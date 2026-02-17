@@ -725,20 +725,19 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     sweep_start_offset_lb = sweep_start_offset
 
     # Finalize requested_mode ONCE (and keep it)
-    requested_mode = (args.channels or "stereo").strip().lower()
+    requested_mode = args.channels  # already canonical: stereo|mono|l|r
 
     if not rec_is_stereo and requested_mode != "mono":
         print("[warn] Recorded capture is mono; analyzing mono.")
         requested_mode = "mono"
 
-    # Decide channels to analyze NOW (so ch_list exists for loopback logic)
-    if requested_mode in ["stereo", "lr", "l+r"]:
+    if requested_mode == "stereo":
         ch_list = ["L", "R"]
-    elif requested_mode in ["l", "left"]:
+    elif requested_mode == "l":
         ch_list = ["L"]
-    elif requested_mode in ["r", "right"]:
+    elif requested_mode == "r":
         ch_list = ["R"]
-    else:
+    else:  # mono
         ch_list = ["mono"]
 
     analyzing_lr = ("L" in ch_list) or ("R" in ch_list)
