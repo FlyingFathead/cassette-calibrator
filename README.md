@@ -134,4 +134,4 @@ In `--outdir`:
 
 ## About
 
-By [FlyingFathead](https://github.com/FlyingFathead) with a bit of help from ChaosWhisperer.
+By [FlyingFathead](https://github.com/FlyingFathead) with bits and bytes of help from ChaosWhisperer.

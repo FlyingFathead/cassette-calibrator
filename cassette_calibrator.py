@@ -298,14 +298,21 @@ def ess_inverse_filter(f1: float, f2: float, T: float, sr: int, sweep: np.ndarra
 
 
 def octave_smooth(freq: np.ndarray, mag_db_arr: np.ndarray, frac: int = 12) -> np.ndarray:
-    lf = np.log10(np.maximum(freq, 1e-9))
-    out = np.empty_like(mag_db_arr)
-    hw = (np.log10(2.0) / frac) / 2.0
-    for i in range(len(freq)):
-        lo, hi = lf[i] - hw, lf[i] + hw
-        m = (lf >= lo) & (lf <= hi)
-        out[i] = float(np.mean(mag_db_arr[m])) if np.any(m) else float(mag_db_arr[i])
-    return out
+    freq = np.asarray(freq)
+    mag_db_arr = np.asarray(mag_db_arr)
+    lf = np.log10(np.maximum(freq, 1e-12))
+
+    hw = (np.log10(2.0) / frac) * 0.5
+    lo = lf - hw
+    hi = lf + hw
+
+    idx_lo = np.searchsorted(lf, lo, side="left")
+    idx_hi = np.searchsorted(lf, hi, side="right")
+
+    c = np.concatenate([[0.0], np.cumsum(mag_db_arr)])
+    denom = np.maximum(1, idx_hi - idx_lo)
+    out = (c[idx_hi] - c[idx_lo]) / denom
+    return out.astype(np.float32)
 
 
 @dataclass
@@ -619,25 +626,36 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     # After marker_start: noisewin + pad + (countdown) + pad + tone + pad => sweep
     sweep_start_offset = marker_dur + args.noisewin_s + args.pad_s + cd_dur + args.pad_s + args.tone_s + args.pad_s
-
     ref_sweep = extract(ref, t_rs + sweep_start_offset, args.sweep_s, sr)
-    rec_sweep_raw = extract(rec, t_ms + sweep_start_offset, args.sweep_s, sr)
 
-    # Drift ratio using marker-to-marker distance (approx; marker timestamps point to first symbol)
-    marker_end_dur = len(dtmf_sequence(args.marker_end, sr, args.marker_tone_s, args.marker_gap_s, amp_from_dbfs(args.marker_dbfs))) / sr
-    expected_between = (marker_dur + args.noisewin_s + args.pad_s + cd_dur + args.pad_s + args.tone_s + args.pad_s + args.sweep_s + args.pad_s + marker_end_dur)
+    # Drift ratio using marker-to-marker distance (timestamps are at the START of the marker sequence)
+    expected_between = (
+        marker_dur
+        + args.noisewin_s + args.pad_s
+        + cd_dur + args.pad_s
+        + args.tone_s + args.pad_s
+        + args.sweep_s + args.pad_s
+    )
     actual_between = (t_me - t_ms)
     drift_ratio = expected_between / max(actual_between, 1e-9)
 
-    drift_applied = False
+    target_len = len(ref_sweep)
+
+    # Only apply time-warp if drift is meaningfully non-1.0
     if abs(drift_ratio - 1.0) > args.drift_warn:
         drift_applied = True
+        rec_sweep_dur = args.sweep_s / max(drift_ratio, 1e-9)
         print(f"[warn] drift ratio {drift_ratio:.6f} (expected/actual) -- applying linear warp")
+    else:
+        drift_applied = False
+        rec_sweep_dur = args.sweep_s
 
-    target_len = len(ref_sweep)
-    warped_len = max(16, int(round(len(rec_sweep_raw) * drift_ratio)))
-    rec_sweep_warped = resample_to_length(rec_sweep_raw, warped_len)
-    rec_sweep_warped = resample_to_length(rec_sweep_warped, target_len)
+    sweep_start_offset_rec = sweep_start_offset
+    if drift_applied:
+        sweep_start_offset_rec = sweep_start_offset / max(drift_ratio, 1e-9)
+
+    rec_sweep_raw = extract(rec, t_ms + sweep_start_offset_rec, rec_sweep_dur, sr)
+    rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
 
     if args.fine_align:
         corr = signal.fftconvolve(rec_sweep_warped, ref_sweep[::-1], mode="full")
