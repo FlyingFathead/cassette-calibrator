@@ -790,12 +790,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--marker-tone-s", type=float, default=0.22)
     g.add_argument("--marker-gap-s", type=float, default=0.04)
     g.add_argument("--marker-dbfs", type=float, default=-12.0, help="DTMF marker level (peak dBFS)")
+
     g.add_argument(
     "--countdown",
     action=argparse.BooleanOptionalAction,
     default=True,
     help="include DTMF countdown (default: on; disable with --no-countdown)",
     )
+
     g.add_argument("--countdown-from", type=int, default=10)
     g.add_argument("--tone-hz", type=float, default=1000.0)
     g.add_argument("--tone-s", type=float, default=10.0)
