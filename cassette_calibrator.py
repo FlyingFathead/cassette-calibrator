@@ -1183,6 +1183,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         plt.title(f"Cassette chain magnitude response ({ch})")
         plt.tight_layout()
         plt.savefig(outdir / f"response{out_suffix(ch)}.png", dpi=150)
+        plt.close()
 
         if diff_db_s is not None:
             plt.figure()
@@ -1193,6 +1194,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             plt.title(f"Cassette chain minus loopback ({ch})")
             plt.tight_layout()
             plt.savefig(outdir / f"difference{out_suffix(ch)}.png", dpi=150)
+            plt.close()
 
         if args.save_ir:
             plt.figure()
@@ -1204,6 +1206,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             plt.title(f"Windowed impulse response segment ({ch})")
             plt.tight_layout()
             plt.savefig(outdir / f"impulse{out_suffix(ch)}.png", dpi=150)
+            plt.close()
 
         per_ch[ch] = {
             "snr_db": snr_db,
@@ -1238,6 +1241,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         plt.title("Channel mismatch: L - R")
         plt.tight_layout()
         plt.savefig(outdir / "lr_diff.png", dpi=150)
+        plt.close()
 
         stereo_outputs["lr_diff_png"] = str(outdir / "lr_diff.png")
 
