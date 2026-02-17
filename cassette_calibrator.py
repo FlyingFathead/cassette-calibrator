@@ -835,17 +835,6 @@ def cmd_detect(args: argparse.Namespace) -> None:
     x = pick_channel(y, args.channel)
 
     dedupe_s = args.dtmf_dedupe_s if args.dtmf_dedupe_s is not None else auto_dedupe_s(args)
-    if dedupe_s is None:
-        win_s = args.win_ms / 1000.0
-        hop_s = args.hop_ms / 1000.0
-
-        # Try to keep ~one event per actual digit tone,
-        # but never long enough to eat a real repeated digit.
-        upper = max(0.0, (args.marker_tone_s + args.marker_gap_s) - 0.5 * hop_s)
-        base  = args.marker_tone_s + 0.5 * win_s   # tone plus half-window smear
-
-        raw = max(base, win_s, 3.0 * hop_s)
-        dedupe_s = raw if upper <= 0 else min(raw, upper)
 
     events = detect_dtmf_events(
         x, sr,
