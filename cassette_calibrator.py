@@ -832,9 +832,9 @@ def cmd_detect(args: argparse.Namespace) -> None:
     # NEW: choose dedupe window (either explicit or auto)
     dedupe_s = getattr(args, "dtmf_dedupe_s", None)
     if dedupe_s is None:
-        # Option 1 (recommended): based on marker timing, if you add these args
-        # merges repeated frame-detections, doesn't murder real repeated digits
-        dedupe_s = 0.5 * (args.marker_tone_s + args.marker_gap_s)
+        # Default dedupe should merge repeated window hits for the SAME tone,
+        # but never collapse real repeated digits in the marker string.
+        dedupe_s = max(args.win_ms, 3.0 * args.hop_ms) / 1000.0
 
         # Option 2 (no extra args): based on analysis windowing
         # dedupe_s = max(3.0 * (args.hop_ms / 1000.0), 0.5 * (args.win_ms / 1000.0))
@@ -917,8 +917,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     # -------------------------
     dedupe_s = getattr(args, "dtmf_dedupe_s", None)
     if dedupe_s is None:
-        # Safe default: merges repeated frame detections, but won’t eat real repeated digits.
-        dedupe_s = 0.5 * (args.marker_tone_s + args.marker_gap_s)
+        # Default dedupe should merge repeated window hits for the SAME tone,
+        # but never collapse real repeated digits in marker strings ("99#*" etc).
+        dedupe_s = max(args.win_ms, 3.0 * args.hop_ms) / 1000.0
 
     dtmf_log_stats = bool(getattr(args, "dtmf_stats", False))
 
@@ -1374,8 +1375,13 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     d.add_argument("--json", action="store_true", help="print JSON to stdout")
     d.add_argument("--marker-tone-s", type=float, default=0.22)
     d.add_argument("--marker-gap-s", type=float, default=0.04)
-    d.add_argument("--dtmf-dedupe-s", type=float, default=None,
-                help="merge same-symbol detections within this many seconds (default: 0.5*(marker-tone-s + marker-gap-s))")
+    d.add_argument(
+        "--dtmf-dedupe-s",
+        type=float,
+        default=None,
+        help="merge same-symbol detections within this many seconds "
+            "(default: max(win-ms, 3*hop-ms)/1000; safe for repeated digits like '99#*')",
+    )
     d.add_argument("--dtmf-stats", action="store_true", help="print DTMF timing stats")
     d.set_defaults(func=cmd_detect)
 
@@ -1388,8 +1394,13 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     a.add_argument("--loopback", default=None, help="optional loopback capture to subtract interface coloration")
     a.add_argument("--outdir", default="cassette_results")
 
-    a.add_argument("--dtmf-dedupe-s", type=float, default=None,
-                help="merge same-symbol detections within this many seconds (default: 0.5*(marker-tone+gap))")
+    a.add_argument(
+        "--dtmf-dedupe-s",
+        type=float,
+        default=None,
+        help="merge same-symbol detections within this many seconds "
+            "(default: max(win-ms, 3*hop-ms)/1000; safe for repeated digits like '99#*')",
+    )
     a.add_argument("--dtmf-stats", action="store_true", help="print DTMF timing stats")
 
     a.add_argument("--marker-start", default="99#*")
