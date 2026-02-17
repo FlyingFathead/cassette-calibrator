@@ -458,7 +458,7 @@ def detect_dtmf_events(
 
     min_amp = amp_from_dbfs(min_dbfs)
 
-    for i in range(0, len(y) - win, hop):
+    for i in range(0, len(y) - win + 1, hop):
         seg = y[i:i + win]
 
         # quick gate before doing Goertzel
@@ -1241,15 +1241,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             lr_freq = resL.freq
             lr_diff = resL.mag_db_s - np.interp(lr_freq, resR.freq, resR.mag_db_s)
 
-        plt.figure()
-        plt.semilogx(lr_freq, lr_diff)
-        plt.grid(True, which="both")
-        plt.xlabel("Frequency (Hz)")
-        plt.ylabel("L - R (dB, smoothed)")
-        plt.title("Channel mismatch: L - R")
-        plt.tight_layout()
-        plt.savefig(outdir / "lr_diff.png", dpi=150)
-        plt.close()
+        fig, ax = plt.subplots()
+        ax.semilogx(lr_freq, lr_diff)
+        ax.grid(True, which="both")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("L - R (dB, smoothed)")
+        ax.set_title("Channel mismatch: L - R")
+        fig.tight_layout()
+        fig.savefig(outdir / "lr_diff.png", dpi=150)
+        plt.close(fig)
 
         stereo_outputs["lr_diff_png"] = str(outdir / "lr_diff.png")
 
