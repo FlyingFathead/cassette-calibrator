@@ -616,15 +616,6 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         print("[warn] Recorded capture is mono; forcing --marker-channel mono.")
         args.marker_channel = "mono"
 
-    # If user asked for stereo/L/R analysis but recording is mono, force analysis to mono
-    requested_mode = (args.channels or "stereo").strip().lower()
-    if not rec_is_stereo:
-        if requested_mode in ["stereo", "lr", "l+r", "l", "left", "r", "right"]:
-            print("[warn] Recorded capture is mono; analyzing mono.")
-        requested_mode = "mono"
-    else:
-        requested_mode = requested_mode  # keep as requested
-
     # Marker detection uses a selectable channel (default mono)
     rec_marker = pick_channel(rec_y, args.marker_channel)
     ref_marker = pick_channel(ref_y, args.marker_channel)
