@@ -416,13 +416,11 @@ def goertzel_power(x: np.ndarray, sr: int, f: float) -> float:
     power = s1 * s1 + s2 * s2 - coeff * s1 * s2
     return power
 
-
 @dataclass
 class DTMFEvent:
     t: float      # window-center time (nice for plots/logs)
     t0: float     # window-start time (layout anchor)
     sym: str
-
 
 def detect_dtmf_events(
     x: np.ndarray,
@@ -518,6 +516,13 @@ def detect_dtmf_events(
 
     return events
 
+def auto_dedupe_s(args: argparse.Namespace) -> float:
+    win_s = args.win_ms / 1000.0
+    hop_s = args.hop_ms / 1000.0
+    upper = (args.marker_tone_s + args.marker_gap_s) - 0.5 * hop_s
+    base  = args.marker_tone_s + 0.5 * win_s
+    raw   = max(base, win_s, 3.0 * hop_s)
+    return raw if upper <= 0 else min(raw, upper)
 
 def find_sequence(events: Sequence[DTMFEvent], seq: str, *, which: str = "t0") -> Optional[float]:
     syms = [e.sym for e in events]
@@ -829,15 +834,18 @@ def cmd_detect(args: argparse.Namespace) -> None:
     sr, y = read_wav(Path(args.wav))
     x = pick_channel(y, args.channel)
 
-    # NEW: choose dedupe window (either explicit or auto)
-    dedupe_s = getattr(args, "dtmf_dedupe_s", None)
+    dedupe_s = args.dtmf_dedupe_s if args.dtmf_dedupe_s is not None else auto_dedupe_s(args)
     if dedupe_s is None:
-        # Default dedupe should merge repeated window hits for the SAME tone,
-        # but never collapse real repeated digits in the marker string.
-        dedupe_s = max(args.win_ms, 3.0 * args.hop_ms) / 1000.0
+        win_s = args.win_ms / 1000.0
+        hop_s = args.hop_ms / 1000.0
 
-        # Option 2 (no extra args): based on analysis windowing
-        # dedupe_s = max(3.0 * (args.hop_ms / 1000.0), 0.5 * (args.win_ms / 1000.0))
+        # Try to keep ~one event per actual digit tone,
+        # but never long enough to eat a real repeated digit.
+        upper = max(0.0, (args.marker_tone_s + args.marker_gap_s) - 0.5 * hop_s)
+        base  = args.marker_tone_s + 0.5 * win_s   # tone plus half-window smear
+
+        raw = max(base, win_s, 3.0 * hop_s)
+        dedupe_s = raw if upper <= 0 else min(raw, upper)
 
     events = detect_dtmf_events(
         x, sr,
@@ -845,8 +853,8 @@ def cmd_detect(args: argparse.Namespace) -> None:
         hop_ms=args.hop_ms,
         thresh_ratio=args.thresh,
         min_dbfs=args.min_dbfs,
-        dedupe_s=dedupe_s,                 # NEW
-        log_stats=getattr(args, "dtmf_stats", False),  # NEW (optional)
+        dedupe_s=dedupe_s,
+        log_stats=getattr(args, "dtmf_stats", False),
     )
 
     # Anchor times (layout) -- these are what you want for extraction and drift math
@@ -915,12 +923,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     # -------------------------
     # DTMF detection knobs (analyze)
     # -------------------------
-    dedupe_s = getattr(args, "dtmf_dedupe_s", None)
-    if dedupe_s is None:
-        # Default dedupe should merge repeated window hits for the SAME tone,
-        # but never collapse real repeated digits in marker strings ("99#*" etc).
-        dedupe_s = max(args.win_ms, 3.0 * args.hop_ms) / 1000.0
 
+    dedupe_s = args.dtmf_dedupe_s if args.dtmf_dedupe_s is not None else auto_dedupe_s(args)
     dtmf_log_stats = bool(getattr(args, "dtmf_stats", False))
 
     rec_is_stereo = is_stereo_audio(rec_y)
@@ -1380,7 +1384,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         type=float,
         default=None,
         help="merge same-symbol detections within this many seconds "
-            "(default: max(win-ms, 3*hop-ms)/1000; safe for repeated digits like '99#*')",
+            "(default: marker_tone_s + 0.5*win_s; clamped when meaningful to avoid eating real repeats)"
     )
     d.add_argument("--dtmf-stats", action="store_true", help="print DTMF timing stats")
     d.set_defaults(func=cmd_detect)
@@ -1399,7 +1403,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         type=float,
         default=None,
         help="merge same-symbol detections within this many seconds "
-            "(default: max(win-ms, 3*hop-ms)/1000; safe for repeated digits like '99#*')",
+            "(default: marker_tone_s + 0.5*win_s; clamped when meaningful to avoid eating real repeats)"
     )
     a.add_argument("--dtmf-stats", action="store_true", help="print DTMF timing stats")
 
