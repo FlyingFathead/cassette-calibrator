@@ -715,19 +715,33 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     lb_sweep_dur = args.sweep_s
     sweep_start_offset_lb = sweep_start_offset
 
+    # Finalize requested_mode ONCE (and keep it)
     requested_mode = (args.channels or "stereo").strip().lower()
-    if (not is_stereo_audio(lb_y)) and requested_mode in ["stereo", "lr", "l+r", "l", "left", "r", "right"]:
-        print("[warn] Loopback file is mono; using the same loopback response for both L and R subtraction.")
+
+    if not rec_is_stereo and requested_mode != "mono":
+        print("[warn] Recorded capture is mono; analyzing mono.")
+        requested_mode = "mono"
+
+    # Decide channels to analyze NOW (so ch_list exists for loopback logic)
+    if requested_mode in ["stereo", "lr", "l+r"]:
+        ch_list = ["L", "R"]
+    elif requested_mode in ["l", "left"]:
+        ch_list = ["L"]
+    elif requested_mode in ["r", "right"]:
+        ch_list = ["R"]
+    else:
+        ch_list = ["mono"]
+
+    analyzing_lr = ("L" in ch_list) or ("R" in ch_list)
 
     if args.loopback:
         sr_lb, lb_y = read_wav(Path(args.loopback))
 
-        # (optional warning) loopback is mono but we're analyzing L/R
-        if (not is_stereo_audio(lb_y)) and ("L" in ch_list or "R" in ch_list):
-            print("[warn] Loopback file is mono; using the same loopback response for both L and R subtraction.")
-
         if sr_lb != sr:
             raise SystemExit("Loopback sample rate differs. Resample first.")
+
+        if analyzing_lr and (not is_stereo_audio(lb_y)):
+            print("[warn] Loopback file is mono; using the same loopback response for both L and R subtraction.")
 
         lb_marker = pick_channel(lb_y, args.marker_channel)
         events_lb = detect_dtmf_events(
