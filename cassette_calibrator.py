@@ -121,6 +121,30 @@ def amp_from_dbfs(dbfs: float) -> float:
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
+def json_sanitize(obj):
+    """Convert NaN/Inf into None and make common NumPy types JSON-safe."""
+    # NumPy scalars (np.float32 etc.)
+    if isinstance(obj, (float, np.floating)):
+        v = float(obj)
+        return v if math.isfinite(v) else None
+
+    # Optional: NumPy ints/bools
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+
+    # Optional: arrays -> lists
+    if isinstance(obj, np.ndarray):
+        return json_sanitize(obj.tolist())
+
+    if isinstance(obj, dict):
+        return {k: json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_sanitize(v) for v in obj]
+
+    return obj
+
 def extract(x: np.ndarray, start_s: float, dur_s: float, sr: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     start = int(round(start_s * sr))
@@ -1014,10 +1038,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         "summary_json": str(outdir / "summary.json"),
     }
 
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    safe_summary = json_sanitize(summary)
+
+    (outdir / "summary.json").write_text(
+        json.dumps(safe_summary, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
 
     if args.json:
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(safe_summary, indent=2, allow_nan=False))
 
     print(f"Wrote results to: {outdir}")
     if ch_list == ["mono"]:
