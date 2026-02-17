@@ -153,6 +153,24 @@ def resample_to_length(x: np.ndarray, target_len: int) -> np.ndarray:
         y = np.pad(y, (0, target_len - len(y)))
     return y
 
+def parse_channels(s: str) -> str:
+    s = (s or "").strip().lower()
+    aliases = {
+        "stereo": "stereo",
+        "lr": "stereo",
+        "l+r": "stereo",
+
+        "mono": "mono",
+
+        "l": "l",
+        "left": "l",
+
+        "r": "r",
+        "right": "r",
+    }
+    if s not in aliases:
+        raise argparse.ArgumentTypeError("invalid --channels (use mono|stereo|l|r; aliases: left/right/lr/l+r)")
+    return aliases[s]
 
 # -------------------------
 # DTMF markers
@@ -1035,12 +1053,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_detect)
 
     a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
-    a.add_argument(
-        "--channels",
-        choices=["mono", "L", "R", "stereo"],
-        default="stereo",
-        help="channels to analyze: stereo (default), mono, L, R. If input is mono, auto-falls back to mono with a warning.",
-    )
+    a.add_argument("--channels", type=parse_channels, default="stereo")
     a.add_argument("--marker-channel", choices=["mono", "L", "R"], default="mono",
                 help="channel used for DTMF marker detection/layout timing")
     a.add_argument("--ref", required=True, help="reference generated WAV (the one you played out)")
