@@ -596,6 +596,24 @@ def octave_smooth(freq: np.ndarray, mag_db_arr: np.ndarray, frac: int = 12) -> n
     return out.astype(np.float32)
 
 
+def octave_smooth_linear(freq: np.ndarray, mag_lin: np.ndarray, frac: int = 12) -> np.ndarray:
+    freq = np.asarray(freq)
+    mag_lin = np.asarray(mag_lin, dtype=np.float32)
+
+    lf = np.log10(np.maximum(freq, 1e-12))
+    hw = (np.log10(2.0) / frac) * 0.5
+    lo = lf - hw
+    hi = lf + hw
+
+    idx_lo = np.searchsorted(lf, lo, side="left")
+    idx_hi = np.searchsorted(lf, hi, side="right")
+
+    c = np.concatenate([[0.0], np.cumsum(mag_lin, dtype=np.float64)])
+    denom = np.maximum(1, idx_hi - idx_lo)
+    out = (c[idx_hi] - c[idx_lo]) / denom
+    return out.astype(np.float32)
+
+
 @dataclass
 class AnalysisResult:
     freq: np.ndarray
@@ -622,9 +640,8 @@ def analyze_chain(
 
     peak_i = int(np.argmax(np.abs(ir_full)))
     win = int(max(32, round(ir_win_s * sr)))
-    start = peak_i - win // 4
-    if start < 0:
-        start = 0
+    start = max(0, peak_i - win // 4)
+
     ir = ir_full[start:start + win]
     if len(ir) < win:
         ir = np.pad(ir, (0, win - len(ir)))
@@ -633,14 +650,23 @@ def analyze_chain(
     nfft = int(2 ** math.ceil(math.log2(len(ir) * 8)))
     H = np.fft.rfft(ir, n=nfft)
     freq = np.fft.rfftfreq(nfft, 1.0 / sr)
-    mag = db(H)
+
+    mag_lin = np.abs(H).astype(np.float32)
 
     m = (freq >= fmin) & (freq <= fmax)
     freq = freq[m]
-    mag = mag[m]
-    mag_s = octave_smooth(freq, mag, frac=smooth_oct) if smooth_oct > 0 else mag.copy()
+    mag_lin = mag_lin[m]
 
-    # after mag = db(H), after you mask freq to fmin/fmax
+    eps = 1e-12
+    mag = 20.0 * np.log10(np.maximum(mag_lin, eps))
+
+    if smooth_oct > 0:
+        mag_lin_s = octave_smooth_linear(freq, mag_lin, frac=smooth_oct)
+        mag_s = 20.0 * np.log10(np.maximum(mag_lin_s, eps))
+    else:
+        mag_s = mag.copy()
+
+    # 1 kHz-ish normalization (same as before)
     refband = (freq >= 900.0) & (freq <= 1100.0)
     if np.any(refband):
         off = float(np.median(mag[refband]))
