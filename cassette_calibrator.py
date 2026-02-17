@@ -439,22 +439,52 @@ def compute_snr(
     tone_hz: float,
     snr_noise_s: float,
     snr_tone_s: float,
+    layout_scale: float = 1.0,
 ) -> Tuple[Optional[float], Dict[str, float], List[str]]:
     warnings: List[str] = []
-    marker_dur = len(dtmf_sequence(marker_start, sr, marker_tone_s, marker_gap_s, amp_from_dbfs(marker_dbfs))) / sr
 
-    cd_dur = 0.0
+    layout_scale = float(layout_scale)
+    if not np.isfinite(layout_scale) or layout_scale <= 0:
+        layout_scale = 1.0
+
+    marker_dur_layout = len(
+        dtmf_sequence(
+            marker_start,
+            sr,
+            marker_tone_s,
+            marker_gap_s,
+            amp_from_dbfs(marker_dbfs),
+        )
+    ) / sr
+    marker_dur = marker_dur_layout * layout_scale
+
+    cd_dur_layout = 0.0
     if countdown:
         tokens = countdown_tokens(countdown_from)
         cd_audio = []
         for tok in tokens:
-            cd_audio.append(dtmf_sequence(tok, sr, marker_tone_s, marker_gap_s, amp_from_dbfs(marker_dbfs) * 0.9))
+            cd_audio.append(
+                dtmf_sequence(
+                    tok,
+                    sr,
+                    marker_tone_s,
+                    marker_gap_s,
+                    amp_from_dbfs(marker_dbfs) * 0.9,
+                )
+            )
             cd_audio.append(np.zeros(int(sr * 0.12), dtype=np.float32))
-        cd_dur = (sum(len(a) for a in cd_audio) / sr) if cd_audio else 0.0
+        cd_dur_layout = (sum(len(a) for a in cd_audio) / sr) if cd_audio else 0.0
+    cd_dur = cd_dur_layout * layout_scale
+
+    # Scale layout durations into recorded-time space (because of transport drift)
+    noisewin_rec = noisewin_s * layout_scale
+    pad_rec = pad_s * layout_scale
+    tone_s_rec = tone_s * layout_scale
 
     # Noise window is right after marker_start
     noise_start = t_marker_start + marker_dur
-    noise_dur = max(0.0, min(noisewin_s, snr_noise_s if snr_noise_s > 0 else noisewin_s))
+    noise_use = (snr_noise_s if snr_noise_s > 0 else noisewin_s) * layout_scale
+    noise_dur = max(0.0, min(noisewin_rec, noise_use))
     noise_seg = extract(rec, noise_start, noise_dur, sr)
     if len(noise_seg) < int(0.2 * sr):
         warnings.append("Noise window too short or missing; SNR may be unavailable.")
@@ -463,25 +493,32 @@ def compute_snr(
         noise_r = rms(noise_seg)
 
     # Tone start:
-    tone_start = t_marker_start + marker_dur + noisewin_s + pad_s + cd_dur + pad_s
+    tone_start = t_marker_start + marker_dur + noisewin_rec + pad_rec + cd_dur + pad_rec
+
     # Take tone from the middle to avoid edges
     if snr_tone_s <= 0:
-        tone_meas_dur = max(0.0, min(5.0, tone_s))
+        tone_meas_dur = max(0.0, min(5.0 * layout_scale, tone_s_rec))
     else:
-        tone_meas_dur = min(snr_tone_s, tone_s)
+        tone_meas_dur = min(snr_tone_s * layout_scale, tone_s_rec)
 
-    if tone_s <= 0.2:
+    if tone_s_rec <= 0.2 * layout_scale:
         warnings.append("Tone duration too short for SNR measurement.")
         tone_r = float("nan")
     else:
-        mid = tone_start + (tone_s * 0.5) - (tone_meas_dur * 0.5)
+        mid = tone_start + (tone_s_rec * 0.5) - (tone_meas_dur * 0.5)
         tone_seg = extract(rec, mid, tone_meas_dur, sr)
         if len(tone_seg) < int(0.2 * sr):
             warnings.append("Tone segment too short/missing; SNR may be unavailable.")
             tone_r = float("nan")
         else:
             # Optionally bandpass around tone to reduce broadband hiss affecting RMS:
-            sos = signal.butter(4, [tone_hz * 0.8, tone_hz * 1.2], btype="bandpass", fs=sr, output="sos")
+            sos = signal.butter(
+                4,
+                [tone_hz * 0.8, tone_hz * 1.2],
+                btype="bandpass",
+                fs=sr,
+                output="sos",
+            )
             tone_f = signal.sosfilt(sos, tone_seg)
             tone_r = rms(tone_f)
 
@@ -863,7 +900,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             tone_hz=args.tone_hz,
             snr_noise_s=args.snr_noise_s,
             snr_tone_s=args.snr_tone_s,
+            layout_scale=(1.0 / drift_ratio) if drift_applied else 1.0,
         )
+
         snrs[ch] = snr_db
         snr_parts_all[ch] = snr_parts
         snr_warnings_all[ch] = snr_warnings
