@@ -419,7 +419,8 @@ def goertzel_power(x: np.ndarray, sr: int, f: float) -> float:
 
 @dataclass
 class DTMFEvent:
-    t: float
+    t: float      # window-center time (nice for plots/logs)
+    t0: float     # window-start time (layout anchor)
     sym: str
 
 
@@ -430,8 +431,8 @@ def detect_dtmf_events(
     hop_ms: float = 10.0,
     thresh_ratio: float = 6.0,
     min_dbfs: float = -55.0,
-    dedupe_s: float = 0.15,      # NEW (default keeps old behavior unless you override)
-    log_stats: bool = False,     # NEW (optional)
+    dedupe_s: float = 0.15,
+    log_stats: bool = False,
 ) -> List[DTMFEvent]:
 
     x = np.asarray(x, dtype=np.float32)
@@ -445,17 +446,27 @@ def detect_dtmf_events(
     if win < 64:
         raise ValueError("Window too short; increase win_ms.")
 
+    # Sanitize dedupe_s (avoid negative/NaN causing weird behavior)
+    try:
+        dedupe_s = float(dedupe_s)
+    except Exception:
+        dedupe_s = 0.0
+    if (not math.isfinite(dedupe_s)) or dedupe_s < 0.0:
+        dedupe_s = 0.0
+
     events: List[DTMFEvent] = []
     last_sym: Optional[str] = None
     last_t: float = -1e9
-    dedupe_s = float(dedupe_s)
 
     min_amp = amp_from_dbfs(min_dbfs)
 
     for i in range(0, len(y) - win, hop):
         seg = y[i:i + win]
+
+        # quick gate before doing Goertzel
         if rms(seg) < (min_amp * 0.2):
             continue
+
         seg = seg * signal.windows.hann(len(seg), sym=False).astype(np.float32)
 
         row_p = [goertzel_power(seg, sr, f) for f in ROWS]
@@ -480,12 +491,17 @@ def detect_dtmf_events(
         if sym is None:
             continue
 
+        # Two timestamps:
+        # t  = window center (nice for scatter plots)
+        # t0 = window start (layout anchor for extraction/drift math)
         t = (i + 0.5 * win) / sr
+        t0 = i / sr
 
+        # dedupe based on center-time to collapse repeated frame detections
         if sym == last_sym and (t - last_t) < dedupe_s:
             continue
 
-        events.append(DTMFEvent(t=t, sym=sym))
+        events.append(DTMFEvent(t=t, t0=t0, sym=sym))
         last_sym = sym
         last_t = t
 
@@ -503,9 +519,14 @@ def detect_dtmf_events(
     return events
 
 
-def find_sequence(events: Sequence[DTMFEvent], seq: str) -> Optional[float]:
+def find_sequence(events: Sequence[DTMFEvent], seq: str, *, which: str = "t0") -> Optional[float]:
     syms = [e.sym for e in events]
-    times = [e.t for e in events]
+
+    if which not in ("t", "t0"):
+        raise ValueError("which must be 't' or 't0'")
+
+    times = [getattr(e, which) for e in events]
+
     sub = list(seq)
     for i in range(0, len(syms) - len(sub) + 1):
         if syms[i:i + len(sub)] == sub:
@@ -828,8 +849,13 @@ def cmd_detect(args: argparse.Namespace) -> None:
         log_stats=getattr(args, "dtmf_stats", False),  # NEW (optional)
     )
 
-    t_start = find_sequence(events, args.marker_start)
-    t_end = find_sequence(events, args.marker_end)
+    # Anchor times (layout) -- these are what you want for extraction and drift math
+    t_start = find_sequence(events, args.marker_start, which="t0")
+    t_end = find_sequence(events, args.marker_end, which="t0")
+
+    # Center times (debug/plot-friendly)
+    t_start_c = find_sequence(events, args.marker_start, which="t")
+    t_end_c = find_sequence(events, args.marker_end, which="t")
 
     result = {
         "wav": str(args.wav),
@@ -837,8 +863,15 @@ def cmd_detect(args: argparse.Namespace) -> None:
         "channel": args.channel,
         "marker_start": args.marker_start,
         "marker_end": args.marker_end,
+
+        # Keep existing keys as anchors (the “real” times you should use)
         "t_marker_start": t_start,
         "t_marker_end": t_end,
+
+        # Extra debug fields
+        "t_marker_start_center": t_start_c,
+        "t_marker_end_center": t_end_c,
+
         "events": len(events),
     }
 
@@ -852,7 +885,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
     if args.dump_events:
         for e in events:
-            print(f"{e.t:8.3f}s  {e.sym}")
+            print(f"{e.t0:8.3f}s  (anchor)  {e.t:8.3f}s  (center)  {e.sym}")
 
     if args.plot:
         times = [e.t for e in events]
@@ -911,8 +944,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         log_stats=dtmf_log_stats,
     )
 
-    t_ms = find_sequence(events, args.marker_start)
-    t_me = find_sequence(events, args.marker_end)
+    # Use anchor timestamps for layout/drift math
+    t_ms = find_sequence(events, args.marker_start, which="t0")
+    t_me = find_sequence(events, args.marker_end, which="t0")
+
     if t_ms is None or t_me is None:
         raise SystemExit(
             "Could not find start/end markers in recorded file. "
@@ -932,7 +967,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         log_stats=dtmf_log_stats,
     )
 
-    t_rs = find_sequence(events_ref, args.marker_start)
+    t_rs = find_sequence(events_ref, args.marker_start, which="t0")
     if t_rs is None:
         t_rs = args.pre_s  # fallback assumption
 
@@ -1030,8 +1065,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             log_stats=dtmf_log_stats,
         )
 
-        t_lbs = find_sequence(events_lb, args.marker_start)
-        t_lbe = find_sequence(events_lb, args.marker_end)
+        t_lbs = find_sequence(events_lb, args.marker_start, which="t0")
+        t_lbe = find_sequence(events_lb, args.marker_end, which="t0")
+
         if t_lbs is None or t_lbe is None or t_lbe <= t_lbs:
             raise SystemExit("Could not find valid markers in loopback file.")
 
@@ -1454,6 +1490,11 @@ def main() -> None:
     # Basic console logging (only if nothing configured yet)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    # If user asked for DTMF stats, ensure INFO is visible even if env preconfigured logging
+    if bool(getattr(args, "dtmf_stats", False)):
+        logging.getLogger().setLevel(logging.INFO)
+        LOG.setLevel(logging.INFO)
 
     args.func(args)
 
