@@ -11,3 +11,6 @@ venv/
 *.mp3
 cassette_results/
 results/
+data/
+logs/
+log/
