@@ -7,7 +7,7 @@ What this tool does:
 1) gen:
    Builds a WAV you can print to cassette:
      [pre_silence] [DTMF start marker] [noise window silence] [pad]
-     [optional DTMF countdown] [pad]
+     [DTMF countdown (default on; disable with --no-countdown)] [pad]
      [1 kHz ref tone] [pad]
      [ESS log sweep] [pad]
      [DTMF end marker] [post_silence]
@@ -28,7 +28,7 @@ What this tool does:
    - writes summary.json and optionally prints JSON to stdout
 
 Dependencies:
-  pip install numpy scipy matplotlib
+  python3 -m pip install -r requirements.txt
 """
 
 from __future__ import annotations
