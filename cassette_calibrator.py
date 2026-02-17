@@ -886,18 +886,22 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
     if args.plot:
         times = [e.t for e in events]
-        plt.figure()
-        plt.scatter(times, np.arange(len(times)))
-        plt.grid(True)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Event index")
-        plt.title(f"DTMF detections over time (channel={args.channel})")
-        if t_start is not None:
-            plt.axvline(t_start, linestyle="--")
-        if t_end is not None:
-            plt.axvline(t_end, linestyle="--")
-        plt.show()
+        fig = plt.figure()
+        ax = fig.add_subplot(1, 1, 1)
 
+        ax.scatter(times, np.arange(len(times)))
+        ax.grid(True)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Event index")
+        ax.set_title(f"DTMF detections over time (channel={args.channel})")
+
+        if t_start is not None:
+            ax.axvline(t_start, linestyle="--")
+        if t_end is not None:
+            ax.axvline(t_end, linestyle="--")
+
+        plt.show()
+        plt.close(fig)
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     outdir = Path(args.outdir)
@@ -1173,40 +1177,44 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         snr_warnings_all[ch] = snr_warnings
 
         # Export per-channel
-        save_csv(outdir / f"response{out_suffix(ch)}.csv", res.freq, res.mag_db, res.mag_db_s, diff_db_s)
+        save_csv(outdir / f"response{out_suffix(ch)}.csv",
+                res.freq, res.mag_db, res.mag_db_s, diff_db_s)
 
-        plt.figure()
-        plt.semilogx(res.freq, res.mag_db_s)
-        plt.grid(True, which="both")
-        plt.xlabel("Frequency (Hz)")
-        plt.ylabel("Magnitude (dB, smoothed)")
-        plt.title(f"Cassette chain magnitude response ({ch})")
-        plt.tight_layout()
-        plt.savefig(outdir / f"response{out_suffix(ch)}.png", dpi=150)
-        plt.close()
+        # response plot
+        fig, ax = plt.subplots()
+        ax.semilogx(res.freq, res.mag_db_s)
+        ax.grid(True, which="both")
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+        ax.set_title(f"Cassette chain magnitude response ({ch})")
+        fig.tight_layout()
+        fig.savefig(outdir / f"response{out_suffix(ch)}.png", dpi=150)
+        plt.close(fig)
 
+        # difference plot (optional)
         if diff_db_s is not None:
-            plt.figure()
-            plt.semilogx(res.freq, diff_db_s)
-            plt.grid(True, which="both")
-            plt.xlabel("Frequency (Hz)")
-            plt.ylabel("Difference (dB, smoothed)")
-            plt.title(f"Cassette chain minus loopback ({ch})")
-            plt.tight_layout()
-            plt.savefig(outdir / f"difference{out_suffix(ch)}.png", dpi=150)
-            plt.close()
+            fig, ax = plt.subplots()
+            ax.semilogx(res.freq, diff_db_s)
+            ax.grid(True, which="both")
+            ax.set_xlabel("Frequency (Hz)")
+            ax.set_ylabel("Difference (dB, smoothed)")
+            ax.set_title(f"Cassette chain minus loopback ({ch})")
+            fig.tight_layout()
+            fig.savefig(outdir / f"difference{out_suffix(ch)}.png", dpi=150)
+            plt.close(fig)
 
+        # impulse plot (optional)
         if args.save_ir:
-            plt.figure()
+            fig, ax = plt.subplots()
             tt = np.arange(len(res.ir), dtype=np.float32) / res.ir_sr
-            plt.plot(tt, res.ir)
-            plt.grid(True)
-            plt.xlabel("Time (s)")
-            plt.ylabel("Amplitude")
-            plt.title(f"Windowed impulse response segment ({ch})")
-            plt.tight_layout()
-            plt.savefig(outdir / f"impulse{out_suffix(ch)}.png", dpi=150)
-            plt.close()
+            ax.plot(tt, res.ir)
+            ax.grid(True)
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Amplitude")
+            ax.set_title(f"Windowed impulse response segment ({ch})")
+            fig.tight_layout()
+            fig.savefig(outdir / f"impulse{out_suffix(ch)}.png", dpi=150)
+            plt.close(fig)
 
         per_ch[ch] = {
             "snr_db": snr_db,
