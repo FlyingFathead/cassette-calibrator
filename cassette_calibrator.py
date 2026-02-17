@@ -497,11 +497,13 @@ def compute_snr(
 
     # Take tone from the middle to avoid edges
     if snr_tone_s <= 0:
-        tone_meas_dur = max(0.0, min(5.0 * layout_scale, tone_s_rec))
+        # auto: measure up to 5 seconds (in recorded-time space), limited by tone length
+        tone_meas_dur = max(0.0, min(5.0, tone_s_rec))
     else:
+        # user value is in layout seconds -> scale into recorded-time
         tone_meas_dur = min(snr_tone_s * layout_scale, tone_s_rec)
 
-    if tone_s_rec <= 0.2 * layout_scale:
+    if tone_s_rec <= 0.2:
         warnings.append("Tone duration too short for SNR measurement.")
         tone_r = float("nan")
     else:
