@@ -514,15 +514,17 @@ def compute_snr(
             tone_r = float("nan")
         else:
             # Optionally bandpass around tone to reduce broadband hiss affecting RMS:
-            sos = signal.butter(
-                4,
-                [tone_hz * 0.8, tone_hz * 1.2],
-                btype="bandpass",
-                fs=sr,
-                output="sos",
-            )
-            tone_f = signal.sosfilt(sos, tone_seg)
-            tone_r = rms(tone_f)
+            nyq = 0.5 * sr
+            lo = max(10.0, tone_hz * 0.8)
+            hi = min(nyq - 10.0, tone_hz * 1.2)
+
+            if lo >= hi:
+                warnings.append("Tone bandpass invalid for given tone_hz/sr; using unfiltered RMS.")
+                tone_r = rms(tone_seg)
+            else:
+                sos = signal.butter(4, [lo, hi], btype="bandpass", fs=sr, output="sos")
+                tone_f = signal.sosfilt(sos, tone_seg)
+                tone_r = rms(tone_f)
 
     if not (np.isfinite(noise_r) and np.isfinite(tone_r)) or noise_r <= 0:
         return None, {"noise_rms": noise_r, "tone_rms": tone_r}, warnings
