@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cassette_sweep_lab.py
+cassette_calibrator.py
 
 What this tool does:
 
@@ -775,7 +775,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 # -------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="cassette_sweep_lab.py")
+    ap = argparse.ArgumentParser(prog="cassette_calibrator.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV")
@@ -790,7 +790,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--marker-tone-s", type=float, default=0.22)
     g.add_argument("--marker-gap-s", type=float, default=0.04)
     g.add_argument("--marker-dbfs", type=float, default=-12.0, help="DTMF marker level (peak dBFS)")
-    g.add_argument("--countdown", action="store_true")
+    g.add_argument(
+    "--countdown",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="include DTMF countdown (default: on; disable with --no-countdown)",
+    )
     g.add_argument("--countdown-from", type=int, default=10)
     g.add_argument("--tone-hz", type=float, default=1000.0)
     g.add_argument("--tone-s", type=float, default=10.0)
@@ -827,7 +832,13 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--marker-gap-s", type=float, default=0.04)
     a.add_argument("--marker-dbfs", type=float, default=-12.0)
 
-    a.add_argument("--countdown", action="store_true")
+    a.add_argument(
+    "--countdown",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="expect DTMF countdown in layout (default: on; disable with --no-countdown)",
+    )
+
     a.add_argument("--countdown-from", type=int, default=10)
 
     a.add_argument("--pre-s", type=float, default=1.0)

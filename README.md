@@ -9,7 +9,7 @@ It generates a cassette-friendly measurement WAV with robust DTMF markers, then 
 - Generates a print-to-tape WAV containing:
   - DTMF start marker (robust "audio timecode" anchor)
   - Dedicated silence window for noise-floor measurement
-  - Optional DTMF countdown (purely for humans)
+  - DTMF countdown (default on; mostly for humans, alignment uses start/end markers)
   - 1 kHz reference tone for setting record level
   - ESS log sweep (default 20 Hz -> 20 kHz)
   - DTMF end marker
@@ -25,11 +25,16 @@ It generates a cassette-friendly measurement WAV with robust DTMF markers, then 
 
 ## Install
 
-Python 3.9+ recommended.
+Python 3.9+ recommended. Tested on Python 3.12.x.
 
 ```bash
-pip install numpy scipy matplotlib
+python3 -m pip install -r requirements.txt
 ```
+
+Notes:
+
+* `soundfile` is currently listed in `requirements.txt` (optional / future-proofing for better audio I/O).
+* If you want minimal deps, remove `soundfile` from `requirements.txt` unless you actually use it in code.
 
 ## Workflow
 
@@ -37,8 +42,14 @@ pip install numpy scipy matplotlib
 
 ```bash
 python3 cassette_calibrator.py gen --out sweepcass.wav
-# optional:
-# python3 cassette_calibrator.py gen --out sweepcass.wav --countdown
+# disable countdown if you want:
+# python3 cassette_calibrator.py gen --out sweepcass.wav --no-countdown
+```
+
+Recommended cassette-friendly settings (more buffer for sloppy transport + better noise measurement):
+
+```bash
+python3 cassette_calibrator.py gen --out sweepcass.wav --pre-s 3 --noisewin-s 2
 ```
 
 ### 2) Print to tape and capture playback
@@ -99,6 +110,10 @@ In `--outdir`:
 
   * Generate hotter markers: `--marker-dbfs -10`
   * Loosen detection: lower `--thresh` (e.g. 4.5) or set `--min-dbfs -60`
+
+* Before measuring: clean heads/capstan/pinch roller; check azimuth if HF looks nuked.
+* Set record level using the 1 kHz reference tone (avoid clipping / redlining).
+* Keep any NR / enhancers off unless you are specifically measuring them.
 
 ## About
 
