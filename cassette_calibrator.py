@@ -759,17 +759,6 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             lb_sweep_dur = args.sweep_s
             sweep_start_offset_lb = sweep_start_offset
 
-    # Decide which channels to analyze (requested_mode already accounts for mono fallback)
-    mode = requested_mode
-    if mode in ["stereo", "lr", "l+r"]:
-        ch_list = ["L", "R"]
-    elif mode in ["l", "left"]:
-        ch_list = ["L"]
-    elif mode in ["r", "right"]:
-        ch_list = ["R"]
-    else:
-        ch_list = ["mono"]
-
     def out_suffix(ch: str) -> str:
         # keep legacy names if analyzing only mono
         if ch_list == ["mono"]:
