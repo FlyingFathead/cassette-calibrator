@@ -83,6 +83,10 @@ def to_mono(y: np.ndarray) -> np.ndarray:
         return y
     return y.mean(axis=1).astype(np.float32)
 
+def is_stereo_audio(y: np.ndarray) -> bool:
+    y = np.asarray(y)
+    return (y.ndim == 2 and y.shape[1] >= 2)
+
 def read_wav(path: Path) -> Tuple[int, np.ndarray]:
     sr, y = wavfile.read(str(path))
     return sr, to_float32(y)
@@ -605,6 +609,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         raise SystemExit(f"Sample rates differ: ref={sr_ref}, rec={sr_rec}. Resample one first.")
     sr = sr_ref
 
+    rec_is_stereo = is_stereo_audio(rec_y)
+
+    # If user asked for L/R marker channel but recording is mono, force marker channel to mono
+    if (not rec_is_stereo) and args.marker_channel in ["L", "R"]:
+        print("[warn] Recorded capture is mono; forcing --marker-channel mono.")
+        args.marker_channel = "mono"
+
+    # If user asked for stereo/L/R analysis but recording is mono, force analysis to mono
+    requested_mode = (args.channels or "stereo").strip().lower()
+    if not rec_is_stereo:
+        if requested_mode in ["stereo", "lr", "l+r", "l", "left", "r", "right"]:
+            print("[warn] Recorded capture is mono; analyzing mono.")
+        requested_mode = "mono"
+    else:
+        requested_mode = requested_mode  # keep as requested
+
     # Marker detection uses a selectable channel (default mono)
     rec_marker = pick_channel(rec_y, args.marker_channel)
     ref_marker = pick_channel(ref_y, args.marker_channel)
@@ -695,13 +715,27 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     lb_sweep_dur = args.sweep_s
     sweep_start_offset_lb = sweep_start_offset
 
+    requested_mode = (args.channels or "stereo").strip().lower()
+    if (not is_stereo_audio(lb_y)) and requested_mode in ["stereo", "lr", "l+r", "l", "left", "r", "right"]:
+        print("[warn] Loopback file is mono; using the same loopback response for both L and R subtraction.")
+
     if args.loopback:
         sr_lb, lb_y = read_wav(Path(args.loopback))
+
+        # (optional warning) loopback is mono but we're analyzing L/R
+        if (not is_stereo_audio(lb_y)) and ("L" in ch_list or "R" in ch_list):
+            print("[warn] Loopback file is mono; using the same loopback response for both L and R subtraction.")
+
         if sr_lb != sr:
             raise SystemExit("Loopback sample rate differs. Resample first.")
 
         lb_marker = pick_channel(lb_y, args.marker_channel)
-        events_lb = detect_dtmf_events(lb_marker, sr, win_ms=args.win_ms, hop_ms=args.hop_ms, thresh_ratio=args.thresh, min_dbfs=args.min_dbfs)
+        events_lb = detect_dtmf_events(
+            lb_marker, sr,
+            win_ms=args.win_ms, hop_ms=args.hop_ms,
+            thresh_ratio=args.thresh, min_dbfs=args.min_dbfs
+        )
+
         t_lbs = find_sequence(events_lb, args.marker_start)
         t_lbe = find_sequence(events_lb, args.marker_end)
         if t_lbs is None or t_lbe is None or t_lbe <= t_lbs:
@@ -720,8 +754,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             lb_sweep_dur = args.sweep_s
             sweep_start_offset_lb = sweep_start_offset
 
-    # Decide which channels to analyze
-    mode = (args.channels or "mono").strip().lower()
+    # Decide which channels to analyze (requested_mode already accounts for mono fallback)
+    mode = requested_mode
     if mode in ["stereo", "lr", "l+r"]:
         ch_list = ["L", "R"]
     elif mode in ["l", "left"]:
@@ -1007,8 +1041,12 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_detect)
 
     a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
-    a.add_argument("--channels", choices=["mono", "L", "R", "stereo"], default="mono",
-                help="channels to analyze: mono, L, R, or stereo (exports L+R + lr_diff.png)")
+    a.add_argument(
+        "--channels",
+        choices=["mono", "L", "R", "stereo"],
+        default="stereo",
+        help="channels to analyze: stereo (default), mono, L, R. If input is mono, auto-falls back to mono with a warning.",
+    )
     a.add_argument("--marker-channel", choices=["mono", "L", "R"], default="mono",
                 help="channel used for DTMF marker detection/layout timing")
     a.add_argument("--ref", required=True, help="reference generated WAV (the one you played out)")
