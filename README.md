@@ -54,11 +54,27 @@ python3 cassette_calibrator.py gen --out sweepcass.wav --pre-s 3 --noisewin-s 2
 
 ### 2) Print to tape and capture playback
 
-* Play `sweepcass.wav` out of your interface at line level
-* Record onto your master deck/cassette
-* Play back from the deck into your interface
-* Capture as `recorded.wav` (same sample rate as generated)
-* Record at 24-bit if you can; just keep the sample rate the same.
+**Before you start (quick sanity):**
+- Clean heads + capstan + pinch roller.
+- Set the deck’s tape type correctly (Type I/II/IV).
+- Disable anything “helpful” in the chain: Dolby/NR, EQ, AGC, enhancers, expander, etc. (deck + interface mixer + OS).
+
+**A) Record pass (interface -> deck -> tape)**
+- Connect **interface line out** (L/R) -> deck **line in / aux in** (do **not** use mic inputs).
+- Play `sweepcass.wav` from a player that doesn’t resample or add DSP.
+  - Avoid OS “audio enhancements”, spatial sound, EQ, loudness normalization, etc.
+  - Don’t let system sounds mix into the output.
+- Start deck recording, then start playback of `sweepcass.wav` from the beginning.
+- When the file reaches the **1 kHz reference tone**, set the deck’s record level:
+  - Aim for a safe, repeatable level (avoid clipping/redlining).
+  - The goal is consistency, not “as hot as possible”.
+- Rewind and do a clean, uninterrupted record pass of the full file (including pre/post silence).
+
+**B) Playback capture (deck -> interface -> WAV)**
+- Connect deck **line out / rec out** -> **interface line in**.
+- Capture as `recorded.wav` at the **same sample rate** as generated (default 44.1 kHz).
+- Record at **24-bit** if you can; leave headroom (avoid clipping).
+- Start recording first, then start cassette playback; stop after the end marker + post silence.
 
 Avoid any AGC/NR/enhancers in the interface path.
 
