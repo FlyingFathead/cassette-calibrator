@@ -1,0 +1,47 @@
+[gen]
+sr = 44100
+pre_s = 3.0
+post_s = 1.0
+pad_s = 0.30
+noisewin_s = 2.0
+marker_dbfs = -12.0
+countdown = true
+tone_hz = 1000.0
+tone_s = 10.0
+tone_dbfs = -18.0
+f1 = 20.0
+f2 = 20000.0
+sweep_s = 30.0
+sweep_dbfs = -24.0
+peak = 0.90
+
+[detect]
+channel = "mono"
+win_ms = 40.0
+hop_ms = 10.0
+thresh = 6.0
+min_dbfs = -55.0
+
+[analyze]
+channels = "stereo"
+marker_channel = "mono"
+drift_warn = 0.002
+fine_align = true
+ir_win_s = 0.25
+smooth_oct = 12
+f_plot_min = 20.0
+f_plot_max = 20000.0
+
+[analyze.snr]
+noise_s = 1.0
+tone_s = 3.0
+
+[presets.walkman.gen]
+marker_dbfs = -10.0
+sweep_dbfs = -28.0
+
+[presets.walkman.analyze]
+smooth_oct = 6
+
+[presets.walkman.analyze.snr]
+tone_s = 2.0

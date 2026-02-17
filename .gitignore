@@ -15,4 +15,4 @@ data/
 logs/
 log/
 *.patch
-
+*.log

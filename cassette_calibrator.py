@@ -50,6 +50,143 @@ from scipy import signal
 from scipy.io import wavfile
 import matplotlib.pyplot as plt
 
+import os
+import sys
+
+try:
+    import tomllib  # py3.11+
+except ModuleNotFoundError:  # py3.10-
+    import tomli as tomllib  # type: ignore
+
+import logging
+LOG = logging.getLogger("cassette_calibrator")
+
+# -------------------------
+# Config loaders & helpers
+# -------------------------
+
+def _scan_argv_value(argv: List[str], opt: str) -> Optional[str]:
+    """
+    Find --opt VALUE or --opt=VALUE anywhere in argv.
+    """
+    for i, a in enumerate(argv):
+        if a == opt and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(opt + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def deep_merge_dict(a: dict, b: dict) -> dict:
+    """
+    Return a new dict where b overrides a (recursive for dict values).
+    """
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_toml_config(path: Optional[str]) -> dict:
+    """
+    Load TOML config dict. If path is None, try a few defaults.
+    """
+    candidates: List[Path] = []
+    if path:
+        candidates.append(Path(path).expanduser())
+    else:
+        # Local project file first
+        candidates.append(Path("cassette_calibrator.toml"))
+        candidates.append(Path("cassette-calibrator.toml"))
+        # XDG-ish fallback
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            candidates.append(Path(xdg) / "cassette-calibrator" / "config.toml")
+        else:
+            candidates.append(Path.home() / ".config" / "cassette-calibrator" / "config.toml")
+
+    cfg_path = next((p for p in candidates if p.exists()), None)
+    if cfg_path is None:
+        return {}
+
+    try:
+        with cfg_path.open("rb") as f:
+            cfg = tomllib.load(f)
+        if not isinstance(cfg, dict):
+            return {}
+        cfg["_config_path"] = str(cfg_path)
+        return cfg
+    except Exception as e:
+        raise SystemExit(f"Failed to read TOML config '{cfg_path}': {e}")
+
+
+def _normalize_marker_channel(v: str) -> str:
+    s = str(v).strip().lower()
+    if s in ["mono"]:
+        return "mono"
+    if s in ["l", "left"]:
+        return "L"
+    if s in ["r", "right"]:
+        return "R"
+    return str(v)
+
+
+def flatten_cmd_defaults(cmd: str, section: dict) -> dict:
+    """
+    Turn a TOML section into argparse defaults (flat dict of dest->value).
+    Handles nested analyze.snr.
+    """
+    out: dict = {}
+    if not isinstance(section, dict):
+        return out
+
+    for k, v in section.items():
+        if cmd == "analyze" and k == "snr" and isinstance(v, dict):
+            # [analyze.snr] noise_s / tone_s -> snr_noise_s / snr_tone_s
+            if "noise_s" in v:
+                out["snr_noise_s"] = v["noise_s"]
+            if "tone_s" in v:
+                out["snr_tone_s"] = v["tone_s"]
+            continue
+
+        out[k] = v
+
+    # Small normalizations so config can be forgiving:
+    if cmd in ["detect", "analyze"] and "marker_channel" in out:
+        out["marker_channel"] = _normalize_marker_channel(out["marker_channel"])
+    if cmd == "detect" and "channel" in out:
+        out["channel"] = _normalize_marker_channel(out["channel"])
+    if cmd == "analyze" and "channels" in out:
+        # Config injection bypasses argparse type=parse_channels, so normalize here.
+        out["channels"] = parse_channels(str(out["channels"]))
+
+    return out
+
+
+def apply_config_to_subparser(cmd_parser: argparse.ArgumentParser, defaults: dict, *, label: str = "") -> None:
+    """
+    Apply defaults only for dests that exist in this parser. Warn on unknown keys.
+    """
+    dests = {a.dest for a in cmd_parser._actions}  # pylint: disable=protected-access
+    usable = {}
+    unknown = []
+
+    for k, v in (defaults or {}).items():
+        if k in dests:
+            usable[k] = v
+        else:
+            unknown.append(k)
+
+    if usable:
+        cmd_parser.set_defaults(**usable)
+
+    if unknown:
+        where = f" ({label})" if label else ""
+        print(f"[warn] Ignoring unknown config keys{where}: {', '.join(sorted(unknown))}", file=sys.stderr)
+
 
 # -------------------------
 # Utility
@@ -196,6 +333,26 @@ def parse_channels(s: str) -> str:
         raise argparse.ArgumentTypeError("invalid --channels (use mono|stereo|l|r; aliases: left/right/lr/l+r)")
     return aliases[s]
 
+def _strip_known_opts(argv: List[str], opts: List[str]) -> List[str]:
+    out = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        matched = False
+        for opt in opts:
+            if a == opt:
+                i += 2  # drop opt + value
+                matched = True
+                break
+            if a.startswith(opt + "="):
+                i += 1  # drop opt=value
+                matched = True
+                break
+        if not matched:
+            out.append(a)
+            i += 1
+    return out
+
 # -------------------------
 # DTMF markers
 # -------------------------
@@ -273,7 +430,10 @@ def detect_dtmf_events(
     hop_ms: float = 10.0,
     thresh_ratio: float = 6.0,
     min_dbfs: float = -55.0,
+    dedupe_s: float = 0.15,      # NEW (default keeps old behavior unless you override)
+    log_stats: bool = False,     # NEW (optional)
 ) -> List[DTMFEvent]:
+
     x = np.asarray(x, dtype=np.float32)
 
     # Bandpass around DTMF region to reject LF rumble and very HF hiss
@@ -288,6 +448,7 @@ def detect_dtmf_events(
     events: List[DTMFEvent] = []
     last_sym: Optional[str] = None
     last_t: float = -1e9
+    dedupe_s = float(dedupe_s)
 
     min_amp = amp_from_dbfs(min_dbfs)
 
@@ -319,13 +480,25 @@ def detect_dtmf_events(
         if sym is None:
             continue
 
-        t = i / sr
-        if sym == last_sym and (t - last_t) < 0.15:
+        t = (i + 0.5 * win) / sr
+
+        if sym == last_sym and (t - last_t) < dedupe_s:
             continue
 
         events.append(DTMFEvent(t=t, sym=sym))
         last_sym = sym
         last_t = t
+
+    if log_stats and events:
+        dts = np.diff([e.t for e in events])
+        if len(dts):
+            LOG.info(
+                "DTMF stats: events=%d, dedupe_s=%.3f, dt median=%.3f s, min=%.3f s, max=%.3f s",
+                len(events), float(dedupe_s),
+                float(np.median(dts)), float(np.min(dts)), float(np.max(dts)),
+            )
+        else:
+            LOG.info("DTMF stats: events=%d, dedupe_s=%.3f", len(events), float(dedupe_s))
 
     return events
 
@@ -635,13 +808,26 @@ def cmd_detect(args: argparse.Namespace) -> None:
     sr, y = read_wav(Path(args.wav))
     x = pick_channel(y, args.channel)
 
+    # NEW: choose dedupe window (either explicit or auto)
+    dedupe_s = getattr(args, "dtmf_dedupe_s", None)
+    if dedupe_s is None:
+        # Option 1 (recommended): based on marker timing, if you add these args
+        # merges repeated frame-detections, doesn't murder real repeated digits
+        dedupe_s = 0.5 * (args.marker_tone_s + args.marker_gap_s)
+
+        # Option 2 (no extra args): based on analysis windowing
+        # dedupe_s = max(3.0 * (args.hop_ms / 1000.0), 0.5 * (args.win_ms / 1000.0))
+
     events = detect_dtmf_events(
         x, sr,
         win_ms=args.win_ms,
         hop_ms=args.hop_ms,
         thresh_ratio=args.thresh,
         min_dbfs=args.min_dbfs,
+        dedupe_s=dedupe_s,                 # NEW
+        log_stats=getattr(args, "dtmf_stats", False),  # NEW (optional)
     )
+
     t_start = find_sequence(events, args.marker_start)
     t_end = find_sequence(events, args.marker_end)
 
@@ -682,6 +868,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
             plt.axvline(t_end, linestyle="--")
         plt.show()
 
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     outdir = Path(args.outdir)
     ensure_dir(outdir)
@@ -691,6 +878,16 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if sr_ref != sr_rec:
         raise SystemExit(f"Sample rates differ: ref={sr_ref}, rec={sr_rec}. Resample one first.")
     sr = sr_ref
+
+    # -------------------------
+    # DTMF detection knobs (analyze)
+    # -------------------------
+    dedupe_s = getattr(args, "dtmf_dedupe_s", None)
+    if dedupe_s is None:
+        # Safe default: merges repeated frame detections, but won’t eat real repeated digits.
+        dedupe_s = 0.5 * (args.marker_tone_s + args.marker_gap_s)
+
+    dtmf_log_stats = bool(getattr(args, "dtmf_stats", False))
 
     rec_is_stereo = is_stereo_audio(rec_y)
 
@@ -710,7 +907,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         hop_ms=args.hop_ms,
         thresh_ratio=args.thresh,
         min_dbfs=args.min_dbfs,
+        dedupe_s=dedupe_s,
+        log_stats=dtmf_log_stats,
     )
+
     t_ms = find_sequence(events, args.marker_start)
     t_me = find_sequence(events, args.marker_end)
     if t_ms is None or t_me is None:
@@ -728,7 +928,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         hop_ms=args.hop_ms,
         thresh_ratio=args.thresh,
         min_dbfs=args.min_dbfs,
+        dedupe_s=dedupe_s,
+        log_stats=dtmf_log_stats,
     )
+
     t_rs = find_sequence(events_ref, args.marker_start)
     if t_rs is None:
         t_rs = args.pre_s  # fallback assumption
@@ -819,8 +1022,12 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         lb_marker = pick_channel(lb_y, args.marker_channel)
         events_lb = detect_dtmf_events(
             lb_marker, sr,
-            win_ms=args.win_ms, hop_ms=args.hop_ms,
-            thresh_ratio=args.thresh, min_dbfs=args.min_dbfs
+            win_ms=args.win_ms,
+            hop_ms=args.hop_ms,
+            thresh_ratio=args.thresh,
+            min_dbfs=args.min_dbfs,
+            dedupe_s=dedupe_s,
+            log_stats=dtmf_log_stats,
         )
 
         t_lbs = find_sequence(events_lb, args.marker_start)
@@ -1071,14 +1278,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 # CLI
 # -------------------------
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.ArgumentParser]]:
     ap = argparse.ArgumentParser(prog="cassette_calibrator.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
+    common.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
 
+    # Create subcommands ONCE
+    g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV", parents=[common])
+    d = sub.add_parser("detect", help="Detect start/end markers in a recorded file", parents=[common])
+    a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data", parents=[common])
+
+    # -------- gen --------
     g.add_argument("--dtmf-ramp-ms", type=float, default=5.0,
-               help="DTMF attack/release ramp in ms (short = pointier; 0 = hard gate)")
+                   help="DTMF attack/release ramp in ms (short = pointier; 0 = hard gate)")
     g.add_argument("--out", default="sweepcass.wav")
     g.add_argument("--sr", type=int, default=44100)
     g.add_argument("--pre-s", type=float, default=1.0)
@@ -1092,12 +1307,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--marker-dbfs", type=float, default=-12.0, help="DTMF marker level (peak dBFS)")
 
     g.add_argument(
-    "--countdown",
-    action=argparse.BooleanOptionalAction,
-    default=True,
-    help="include DTMF countdown (default: on; disable with --no-countdown)",
+        "--countdown",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="include DTMF countdown (default: on; disable with --no-countdown)",
     )
-
     g.add_argument("--countdown-from", type=int, default=10)
     g.add_argument("--tone-hz", type=float, default=1000.0)
     g.add_argument("--tone-s", type=float, default=10.0)
@@ -1109,8 +1323,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--peak", type=float, default=0.90, help="hard peak limiter for whole file")
     g.set_defaults(func=cmd_gen)
 
-    d = sub.add_parser("detect", help="Detect start/end markers in a recorded file")
-    d.add_argument("--channel", choices=["mono", "L", "R"], default="mono", help="which channel to use for DTMF detection")
+    # ------- detect -------
+    d.add_argument("--channel", choices=["mono", "L", "R"], default="mono",
+                   help="which channel to use for DTMF detection")
     d.add_argument("--wav", required=True)
     d.add_argument("--marker-start", default="99#*")
     d.add_argument("--marker-end", default="*#99")
@@ -1121,16 +1336,25 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--dump-events", action="store_true")
     d.add_argument("--plot", action="store_true")
     d.add_argument("--json", action="store_true", help="print JSON to stdout")
+    d.add_argument("--marker-tone-s", type=float, default=0.22)
+    d.add_argument("--marker-gap-s", type=float, default=0.04)
+    d.add_argument("--dtmf-dedupe-s", type=float, default=None,
+                help="merge same-symbol detections within this many seconds (default: 0.5*(marker-tone-s + marker-gap-s))")
+    d.add_argument("--dtmf-stats", action="store_true", help="print DTMF timing stats")
     d.set_defaults(func=cmd_detect)
 
-    a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
+    # ------- analyze -------
     a.add_argument("--channels", type=parse_channels, default="stereo")
     a.add_argument("--marker-channel", choices=["mono", "L", "R"], default="mono",
-                help="channel used for DTMF marker detection/layout timing")
+                   help="channel used for DTMF marker detection/layout timing")
     a.add_argument("--ref", required=True, help="reference generated WAV (the one you played out)")
     a.add_argument("--rec", required=True, help="recorded capture from cassette playback")
     a.add_argument("--loopback", default=None, help="optional loopback capture to subtract interface coloration")
     a.add_argument("--outdir", default="cassette_results")
+
+    a.add_argument("--dtmf-dedupe-s", type=float, default=None,
+                help="merge same-symbol detections within this many seconds (default: 0.5*(marker-tone+gap))")
+    a.add_argument("--dtmf-stats", action="store_true", help="print DTMF timing stats")
 
     a.add_argument("--marker-start", default="99#*")
     a.add_argument("--marker-end", default="*#99")
@@ -1139,12 +1363,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--marker-dbfs", type=float, default=-12.0)
 
     a.add_argument(
-    "--countdown",
-    action=argparse.BooleanOptionalAction,
-    default=True,
-    help="expect DTMF countdown in layout (default: on; disable with --no-countdown)",
+        "--countdown",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="expect DTMF countdown in layout (default: on; disable with --no-countdown)",
     )
-
     a.add_argument("--countdown-from", type=int, default=10)
 
     a.add_argument("--pre-s", type=float, default=1.0)
@@ -1168,26 +1391,71 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--thresh", type=float, default=6.0)
     a.add_argument("--min-dbfs", type=float, default=-55.0)
 
-    a.add_argument("--drift-warn", type=float, default=0.002, help="warn if drift ratio differs more than this")
-    a.add_argument("--fine-align", action="store_true", help="apply small correlation-based lag correction after warp")
+    a.add_argument("--drift-warn", type=float, default=0.002,
+                   help="warn if drift ratio differs more than this")
+    a.add_argument(
+        "--fine-align",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="apply small correlation-based lag correction after warp",
+    )
 
-    # SNR knobs
-    a.add_argument("--snr-noise-s", type=float, default=1.0, help="seconds used from noise window (<= noisewin-s)")
-    a.add_argument("--snr-tone-s", type=float, default=3.0, help="seconds used from middle of tone for RMS")
+    a.add_argument("--snr-noise-s", type=float, default=1.0,
+                   help="seconds used from noise window (<= noisewin-s)")
+    a.add_argument("--snr-tone-s", type=float, default=3.0,
+                   help="seconds used from middle of tone for RMS")
 
-    a.add_argument("--save-ir", action="store_true", help="also save impulse.png")
+    # Optional improvement: allow --no-save-ir if config sets it true
+    a.add_argument(
+        "--save-ir",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="also save impulse.png",
+    )
+
     a.add_argument("--json", action="store_true", help="print summary JSON to stdout")
-
     a.set_defaults(func=cmd_analyze)
 
-    return ap
+    return ap, {"gen": g, "detect": d, "analyze": a}
 
+# ----------------------
+# MAIN
+# ----------------------
 
 def main() -> None:
-    ap = build_parser()
-    args = ap.parse_args()
-    args.func(args)
+    argv = sys.argv[1:]
 
+    # Grab config/preset anywhere in argv (before/after subcommand)
+    cfg_path = _scan_argv_value(argv, "--config")
+    preset = _scan_argv_value(argv, "--preset")
+
+    cfg = load_toml_config(cfg_path)
+
+    ap, cmd_parsers = build_parser()
+
+    # Apply base sections: [gen], [detect], [analyze]
+    for cmd, p in cmd_parsers.items():
+        base = flatten_cmd_defaults(cmd, cfg.get(cmd, {}))
+        apply_config_to_subparser(p, base, label=f"{cmd}")
+
+    # Apply optional presets: [presets.<name>.<cmd>]
+    if preset:
+        presets = cfg.get("presets", {})
+        pset = presets.get(preset, {}) if isinstance(presets, dict) else {}
+        if not isinstance(pset, dict):
+            pset = {}
+        for cmd, p in cmd_parsers.items():
+            override = flatten_cmd_defaults(cmd, pset.get(cmd, {}))
+            apply_config_to_subparser(p, override, label=f"presets.{preset}.{cmd}")
+
+    argv2 = _strip_known_opts(argv, ["--config", "--preset"])
+    args = ap.parse_args(argv2)
+
+    # Basic console logging (only if nothing configured yet)
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    args.func(args)
 
 if __name__ == "__main__":
     main()
