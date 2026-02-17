@@ -62,7 +62,7 @@ python3 cassette_calibrator.py gen --out sweepcass.wav --pre-s 3 --noisewin-s 2
 **A) Record pass (interface -> deck -> tape)**
 - Connect **interface line out** (L/R) -> deck **line in / aux in** (do **not** use mic inputs).
 - Play `sweepcass.wav` from a player that doesn’t resample or add DSP.
-  - Avoid OS “audio enhancements”, spatial sound, EQ, loudness normalization, etc.
+  - Avoid OS “audio enhancements” at all costs! Disable **all** spatial sound, EQ, loudness normalization and other audio enhancements from your audio host device.
   - Don’t let system sounds mix into the output.
 - Start deck recording, then start playback of `sweepcass.wav` from the beginning.
 - When the file reaches the **1 kHz reference tone**, set the deck’s record level:
