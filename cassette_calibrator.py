@@ -58,21 +58,18 @@ import matplotlib.pyplot as plt
 def db(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return 20.0 * np.log10(np.maximum(np.abs(x), eps))
 
-
 def rms(x: np.ndarray, eps: float = 1e-12) -> float:
     x = np.asarray(x, dtype=np.float32)
     return float(np.sqrt(np.mean(x * x) + eps))
 
-
 def to_float32(y: np.ndarray) -> np.ndarray:
-    if y.ndim == 2:
-        y = y.mean(axis=1)
+    y = np.asarray(y)
+    # DO NOT downmix here. Keep channels intact.
     if y.dtype == np.int16:
-        return (y.astype(np.float32) / 32767.0)
+        return (y.astype(np.float32) / 32768.0)
     if y.dtype == np.int32:
-        return (y.astype(np.float32) / 2147483647.0)
+        return (y.astype(np.float32) / 2147483648.0)
     return y.astype(np.float32)
-
 
 def write_wav_int16(path: Path, sr: int, x: np.ndarray) -> None:
     x = np.asarray(x, dtype=np.float32)
@@ -80,20 +77,45 @@ def write_wav_int16(path: Path, sr: int, x: np.ndarray) -> None:
     y = (x * 32767.0).astype(np.int16)
     wavfile.write(str(path), sr, y)
 
+def to_mono(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 1:
+        return y
+    return y.mean(axis=1).astype(np.float32)
 
-def read_wav_mono(path: Path) -> Tuple[int, np.ndarray]:
+def read_wav(path: Path) -> Tuple[int, np.ndarray]:
     sr, y = wavfile.read(str(path))
     return sr, to_float32(y)
 
+def pick_channel(y: np.ndarray, channel: str) -> np.ndarray:
+    """
+    channel: "mono", "L", "R"
+    Returns 1D float32.
+    """
+    y = np.asarray(y, dtype=np.float32)
+    c = (channel or "mono").strip().lower()
+
+    if y.ndim == 1:
+        return y
+
+    if c in ["l", "left"]:
+        return y[:, 0].astype(np.float32)
+    if c in ["r", "right"]:
+        idx = 1 if y.shape[1] > 1 else 0
+        return y[:, idx].astype(np.float32)
+
+    return y.mean(axis=1).astype(np.float32)
+
+def read_wav_mono(path: Path) -> Tuple[int, np.ndarray]:
+    sr, y = read_wav(path)
+    return sr, to_mono(y)
 
 def amp_from_dbfs(dbfs: float) -> float:
     # 0 dBFS -> 1.0 peak. -20 dBFS -> 0.1 peak.
     return float(10.0 ** (dbfs / 20.0))
 
-
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
-
 
 def extract(x: np.ndarray, start_s: float, dur_s: float, sr: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
@@ -109,7 +131,6 @@ def extract(x: np.ndarray, start_s: float, dur_s: float, sr: int) -> np.ndarray:
     if end > len(x):
         x = np.pad(x, (0, end - len(x)))
     return x[start:end]
-
 
 def resample_to_length(x: np.ndarray, target_len: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
@@ -524,7 +545,9 @@ def cmd_gen(args: argparse.Namespace) -> None:
 
 
 def cmd_detect(args: argparse.Namespace) -> None:
-    sr, x = read_wav_mono(Path(args.wav))
+    sr, y = read_wav(Path(args.wav))
+    x = pick_channel(y, args.channel)
+
     events = detect_dtmf_events(
         x, sr,
         win_ms=args.win_ms,
@@ -538,6 +561,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
     result = {
         "wav": str(args.wav),
         "sr": sr,
+        "channel": args.channel,
         "marker_start": args.marker_start,
         "marker_end": args.marker_end,
         "t_marker_start": t_start,
@@ -549,7 +573,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
         print(json.dumps(result, indent=2))
         return
 
-    print(f"Detected {len(events)} DTMF events")
+    print(f"Detected {len(events)} DTMF events (channel={args.channel})")
     print(f"marker_start '{args.marker_start}': {t_start if t_start is not None else 'NOT FOUND'}")
     print(f"marker_end   '{args.marker_end}': {t_end if t_end is not None else 'NOT FOUND'}")
 
@@ -564,27 +588,30 @@ def cmd_detect(args: argparse.Namespace) -> None:
         plt.grid(True)
         plt.xlabel("Time (s)")
         plt.ylabel("Event index")
-        plt.title("DTMF detections over time")
+        plt.title(f"DTMF detections over time (channel={args.channel})")
         if t_start is not None:
             plt.axvline(t_start, linestyle="--")
         if t_end is not None:
             plt.axvline(t_end, linestyle="--")
         plt.show()
 
-
 def cmd_analyze(args: argparse.Namespace) -> None:
     outdir = Path(args.outdir)
     ensure_dir(outdir)
 
-    sr_ref, ref = read_wav_mono(Path(args.ref))
-    sr_rec, rec = read_wav_mono(Path(args.rec))
+    sr_ref, ref_y = read_wav(Path(args.ref))
+    sr_rec, rec_y = read_wav(Path(args.rec))
     if sr_ref != sr_rec:
         raise SystemExit(f"Sample rates differ: ref={sr_ref}, rec={sr_rec}. Resample one first.")
     sr = sr_ref
 
-    # Detect markers in recording
+    # Marker detection uses a selectable channel (default mono)
+    rec_marker = pick_channel(rec_y, args.marker_channel)
+    ref_marker = pick_channel(ref_y, args.marker_channel)
+
+    # Detect markers in recording (marker channel)
     events = detect_dtmf_events(
-        rec, sr,
+        rec_marker, sr,
         win_ms=args.win_ms,
         hop_ms=args.hop_ms,
         thresh_ratio=args.thresh,
@@ -602,7 +629,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     # Detect marker_start in ref too (robust if user edited pre-silence)
     events_ref = detect_dtmf_events(
-        ref, sr,
+        ref_marker, sr,
         win_ms=args.win_ms,
         hop_ms=args.hop_ms,
         thresh_ratio=args.thresh,
@@ -612,8 +639,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if t_rs is None:
         t_rs = args.pre_s  # fallback assumption
 
-    # Compute layout offsets
-    marker_dur = len(dtmf_sequence(args.marker_start, sr, args.marker_tone_s, args.marker_gap_s, amp_from_dbfs(args.marker_dbfs))) / sr
+    # Layout constants
+    marker_dur = len(dtmf_sequence(
+        args.marker_start, sr, args.marker_tone_s, args.marker_gap_s, amp_from_dbfs(args.marker_dbfs)
+    )) / sr
 
     cd_dur = 0.0
     if args.countdown:
@@ -624,11 +653,19 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             cd_audio.append(np.zeros(int(sr * 0.12), dtype=np.float32))
         cd_dur = (sum(len(a) for a in cd_audio) / sr) if cd_audio else 0.0
 
-    # After marker_start: noisewin + pad + (countdown) + pad + tone + pad => sweep
-    sweep_start_offset = marker_dur + args.noisewin_s + args.pad_s + cd_dur + args.pad_s + args.tone_s + args.pad_s
-    ref_sweep = extract(ref, t_rs + sweep_start_offset, args.sweep_s, sr)
+    sweep_start_offset = (
+        marker_dur
+        + args.noisewin_s + args.pad_s
+        + cd_dur + args.pad_s
+        + args.tone_s + args.pad_s
+    )
 
-    # Drift ratio using marker-to-marker distance (timestamps are at the START of the marker sequence)
+    # Reference sweep always taken from mono of ref (gen output is mono anyway)
+    ref_mono = pick_channel(ref_y, "mono")
+    ref_sweep = extract(ref_mono, t_rs + sweep_start_offset, args.sweep_s, sr)
+    target_len = len(ref_sweep)
+
+    # Drift ratio using marker-to-marker distance (timestamps at START of marker sequence)
     expected_between = (
         marker_dur
         + args.noisewin_s + args.pad_s
@@ -639,65 +676,94 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     actual_between = (t_me - t_ms)
     drift_ratio = expected_between / max(actual_between, 1e-9)
 
-    target_len = len(ref_sweep)
-
-    # Only apply time-warp if drift is meaningfully non-1.0
     if abs(drift_ratio - 1.0) > args.drift_warn:
         drift_applied = True
         rec_sweep_dur = args.sweep_s / max(drift_ratio, 1e-9)
+        sweep_start_offset_rec = sweep_start_offset / max(drift_ratio, 1e-9)
         print(f"[warn] drift ratio {drift_ratio:.6f} (expected/actual) -- applying linear warp")
     else:
         drift_applied = False
         rec_sweep_dur = args.sweep_s
+        sweep_start_offset_rec = sweep_start_offset
 
-    sweep_start_offset_rec = sweep_start_offset
-    if drift_applied:
-        sweep_start_offset_rec = sweep_start_offset / max(drift_ratio, 1e-9)
+    # Loopback pre-load (optional) + marker location for loopback
+    lb_y = None
+    t_lbs = None
+    t_lbe = None
+    drift_ratio_lb = 1.0
+    drift_applied_lb = False
+    lb_sweep_dur = args.sweep_s
+    sweep_start_offset_lb = sweep_start_offset
 
-    rec_sweep_raw = extract(rec, t_ms + sweep_start_offset_rec, rec_sweep_dur, sr)
-    rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
-
-    if args.fine_align:
-        corr = signal.fftconvolve(rec_sweep_warped, ref_sweep[::-1], mode="full")
-        lag = int(np.argmax(corr) - (len(ref_sweep) - 1))
-        if lag != 0:
-            if lag > 0:
-                rec_sweep_warped = rec_sweep_warped[lag:]
-                rec_sweep_warped = np.pad(rec_sweep_warped, (0, target_len - len(rec_sweep_warped)))
-            else:
-                rec_sweep_warped = np.pad(rec_sweep_warped, (abs(lag), 0))
-                rec_sweep_warped = rec_sweep_warped[:target_len]
-            print(f"[info] fine-align lag={lag} samples ({lag/sr*1000:.2f} ms)")
-
-    res = analyze_chain(
-        ref_sweep=ref_sweep,
-        rec_sweep=rec_sweep_warped,
-        sr=sr,
-        f1=args.f1,
-        f2=args.f2,
-        T=args.sweep_s,
-        ir_win_s=args.ir_win_s,
-        smooth_oct=args.smooth_oct,
-        fmin=args.f_plot_min,
-        fmax=args.f_plot_max,
-    )
-
-    diff_db_s = None
     if args.loopback:
-        sr_lb, lb = read_wav_mono(Path(args.loopback))
+        sr_lb, lb_y = read_wav(Path(args.loopback))
         if sr_lb != sr:
             raise SystemExit("Loopback sample rate differs. Resample first.")
 
-        events_lb = detect_dtmf_events(lb, sr, win_ms=args.win_ms, hop_ms=args.hop_ms, thresh_ratio=args.thresh, min_dbfs=args.min_dbfs)
+        lb_marker = pick_channel(lb_y, args.marker_channel)
+        events_lb = detect_dtmf_events(lb_marker, sr, win_ms=args.win_ms, hop_ms=args.hop_ms, thresh_ratio=args.thresh, min_dbfs=args.min_dbfs)
         t_lbs = find_sequence(events_lb, args.marker_start)
-        if t_lbs is None:
-            raise SystemExit("Could not find marker_start in loopback file.")
-        lb_sweep = extract(lb, t_lbs + sweep_start_offset, args.sweep_s, sr)
-        lb_sweep = resample_to_length(lb_sweep, len(ref_sweep))
+        t_lbe = find_sequence(events_lb, args.marker_end)
+        if t_lbs is None or t_lbe is None or t_lbe <= t_lbs:
+            raise SystemExit("Could not find valid markers in loopback file.")
 
-        res_lb = analyze_chain(
+        actual_between_lb = (t_lbe - t_lbs)
+        drift_ratio_lb = expected_between / max(actual_between_lb, 1e-9)
+
+        if abs(drift_ratio_lb - 1.0) > args.drift_warn:
+            drift_applied_lb = True
+            lb_sweep_dur = args.sweep_s / max(drift_ratio_lb, 1e-9)
+            sweep_start_offset_lb = sweep_start_offset / max(drift_ratio_lb, 1e-9)
+            print(f"[warn] loopback drift ratio {drift_ratio_lb:.6f} -- applying linear warp")
+        else:
+            drift_applied_lb = False
+            lb_sweep_dur = args.sweep_s
+            sweep_start_offset_lb = sweep_start_offset
+
+    # Decide which channels to analyze
+    mode = (args.channels or "mono").strip().lower()
+    if mode in ["stereo", "lr", "l+r"]:
+        ch_list = ["L", "R"]
+    elif mode in ["l", "left"]:
+        ch_list = ["L"]
+    elif mode in ["r", "right"]:
+        ch_list = ["R"]
+    else:
+        ch_list = ["mono"]
+
+    def out_suffix(ch: str) -> str:
+        # keep legacy names if analyzing only mono
+        if ch_list == ["mono"]:
+            return ""
+        return "_" + ch.lower()
+
+    per_ch = {}
+    results = {}      # AnalysisResult
+    diffs = {}        # Optional[np.ndarray]
+    snrs = {}         # Optional[float]
+    snr_parts_all = {}
+    snr_warnings_all = {}
+
+    for ch in ch_list:
+        rec_ch = pick_channel(rec_y, ch)
+        rec_sweep_raw = extract(rec_ch, t_ms + sweep_start_offset_rec, rec_sweep_dur, sr)
+        rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
+
+        if args.fine_align:
+            corr = signal.fftconvolve(rec_sweep_warped, ref_sweep[::-1], mode="full")
+            lag = int(np.argmax(corr) - (len(ref_sweep) - 1))
+            if lag != 0:
+                if lag > 0:
+                    rec_sweep_warped = rec_sweep_warped[lag:]
+                    rec_sweep_warped = np.pad(rec_sweep_warped, (0, target_len - len(rec_sweep_warped)))
+                else:
+                    rec_sweep_warped = np.pad(rec_sweep_warped, (abs(lag), 0))
+                    rec_sweep_warped = rec_sweep_warped[:target_len]
+                print(f"[info] fine-align ({ch}) lag={lag} samples ({lag/sr*1000:.2f} ms)")
+
+        res = analyze_chain(
             ref_sweep=ref_sweep,
-            rec_sweep=lb_sweep,
+            rec_sweep=rec_sweep_warped,
             sr=sr,
             f1=args.f1,
             f2=args.f2,
@@ -707,68 +773,133 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             fmin=args.f_plot_min,
             fmax=args.f_plot_max,
         )
-        if len(res_lb.freq) == len(res.freq) and np.allclose(res_lb.freq, res.freq):
-            diff_db_s = res.mag_db_s - res_lb.mag_db_s
-        else:
-            diff_db_s = res.mag_db_s - np.interp(res.freq, res_lb.freq, res_lb.mag_db_s)
+        results[ch] = res
 
-    # SNR
-    snr_db, snr_parts, snr_warnings = compute_snr(
-        rec=rec,
-        sr=sr,
-        t_marker_start=t_ms,
-        marker_start=args.marker_start,
-        marker_tone_s=args.marker_tone_s,
-        marker_gap_s=args.marker_gap_s,
-        marker_dbfs=args.marker_dbfs,
-        noisewin_s=args.noisewin_s,
-        pad_s=args.pad_s,
-        countdown=args.countdown,
-        countdown_from=args.countdown_from,
-        tone_s=args.tone_s,
-        tone_hz=args.tone_hz,
-        snr_noise_s=args.snr_noise_s,
-        snr_tone_s=args.snr_tone_s,
-    )
+        diff_db_s = None
+        if lb_y is not None:
+            lb_ch = pick_channel(lb_y, ch)
+            lb_sweep_raw = extract(lb_ch, t_lbs + sweep_start_offset_lb, lb_sweep_dur, sr)
+            lb_sweep_warped = resample_to_length(lb_sweep_raw, target_len)
 
-    # Export plots/data
-    save_csv(outdir / "response.csv", res.freq, res.mag_db, res.mag_db_s, diff_db_s)
+            res_lb = analyze_chain(
+                ref_sweep=ref_sweep,
+                rec_sweep=lb_sweep_warped,
+                sr=sr,
+                f1=args.f1,
+                f2=args.f2,
+                T=args.sweep_s,
+                ir_win_s=args.ir_win_s,
+                smooth_oct=args.smooth_oct,
+                fmin=args.f_plot_min,
+                fmax=args.f_plot_max,
+            )
 
-    plt.figure()
-    plt.semilogx(res.freq, res.mag_db_s)
-    plt.grid(True, which="both")
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Magnitude (dB, smoothed)")
-    plt.title("Cassette chain magnitude response")
-    plt.tight_layout()
-    plt.savefig(outdir / "response.png", dpi=150)
+            if len(res_lb.freq) == len(res.freq) and np.allclose(res_lb.freq, res.freq):
+                diff_db_s = res.mag_db_s - res_lb.mag_db_s
+            else:
+                diff_db_s = res.mag_db_s - np.interp(res.freq, res_lb.freq, res_lb.mag_db_s)
 
-    if diff_db_s is not None:
+        diffs[ch] = diff_db_s
+
+        # SNR per channel
+        snr_db, snr_parts, snr_warnings = compute_snr(
+            rec=rec_ch,
+            sr=sr,
+            t_marker_start=t_ms,
+            marker_start=args.marker_start,
+            marker_tone_s=args.marker_tone_s,
+            marker_gap_s=args.marker_gap_s,
+            marker_dbfs=args.marker_dbfs,
+            noisewin_s=args.noisewin_s,
+            pad_s=args.pad_s,
+            countdown=args.countdown,
+            countdown_from=args.countdown_from,
+            tone_s=args.tone_s,
+            tone_hz=args.tone_hz,
+            snr_noise_s=args.snr_noise_s,
+            snr_tone_s=args.snr_tone_s,
+        )
+        snrs[ch] = snr_db
+        snr_parts_all[ch] = snr_parts
+        snr_warnings_all[ch] = snr_warnings
+
+        # Export per-channel
+        save_csv(outdir / f"response{out_suffix(ch)}.csv", res.freq, res.mag_db, res.mag_db_s, diff_db_s)
+
         plt.figure()
-        plt.semilogx(res.freq, diff_db_s)
+        plt.semilogx(res.freq, res.mag_db_s)
         plt.grid(True, which="both")
         plt.xlabel("Frequency (Hz)")
-        plt.ylabel("Difference (dB, smoothed)")
-        plt.title("Cassette chain minus loopback")
+        plt.ylabel("Magnitude (dB, smoothed)")
+        plt.title(f"Cassette chain magnitude response ({ch})")
         plt.tight_layout()
-        plt.savefig(outdir / "difference.png", dpi=150)
+        plt.savefig(outdir / f"response{out_suffix(ch)}.png", dpi=150)
 
-    if args.save_ir:
+        if diff_db_s is not None:
+            plt.figure()
+            plt.semilogx(res.freq, diff_db_s)
+            plt.grid(True, which="both")
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("Difference (dB, smoothed)")
+            plt.title(f"Cassette chain minus loopback ({ch})")
+            plt.tight_layout()
+            plt.savefig(outdir / f"difference{out_suffix(ch)}.png", dpi=150)
+
+        if args.save_ir:
+            plt.figure()
+            tt = np.arange(len(res.ir), dtype=np.float32) / res.ir_sr
+            plt.plot(tt, res.ir)
+            plt.grid(True)
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude")
+            plt.title(f"Windowed impulse response segment ({ch})")
+            plt.tight_layout()
+            plt.savefig(outdir / f"impulse{out_suffix(ch)}.png", dpi=150)
+
+        per_ch[ch] = {
+            "snr_db": snr_db,
+            "snr_noise_rms": snr_parts.get("noise_rms"),
+            "snr_tone_rms": snr_parts.get("tone_rms"),
+            "snr_warnings": snr_warnings,
+            "outputs": {
+                "response_png": str(outdir / f"response{out_suffix(ch)}.png"),
+                "response_csv": str(outdir / f"response{out_suffix(ch)}.csv"),
+                "difference_png": str(outdir / f"difference{out_suffix(ch)}.png") if diffs[ch] is not None else None,
+                "impulse_png": str(outdir / f"impulse{out_suffix(ch)}.png") if args.save_ir else None,
+            }
+        }
+
+    # If stereo, export L-R smoothed difference plot
+    stereo_outputs = {}
+    if "L" in results and "R" in results:
+        resL = results["L"]
+        resR = results["R"]
+        if len(resL.freq) == len(resR.freq) and np.allclose(resL.freq, resR.freq):
+            lr_diff = resL.mag_db_s - resR.mag_db_s
+            lr_freq = resL.freq
+        else:
+            lr_freq = resL.freq
+            lr_diff = resL.mag_db_s - np.interp(lr_freq, resR.freq, resR.mag_db_s)
+
         plt.figure()
-        t = np.arange(len(res.ir), dtype=np.float32) / res.ir_sr
-        plt.plot(t, res.ir)
-        plt.grid(True)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Amplitude")
-        plt.title("Windowed impulse response segment")
+        plt.semilogx(lr_freq, lr_diff)
+        plt.grid(True, which="both")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("L - R (dB, smoothed)")
+        plt.title("Channel mismatch: L - R")
         plt.tight_layout()
-        plt.savefig(outdir / "impulse.png", dpi=150)
+        plt.savefig(outdir / "lr_diff.png", dpi=150)
+
+        stereo_outputs["lr_diff_png"] = str(outdir / "lr_diff.png")
 
     summary = {
         "sr": sr,
         "ref": str(args.ref),
         "rec": str(args.rec),
         "loopback": str(args.loopback) if args.loopback else None,
+
+        "channels_analyzed": ch_list,
+        "marker_channel": args.marker_channel,
 
         "marker_start": args.marker_start,
         "marker_end": args.marker_end,
@@ -780,10 +911,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         "drift_ratio_expected_over_actual": drift_ratio,
         "drift_applied": drift_applied,
 
-        "snr_db": snr_db,
-        "snr_noise_rms": snr_parts.get("noise_rms"),
-        "snr_tone_rms": snr_parts.get("tone_rms"),
-        "snr_warnings": snr_warnings,
+        "loopback_drift_ratio": drift_ratio_lb if args.loopback else None,
+        "loopback_drift_applied": drift_applied_lb if args.loopback else None,
 
         "f1": args.f1,
         "f2": args.f2,
@@ -791,13 +920,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         "ir_win_s": args.ir_win_s,
         "smooth_oct": args.smooth_oct,
 
-        "outputs": {
-            "response_png": str(outdir / "response.png"),
-            "response_csv": str(outdir / "response.csv"),
-            "difference_png": str(outdir / "difference.png") if diff_db_s is not None else None,
-            "impulse_png": str(outdir / "impulse.png") if args.save_ir else None,
-            "summary_json": str(outdir / "summary.json"),
-        }
+        "per_channel": per_ch,
+        "stereo_outputs": stereo_outputs,
+
+        "summary_json": str(outdir / "summary.json"),
     }
 
     (outdir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -806,11 +932,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         print(json.dumps(summary, indent=2))
 
     print(f"Wrote results to: {outdir}")
-    print("  response.png, response.csv, summary.json")
-    if diff_db_s is not None:
-        print("  difference.png (loopback comparison)")
-    if args.save_ir:
-        print("  impulse.png")
+    if ch_list == ["mono"]:
+        print("  response.png, response.csv, summary.json")
+        if args.loopback:
+            print("  difference.png")
+        if args.save_ir:
+            print("  impulse.png")
+    else:
+        for ch in ch_list:
+            print(f"  response_{ch.lower()}.png, response_{ch.lower()}.csv")
+            if args.loopback:
+                print(f"  difference_{ch.lower()}.png")
+            if args.save_ir:
+                print(f"  impulse_{ch.lower()}.png")
+        if "lr_diff_png" in stereo_outputs:
+            print("  lr_diff.png")
+        print("  summary.json")
 
 
 # -------------------------
@@ -856,6 +993,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.set_defaults(func=cmd_gen)
 
     d = sub.add_parser("detect", help="Detect start/end markers in a recorded file")
+    d.add_argument("--channel", choices=["mono", "L", "R"], default="mono", help="which channel to use for DTMF detection")
     d.add_argument("--wav", required=True)
     d.add_argument("--marker-start", default="99#*")
     d.add_argument("--marker-end", default="*#99")
@@ -869,6 +1007,10 @@ def build_parser() -> argparse.ArgumentParser:
     d.set_defaults(func=cmd_detect)
 
     a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
+    a.add_argument("--channels", choices=["mono", "L", "R", "stereo"], default="mono",
+                help="channels to analyze: mono, L, R, or stereo (exports L+R + lr_diff.png)")
+    a.add_argument("--marker-channel", choices=["mono", "L", "R"], default="mono",
+                help="channel used for DTMF marker detection/layout timing")
     a.add_argument("--ref", required=True, help="reference generated WAV (the one you played out)")
     a.add_argument("--rec", required=True, help="recorded capture from cassette playback")
     a.add_argument("--loopback", default=None, help="optional loopback capture to subtract interface coloration")
