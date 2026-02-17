@@ -58,6 +58,7 @@ python3 cassette_calibrator.py gen --out sweepcass.wav --pre-s 3 --noisewin-s 2
 * Record onto your master deck/cassette
 * Play back from the deck into your interface
 * Capture as `recorded.wav` (same sample rate as generated)
+* Record at 24-bit if you can; just keep the sample rate the same.
 
 Avoid any AGC/NR/enhancers in the interface path.
 
