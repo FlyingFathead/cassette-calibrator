@@ -224,9 +224,24 @@ def is_stereo_audio(y: np.ndarray) -> bool:
     y = np.asarray(y)
     return (y.ndim == 2 and y.shape[1] >= 2)
 
-def read_wav(path: Path) -> Tuple[int, np.ndarray]:
-    sr, y = wavfile.read(str(path))
-    return sr, to_float32(y)
+def to_float32(y: np.ndarray) -> np.ndarray:
+    y = np.asarray(y)
+
+    if y.dtype == np.uint8:
+        # 8-bit PCM is unsigned
+        return ((y.astype(np.float32) - 128.0) / 128.0)
+
+    if y.dtype == np.int16:
+        return (y.astype(np.float32) / 32768.0)
+
+    if y.dtype == np.int32:
+        maxabs = int(np.max(np.abs(y))) if y.size else 0
+        # Heuristic: PCM24 stored in int32 usually tops out near 2^23
+        if maxabs <= (2**23):
+            return (y.astype(np.float32) / 8388608.0)  # 2^23
+        return (y.astype(np.float32) / 2147483648.0)   # 2^31
+
+    return y.astype(np.float32)
 
 def pick_channel(y: np.ndarray, channel: str) -> np.ndarray:
     """
@@ -624,6 +639,13 @@ def analyze_chain(
     freq = freq[m]
     mag = mag[m]
     mag_s = octave_smooth(freq, mag, frac=smooth_oct) if smooth_oct > 0 else mag.copy()
+
+    # after mag = db(H), after you mask freq to fmin/fmax
+    refband = (freq >= 900.0) & (freq <= 1100.0)
+    if np.any(refband):
+        off = float(np.median(mag[refband]))
+        mag = mag - off
+        mag_s = mag_s - off
 
     return AnalysisResult(freq=freq, mag_db=mag, mag_db_s=mag_s, ir=ir, ir_sr=sr)
 
