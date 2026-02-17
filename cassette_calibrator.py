@@ -142,30 +142,43 @@ DTMF: Dict[str, Tuple[int, int]] = {
 ROWS = [697, 770, 852, 941]
 COLS = [1209, 1336, 1477, 1633]
 
+# helper for dialtones
+def raised_cosine_env(n: int, sr: int, ramp_ms: float) -> np.ndarray:
+    env = np.ones(n, dtype=np.float32)
+    r = int(round(sr * ramp_ms / 1000.0))
+    if r <= 0:
+        return env
+    if 2 * r >= n:
+        # too short tone for the ramp; fall back to full Hann
+        return signal.windows.hann(n, sym=False).astype(np.float32)
 
-def dtmf_tone(sym: str, sr: int, dur_s: float, amp: float) -> np.ndarray:
+    k = np.arange(1, r + 1, dtype=np.float32) / r
+    ramp = 0.5 - 0.5 * np.cos(np.pi * k)  # 0 -> 1
+    env[:r] = ramp
+    env[-r:] = ramp[::-1]
+    return env
+
+def dtmf_tone(sym: str, sr: int, dur_s: float, amp: float, ramp_ms: float = 5.0) -> np.ndarray:
     if sym not in DTMF:
         raise ValueError(f"Unknown DTMF symbol: {sym}")
     f1, f2 = DTMF[sym]
     n = int(sr * dur_s)
     t = np.arange(n, dtype=np.float32) / sr
-    w = signal.windows.hann(n, sym=False).astype(np.float32) if n >= 16 else np.ones(n, dtype=np.float32)
-    y = amp * (np.sin(2 * np.pi * f1 * t) + np.sin(2 * np.pi * f2 * t)) * w * 0.5
+
+    y = amp * 0.5 * (np.sin(2 * np.pi * f1 * t) + np.sin(2 * np.pi * f2 * t))
+    y *= raised_cosine_env(n, sr, ramp_ms)
     return y.astype(np.float32)
 
-
-def dtmf_sequence(seq: str, sr: int, tone_dur: float, gap: float, amp: float) -> np.ndarray:
+def dtmf_sequence(seq: str, sr: int, tone_dur: float, gap: float, amp: float, ramp_ms: float = 5.0) -> np.ndarray:
     parts: List[np.ndarray] = []
     z_gap = np.zeros(int(sr * gap), dtype=np.float32)
     for ch in seq:
-        parts.append(dtmf_tone(ch, sr, tone_dur, amp))
+        parts.append(dtmf_tone(ch, sr, tone_dur, amp, ramp_ms=ramp_ms))
         parts.append(z_gap)
     return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
-
 def countdown_tokens(n: int = 10) -> List[str]:
     return [str(n)] + [str(k) for k in range(n - 1, 0, -1)]
-
 
 def goertzel_power(x: np.ndarray, sr: int, f: float) -> float:
     w = 2.0 * np.pi * f / sr
@@ -446,8 +459,14 @@ def cmd_gen(args: argparse.Namespace) -> None:
     post = np.zeros(int(sr * args.post_s), dtype=np.float32)
     pad = np.zeros(int(sr * args.pad_s), dtype=np.float32)
 
-    marker_start = dtmf_sequence(args.marker_start, sr, args.marker_tone_s, args.marker_gap_s, marker_amp)
-    marker_end = dtmf_sequence(args.marker_end, sr, args.marker_tone_s, args.marker_gap_s, marker_amp)
+    marker_start = dtmf_sequence(
+        args.marker_start, sr, args.marker_tone_s, args.marker_gap_s, marker_amp,
+        ramp_ms=args.dtmf_ramp_ms
+    )
+    marker_end = dtmf_sequence(
+        args.marker_end, sr, args.marker_tone_s, args.marker_gap_s, marker_amp,
+        ramp_ms=args.dtmf_ramp_ms
+    )
 
     noisewin = np.zeros(int(sr * args.noisewin_s), dtype=np.float32)
 
@@ -456,7 +475,10 @@ def cmd_gen(args: argparse.Namespace) -> None:
         tokens = countdown_tokens(args.countdown_from)
         parts: List[np.ndarray] = []
         for tok in tokens:
-            parts.append(dtmf_sequence(tok, sr, args.marker_tone_s, args.marker_gap_s, marker_amp * 0.9))
+            parts.append(dtmf_sequence(
+                tok, sr, args.marker_tone_s, args.marker_gap_s, marker_amp * 0.9,
+                ramp_ms=args.dtmf_ramp_ms
+            ))
             parts.append(np.zeros(int(sr * 0.12), dtype=np.float32))
         cd = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
@@ -782,6 +804,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV")
+
+    g.add_argument("--dtmf-ramp-ms", type=float, default=5.0,
+               help="DTMF attack/release ramp in ms (short = pointier; 0 = hard gate)")
     g.add_argument("--out", default="sweepcass.wav")
     g.add_argument("--sr", type=int, default=44100)
     g.add_argument("--pre-s", type=float, default=1.0)
