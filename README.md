@@ -1,6 +1,6 @@
 # cassette-calibrator
 
-A CLI tool for measuring and calibrating a compact cassette recording/playback chain using an audio test program and automated alignment.
+A CLI tool for measuring and calibrating a compact cassette recording/playback chain using an audio test program and automated alignment. Also comes with an optional local WebUI for ease of use.
 
 It generates a cassette-friendly measurement WAV with user-configurable DTMF markers, then analyzes a recorded playback capture to estimate the chain's magnitude response (and optional loopback-subtracted response), plus an SNR estimate.
 
@@ -12,7 +12,7 @@ It generates a cassette-friendly measurement WAV with user-configurable DTMF mar
   - DTMF countdown (default on; mostly for humans, alignment uses start/end markers)
   - 1 kHz reference tone for setting record level
   - ESS log sweep (default 20 Hz -> 20 kHz)
-  - Optional periodic DTMF "ticks" embedded during the sweep (for non-linear drift correction)  
+  - Optional periodic DTMF "ticks" embedded during the sweep (for non-linear drift correction)
   - DTMF end marker
 
 - Analyzes a recorded capture by:
@@ -38,6 +38,41 @@ Notes:
 * `soundfile` is currently listed in `requirements.txt` (optional / future-proofing for better audio I/O).
 * If you want minimal deps, remove `soundfile` from `requirements.txt` unless you actually use it in code.
 
+## Local WebUI (optional)
+
+A local-only, stdlib-only WebUI is included as `webui.py`. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
+
+Launch:
+
+```bash
+python3 webui.py
+# options:
+# python3 webui.py --host 127.0.0.1 --port 8765
+# python3 webui.py --no-browser
+```
+
+Config (optional) via `cassette_calibrator.toml`:
+
+```toml
+[webui]
+host = "127.0.0.1"
+port = 8765
+open_browser = true
+```
+
+**Important:** the WebUI only accepts **relative paths under the project directory** (no absolute paths, no "..").
+If you paste `/home/you/recorded.wav`, you'll get:
+
+`ERROR: path must be relative (no absolute paths, no '..')`
+
+Fix: put the file under the repo (recommended `data/`) and use `data/recorded.wav` (or use the Browse button which returns relative paths).
+
+Security posture:
+
+* Binds to `127.0.0.1` by default.
+* Rejects absolute paths and any `..` traversal.
+* Only serves/browses files under the project directory.
+
 ## Workflow
 
 ### 1) Generate the test WAV
@@ -57,26 +92,31 @@ python3 cassette_calibrator.py gen --out sweepcass.wav --pre-s 3 --noisewin-s 2
 ### 2) Print to tape and capture playback
 
 **Before you start (quick sanity):**
-- Clean heads + capstan + pinch roller.
-- Set the deck’s tape type correctly (Type I/II/IV).
-- Disable anything “helpful” in the chain: Dolby/NR, EQ, AGC, enhancers, expander, etc. (deck + interface mixer + OS).
+
+* Clean heads + capstan + pinch roller.
+* Set the deck’s tape type correctly (Type I/II/IV).
+* Disable anything "helpful" in the chain: Dolby/NR, EQ, AGC, enhancers, expander, etc. (deck + interface mixer + OS).
 
 **A) Record pass (interface -> deck -> tape)**
-- Connect **interface line out** (L/R) -> deck **line in / aux in** (do **not** use mic inputs).
-- Play `sweepcass.wav` from a player that doesn’t resample or add DSP.
-  - Avoid OS “audio enhancements” at all costs! Disable **all** spatial sound, EQ, loudness normalization and other audio enhancements from your audio host device.
-  - Don’t let system sounds mix into the output.
-- Start deck recording, then start playback of `sweepcass.wav` from the beginning.
-- When the file reaches the **1 kHz reference tone**, set the deck’s record level:
-  - Aim for a safe, repeatable level (avoid clipping/redlining).
-  - The goal is consistency, not “as hot as possible”.
-- Rewind and do a clean, uninterrupted record pass of the full file (including pre/post silence).
+
+* Connect **interface line out** (L/R) -> deck **line in / aux in** (do **not** use mic inputs).
+* Play `sweepcass.wav` from a player that doesn’t resample or add DSP.
+
+  * Avoid OS "audio enhancements" at all costs! Disable **all** spatial sound, EQ, loudness normalization and other audio enhancements from your audio host device.
+  * Don’t let system sounds mix into the output.
+* Start deck recording, then start playback of `sweepcass.wav` from the beginning.
+* When the file reaches the **1 kHz reference tone**, set the deck’s record level:
+
+  * Aim for a safe, repeatable level (avoid clipping/redlining).
+  * The goal is consistency, not "as hot as possible".
+* Rewind and do a clean, uninterrupted record pass of the full file (including pre/post silence).
 
 **B) Playback capture (deck -> interface -> WAV)**
-- Connect deck **line out / rec out** -> **interface line in**.
-- Capture as `recorded.wav` at the **same sample rate** as generated (default 44.1 kHz).
-- Record at **24-bit** if you can; leave headroom (avoid clipping).
-- Start recording first, then start cassette playback; stop after the end marker + post silence.
+
+* Connect deck **line out / rec out** -> **interface line in**.
+* Capture as `recorded.wav` at the **same sample rate** as generated (default 44.1 kHz).
+* Record at **24-bit** if you can; leave headroom (avoid clipping).
+* Start recording first, then start cassette playback; stop after the end marker + post silence.
 
 Avoid any AGC/NR/enhancers in the interface path.
 
@@ -148,25 +188,38 @@ In `--outdir`:
 ## Notes and gotchas
 
 * HF loss is often mechanical (azimuth, head wear, dirty path, wrong tape-type EQ) before it's "EQ fixing".
+
 * Cassette transports drift. This tool compensates drift with a linear warp between start/end markers.
+
 * For non-linear drift (wow/flutter), enable ticks mode (`gen --ticks` + `analyze --ticks`) for piecewise correction.
+
 * If marker detection fails:
 
   * Generate hotter markers: `--marker-dbfs -10`
   * Loosen detection: lower `--thresh` (e.g. 4.5) or set `--min-dbfs -60`
 
 * Before measuring: clean heads/capstan/pinch roller; check azimuth if HF looks nuked.
+
 * Set record level using the 1 kHz reference tone (avoid clipping / redlining).
+
 * Keep any NR / enhancers off unless you are specifically measuring them.
 
+* WebUI paths are **relative to the project root**. Put files under `data/` and browse/pick them.
+
 ## Changelog / History
-- 0.1.3 - x-axis plot style; drift alignment fixes and more
-  - Improved plot x-axis formatting/ticks for audio frequencies (20 Hz–20 kHz readability).
-  - Drift alignment fixes for more reliable marker-to-marker speed compensation.
-  - Better exports/plot naming consistency (response plots + CSV + summary JSON).
-- 0.1.2 - bugfixes; config changes; dedupe parsing
-- 0.1.1 - Patches to `--help` etc
-- 0.1.0 - Initial release
+
+* 0.1.4 - Local WebUI (stdlib) introduced; fixes
+  * Added `webui.py` local-only WebUI (binds to 127.0.0.1 by default).
+  * Modal file browser with directory creation and safe relative-path handling.
+  * Fixed onclick/quoting issues in generated browse list buttons.
+  * Documents relative-path requirement (no absolute paths / no "..").
+* 0.1.3 - x-axis plot style; drift alignment fixes and more
+  * Improved plot x-axis formatting/ticks for audio frequencies (20 Hz–20 kHz readability).
+  * Drift alignment fixes for more reliable marker-to-marker speed compensation.
+  * Better exports/plot naming consistency (response plots + CSV + summary JSON).
+* 0.1.2 - bugfixes; config changes; dedupe parsing
+* 0.1.1 - Patches to `--help` etc
+* 0.1.0 - Initial release
 
 ## About
 
