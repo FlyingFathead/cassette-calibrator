@@ -18,6 +18,8 @@ sweep_dbfs = -24.0
 peak = 0.90
 
 [detect]
+marker_start = "D#B*"
+marker_end   = "*B#D"
 channel = "mono"
 win_ms = 40.0
 hop_ms = 10.0

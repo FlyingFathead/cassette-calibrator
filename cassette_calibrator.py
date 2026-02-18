@@ -50,6 +50,7 @@ import numpy as np
 from scipy import signal
 from scipy.io import wavfile
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 
 import os
 import sys
@@ -865,29 +866,36 @@ def analyze_chain(
     fmin: float,
     fmax: float,
 ) -> AnalysisResult:
-    inv = ess_inverse_filter(f1, f2, T, sr, ref_sweep)
-    ir_full = signal.fftconvolve(rec_sweep, inv, mode="full").astype(np.float32)
+    # Frequency-domain transfer-function estimate:
+    # H(f) = R(f) * conj(S(f)) / (|S(f)|^2 + eps)
+    # This guarantees: if rec_sweep == ref_sweep, then H == 1 (flat), numerically.
+    ref_sweep = np.asarray(ref_sweep, dtype=np.float32)
+    rec_sweep = np.asarray(rec_sweep, dtype=np.float32)
 
-    peak_i = int(np.argmax(np.abs(ir_full)))
-    win = int(max(32, round(ir_win_s * sr)))
-    start = max(0, peak_i - win // 4)
+    n = int(max(len(ref_sweep), len(rec_sweep)))
+    if n <= 0:
+        return AnalysisResult(
+            freq=np.zeros(0, dtype=np.float32),
+            mag_db=np.zeros(0, dtype=np.float32),
+            mag_db_s=np.zeros(0, dtype=np.float32),
+            ir=np.zeros(0, dtype=np.float32),
+            ir_sr=sr,
+        )
 
-    ir = ir_full[start:start + win]
-    if len(ir) < win:
-        ir = np.pad(ir, (0, win - len(ir)))
-    ir = ir * signal.windows.hann(len(ir), sym=False).astype(np.float32)
-
-    nfft = int(2 ** math.ceil(math.log2(len(ir) * 8)))
-    H = np.fft.rfft(ir, n=nfft)
-    freq = np.fft.rfftfreq(nfft, 1.0 / sr)
-
-    mag_lin = np.abs(H).astype(np.float32)
-
-    m = (freq >= fmin) & (freq <= fmax)
-    freq = freq[m]
-    mag_lin = mag_lin[m]
+    nfft = int(2 ** math.ceil(math.log2(n * 2)))
+    S = np.fft.rfft(ref_sweep, n=nfft)
+    R = np.fft.rfft(rec_sweep, n=nfft)
 
     eps = 1e-12
+    H = (R * np.conj(S)) / (np.abs(S) ** 2 + eps)
+
+    freq_full = np.fft.rfftfreq(nfft, 1.0 / sr)
+    mag_lin_full = np.abs(H).astype(np.float32)
+
+    m = (freq_full >= fmin) & (freq_full <= fmax)
+    freq = freq_full[m].astype(np.float32)
+    mag_lin = mag_lin_full[m].astype(np.float32)
+
     mag = 20.0 * np.log10(np.maximum(mag_lin, eps))
 
     if smooth_oct > 0:
@@ -896,12 +904,23 @@ def analyze_chain(
     else:
         mag_s = mag.copy()
 
-    # 1 kHz-ish normalization (same as before)
+    # 1 kHz-ish normalization (keep the behavior)
     refband = (freq >= 900.0) & (freq <= 1100.0)
     if np.any(refband):
         off = float(np.median(mag[refband]))
         mag = mag - off
         mag_s = mag_s - off
+
+    # Optional: derive an IR preview from H for impulse.png
+    ir_full = np.fft.irfft(H, n=nfft).astype(np.float32)
+    peak_i = int(np.argmax(np.abs(ir_full))) if ir_full.size else 0
+    win = int(max(32, round(ir_win_s * sr)))
+    start = max(0, peak_i - win // 4)
+
+    ir = ir_full[start:start + win]
+    if len(ir) < win:
+        ir = np.pad(ir, (0, win - len(ir)))
+    ir = ir * signal.windows.hann(len(ir), sym=False).astype(np.float32)
 
     return AnalysisResult(freq=freq, mag_db=mag, mag_db_s=mag_s, ir=ir, ir_sr=sr)
 
@@ -909,6 +928,21 @@ def analyze_chain(
 # -------------------------
 # Export helpers
 # -------------------------
+
+def apply_audio_freq_ticks(ax, fmin: float, fmax: float) -> None:
+    ticks = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+    ticks = [t for t in ticks if (t >= fmin and t <= fmax)]
+    ax.set_xlim(fmin, fmax)
+    ax.set_xticks(ticks)
+
+    def fmt(x, _pos=None):
+        if x >= 1000:
+            k = x / 1000.0
+            return f"{int(k)}K" if abs(k - round(k)) < 1e-9 else f"{k:.1f}K"
+        return f"{int(x)}"
+
+    ax.xaxis.set_major_formatter(FuncFormatter(fmt))
+    ax.set_xlabel("Hertz/Kilohertz")
 
 def save_csv(path: Path, freq: np.ndarray, mag_db_arr: np.ndarray, mag_db_s_arr: np.ndarray, diff_db_s: Optional[np.ndarray]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -1445,21 +1479,23 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             matches = match_expected_to_detected(expected, det_tick_abs, float(args.tick_match_tol_s))
 
             if len(matches) >= int(args.tick_min_matches):
-                # Control points map ref-sample -> rec-sample
+                # Build control points + timing errors
                 ref_pts: List[float] = [0.0]
                 rec_pts: List[float] = [0.0]
+                errs: List[float] = []
 
-                errs = []
                 for kk, te, td in matches:
-                    if 0 <= kk < len(tick_layout_centers):
-                        t_layout = tick_layout_centers[kk]
-                    else:
+                    if not (0 <= kk < len(tick_layout_centers)):
                         continue
 
+                    t_layout = tick_layout_centers[kk]
                     ref_i = float(int(round(t_layout * sr)))
                     rec_i = float((td - sweep_abs_start) * sr)
 
-                    if 0.0 <= ref_i <= float(target_len - 1) and 0.0 <= rec_i <= float(max(len(rec_sweep_raw) - 1, 0)):
+                    if (
+                        0.0 <= ref_i <= float(target_len - 1)
+                        and 0.0 <= rec_i <= float(max(len(rec_sweep_raw) - 1, 0))
+                    ):
                         ref_pts.append(ref_i)
                         rec_pts.append(rec_i)
                         errs.append(float(td - te))
@@ -1468,29 +1504,49 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 ref_pts.append(float(target_len - 1))
                 rec_pts.append(float(max(len(rec_sweep_raw) - 1, 0)))
 
-                rec_sweep_warped = warp_by_control_points(rec_sweep_raw, ref_pts, rec_pts, target_len)
+                tick_info["matched"] = int(len(errs))  # real usable matches (not just "matches" length)
 
-                tick_info["used"] = True
-                tick_info["matched"] = int(max(0, len(ref_pts) - 2))  # exclude endpoints
+                mean_ms = float(1000.0 * np.mean(np.abs(errs))) if errs else float("inf")
+                max_ms = float(1000.0 * np.max(np.abs(errs))) if errs else float("inf")
 
-                if errs:
-                    tick_info["mean_abs_ms"] = float(1000.0 * np.mean(np.abs(errs)))
-                    tick_info["max_abs_ms"] = float(1000.0 * np.max(np.abs(errs)))
-
+                tick_info["mean_abs_ms"] = mean_ms if math.isfinite(mean_ms) else None
+                tick_info["max_abs_ms"] = max_ms if math.isfinite(max_ms) else None
                 tick_info["tol_s"] = float(args.tick_match_tol_s)
                 tick_info["sym"] = str(args.tick_sym)
                 tick_info["interval_s"] = float(args.tick_interval_s)
                 tick_info["tone_s"] = float(args.tick_tone_s)
 
-                print(
-                    f"[info] ticks ({ch}) matched={tick_info['matched']} "
-                    f"mean_abs={tick_info.get('mean_abs_ms', 0.0):.1f} ms "
-                    f"max_abs={tick_info.get('max_abs_ms', 0.0):.1f} ms"
-                )
+                # Quality gate: only warp if tick timing is actually tight.
+                # Otherwise you get comb-filter hell and insane spikes.
+                MEAN_MAX_MS = 20.0
+                MAX_MAX_MS  = 80.0
+
+                if (mean_ms <= MEAN_MAX_MS) and (max_ms <= MAX_MAX_MS) and (tick_info["matched"] >= int(args.tick_min_matches)):
+                    rec_sweep_warped = warp_by_control_points(rec_sweep_raw, ref_pts, rec_pts, target_len)
+                    tick_info["used"] = True
+
+                    print(
+                        f"[info] ticks ({ch}) used matched={tick_info['matched']} "
+                        f"mean_abs={mean_ms:.1f} ms max_abs={max_ms:.1f} ms"
+                    )
+                else:
+                    rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
+                    tick_info["used"] = False
+
+                    print(
+                        f"[warn] ticks ({ch}) matched={tick_info['matched']} but timing is sloppy "
+                        f"(mean_abs={mean_ms:.1f} ms, max_abs={max_ms:.1f} ms) -- skipping tick-warp"
+                    )
+
             else:
                 rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
                 tick_info["matched"] = int(len(matches))
-                print(f"[warn] ticks ({ch}) enabled but only matched {len(matches)} (need {args.tick_min_matches}); falling back to linear warp")
+                tick_info["used"] = False
+                print(
+                    f"[warn] ticks ({ch}) enabled but only matched {len(matches)} "
+                    f"(need {args.tick_min_matches}); falling back to linear warp"
+                )
+
         else:
             rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
 
@@ -1578,7 +1634,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         fig, ax = plt.subplots()
         ax.semilogx(res.freq, res.mag_db_s)
         ax.grid(True, which="both")
-        ax.set_xlabel("Frequency (Hz)")
+
+        apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
+
         ax.set_ylabel("Magnitude (dB, smoothed)")
         ax.set_title(f"Cassette chain magnitude response ({ch})")
         fig.tight_layout()
@@ -1590,7 +1648,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             fig, ax = plt.subplots()
             ax.semilogx(res.freq, diff_db_s)
             ax.grid(True, which="both")
-            ax.set_xlabel("Frequency (Hz)")
+
+            apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
+
             ax.set_ylabel("Difference (dB, smoothed)")
             ax.set_title(f"Cassette chain minus loopback ({ch})")
             fig.tight_layout()
@@ -1639,7 +1699,9 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         fig, ax = plt.subplots()
         ax.semilogx(lr_freq, lr_diff)
         ax.grid(True, which="both")
-        ax.set_xlabel("Frequency (Hz)")
+
+        apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
+
         ax.set_ylabel("L - R (dB, smoothed)")
         ax.set_title("Channel mismatch: L - R")
         fig.tight_layout()

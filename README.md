@@ -2,12 +2,12 @@
 
 A CLI tool for measuring and calibrating a compact cassette recording/playback chain using an audio test program and automated alignment.
 
-It generates a cassette-friendly measurement WAV with robust DTMF markers, then analyzes a recorded playback capture to estimate the chain's magnitude response (and optional loopback-subtracted response), plus an SNR estimate.
+It generates a cassette-friendly measurement WAV with user-configurable DTMF markers, then analyzes a recorded playback capture to estimate the chain's magnitude response (and optional loopback-subtracted response), plus an SNR estimate.
 
 ## What this does
 
 - Generates a print-to-tape WAV containing:
-  - DTMF start marker (robust "audio timecode" anchor)
+  - DTMF start marker (audio timecode anchor)
   - Dedicated silence window for noise-floor measurement
   - DTMF countdown (default on; mostly for humans, alignment uses start/end markers)
   - 1 kHz reference tone for setting record level
@@ -160,6 +160,8 @@ In `--outdir`:
 * Keep any NR / enhancers off unless you are specifically measuring them.
 
 ## Changelog / History
+- 0.1.3 - x-axis plot style; drift alignment fixes
+- 0.1.2 - bugfixes; config changes; dedupe parsing
 - 0.1.1 - Patches to `--help` etc
 - 0.1.0 - Initial release
 
