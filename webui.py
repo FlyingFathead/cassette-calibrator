@@ -47,6 +47,22 @@ IGNORE_DIRS = {
 }
 MAX_LIST_ITEMS = 4000
 
+# -----------------------
+# HELPERS
+# -----------------------
+
+def _opt_str(v) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        if s.lower() in ("null", "none"):
+            return None
+        return s
+    s = str(v).strip()
+    return s or None
 
 def _is_rel_safe(p: str) -> bool:
     if p is None:
@@ -61,7 +77,6 @@ def _is_rel_safe(p: str) -> bool:
         return False
     return True
 
-
 def _rel_to_root_checked(p: str) -> str:
     p = (p or "").strip()
     if not _is_rel_safe(p):
@@ -74,7 +89,6 @@ def _rel_to_root_checked(p: str) -> str:
         raise ValueError("path escapes project root") from e
     return str(full.relative_to(ROOT))
 
-
 def _ensure_outdir_rel(p: str) -> str:
     p = (p or "").strip()
     if not p:
@@ -83,10 +97,8 @@ def _ensure_outdir_rel(p: str) -> str:
     (ROOT / p).mkdir(parents=True, exist_ok=True)
     return p
 
-
 def _load_cfg(cfg_path: str | None) -> dict:
     return cc.load_toml_config(cfg_path)
-
 
 def _webui_cfg(cfg: dict) -> dict:
     w = cfg.get("webui", {})
@@ -186,6 +198,69 @@ def _list_result_dirs(max_items: int = 2000) -> list[str]:
     return sorted(set(out))
 
 
+def _list_runs(max_items: int = 500) -> list[dict]:
+    """
+    Return runs with lightweight metadata:
+      {dir, mtime, name, created_at, label}
+    Prefers scanning under data/ if it exists.
+    """
+    runs: list[dict] = []
+
+    bases = []
+    if (ROOT / "data").exists():
+        bases.append(ROOT / "data")
+    bases.append(ROOT)
+
+    seen = set()
+
+    for base in bases:
+        for p in base.rglob("summary.json"):
+            try:
+                run_dir = str(p.parent.relative_to(ROOT))
+            except Exception:
+                continue
+            if run_dir in seen:
+                continue
+            seen.add(run_dir)
+
+            try:
+                st = p.stat()
+                mtime = int(st.st_mtime)
+            except Exception:
+                mtime = 0
+
+            name = None
+            created = None
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(obj, dict):
+                    run = obj.get("run", {})
+                    if isinstance(run, dict):
+                        name = _opt_str(run.get("name"))
+                        created = _opt_str(run.get("created_at_local")) or _opt_str(run.get("created_at_utc"))
+            except Exception:
+                pass
+
+            # label: "name -- dir" or just dir
+            label = (f"{name} -- {run_dir}" if name else run_dir)
+
+            runs.append({
+                "dir": run_dir,
+                "mtime": mtime,
+                "name": name,
+                "created_at": created,
+                "label": label,
+            })
+
+            if len(runs) >= max_items:
+                break
+        if len(runs) >= max_items:
+            break
+
+    runs.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+    return runs
+
+
 def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | None) -> dict:
     """
     mode: "file" or "dir"
@@ -283,13 +358,32 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
         "now": int(time.time()),
     }
 
+def _write_json_atomic_preserve_mtime(path: Path, obj: object) -> None:
+    old_times = None
+    try:
+        st = path.stat()
+        old_times = (st.st_atime, st.st_mtime)
+    except Exception:
+        old_times = None
 
-INDEX_HTML = """<!doctype html>
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+    # Keep mtime so the run list ordering doesn't change just because notes were edited
+    if old_times:
+        try:
+            os.utime(path, old_times)
+        except Exception:
+            pass
+
+INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>cassette-calibrator -- local WebUI</title>
   <style>
+
     body { font-family: system-ui, sans-serif; margin: 20px; }
     .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
     .card { border: 1px solid #ccc; border-radius: 10px; padding: 14px; min-width: 340px; max-width: 560px; flex: 1; }
@@ -316,6 +410,33 @@ INDEX_HTML = """<!doctype html>
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #ccc; color: #333; }
     .muted { color: #777; font-size: 12px; }
+    .runhdr { margin-top: 10px; margin-bottom: 6px; }
+    .runhdr .title { font-size: 22px; font-weight: 700; margin: 0 0 4px 0; }
+    .runhdr .meta { font-size: 12px; color: #666; line-height: 1.35; }
+    .runhdr .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }    
+    
+    textarea { width: 100%; padding: 6px; margin-top: 4px; resize: vertical; }  
+
+    .toc { margin-top: 6px; font-size: 12px; color: #666; }
+    .toc a { color: inherit; text-decoration: none; border-bottom: 1px dotted #999; }
+    .toc a:hover { border-bottom-style: solid; }
+
+    .block { border: 1px solid #ddd; border-radius: 10px; padding: 10px; margin-top: 10px; }
+    .block h4 { margin: 0 0 8px 0; }
+
+    .notes {
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #f6f6f6;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+    }
+
+    .imgsec { margin-top: 14px; padding-top: 10px; border-top: 1px dashed #ccc; }
+    .imgsec h4 { margin: 0 0 8px 0; }
+
   </style>
 </head>
 <body>
@@ -350,6 +471,12 @@ INDEX_HTML = """<!doctype html>
     <div class="card">
       <h3>analyze</h3>
 
+      <label>Run name (optional)</label>
+      <input id="an_name" placeholder="e.g.: this cassette => that deck" />
+
+      <label>Run notes (optional)</label>
+      <textarea id="an_notes" rows="7" placeholder="Long notes: deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
+      
       <label>Ref WAV</label>
       <div class="grid2">
         <input id="an_ref" placeholder="data/sweepcass.wav" />
@@ -375,10 +502,50 @@ INDEX_HTML = """<!doctype html>
       </div>
 
       <button onclick="doAnalyze()">Analyze</button>
-      <pre id="an_log"></pre>
+      <div id="an_header"></div>
+
+      <div id="an_json">
+        <pre id="an_log"></pre>
+      </div>
+
       <div id="an_imgs"></div>
+
     </div>
   </div>
+
+  <div class="card">
+    <h3>runs</h3>
+    <div class="small">Browse previous analysis runs (reads run name from summary.json).</div>
+
+    <button onclick="refreshRuns()">Refresh list</button>
+    <label>Pick a run</label>
+    <select id="runs_sel" style="width:100%; padding:6px; margin-top:4px;"></select>
+
+    <button onclick="loadSelectedRun()">Load run</button>
+    <div id="runs_header"></div>
+
+    <div style="margin-top:8px;">
+      <button id="runs_notes_edit_btn" onclick="runsEditNotes()" style="display:none">Edit notes</button>
+    </div>
+
+    <div id="runs_notes_ctl" class="block" style="display:none">
+      <h4>Edit notes</h4>
+      <textarea id="runs_notes_text" rows="7"
+        placeholder="Deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <button onclick="runsSaveNotes()">Save</button>
+        <button onclick="runsCancelNotes()">Cancel</button>
+      </div>
+      <div id="runs_notes_status" class="small"></div>
+    </div>
+    
+    <div id="runs_json">
+      <pre id="runs_log"></pre>
+    </div>
+
+    <div id="runs_imgs"></div>
+
+  </div>      
 
   <!-- Modal file browser -->
   <div id="mb_backdrop" class="modal-backdrop" onclick="closeBrowser()"></div>
@@ -410,6 +577,59 @@ let MB = {
   title: "Browse",
   allowNew: false
 };
+
+let RUNS_CTX = {
+  dir: "",
+  summary: null
+};
+
+function runsEditNotes() {
+  if (!RUNS_CTX.dir || !RUNS_CTX.summary) return;
+
+  const run = (RUNS_CTX.summary && RUNS_CTX.summary.run) ? RUNS_CTX.summary.run : {};
+  const notes = optStr(run.notes);
+
+  document.getElementById("runs_notes_text").value = notes;
+  document.getElementById("runs_notes_status").textContent = "";
+
+  document.getElementById("runs_notes_ctl").style.display = "block";
+  document.getElementById("runs_notes_edit_btn").style.display = "none";
+}
+
+function runsCancelNotes() {
+  document.getElementById("runs_notes_status").textContent = "";
+  document.getElementById("runs_notes_ctl").style.display = "none";
+  document.getElementById("runs_notes_edit_btn").style.display = RUNS_CTX.dir ? "inline-block" : "none";
+}
+
+async function runsSaveNotes() {
+  try {
+    if (!RUNS_CTX.dir || !RUNS_CTX.summary) return;
+
+    const notes = document.getElementById("runs_notes_text").value || "";
+    document.getElementById("runs_notes_status").textContent = "saving...";
+
+    const r = await api("/api/run_notes", { dir: RUNS_CTX.dir, notes });
+    const summary = (r && r.summary) ? r.summary : RUNS_CTX.summary;
+
+    RUNS_CTX.summary = summary;
+
+    // Re-render header + json + images
+    document.getElementById("runs_header").innerHTML =
+      renderRunHeader(summary, "Selected run", "runs", true) +
+      `<div class="runhdr"><div class="meta">Dir: <span class="mono">${esc(RUNS_CTX.dir)}</span></div></div>`;
+
+    setLog("runs_log", JSON.stringify(summary, null, 2));
+    document.getElementById("runs_imgs").innerHTML =
+      renderImagesWithAnchors(summary, "runs");
+
+    document.getElementById("runs_notes_ctl").style.display = "none";
+    document.getElementById("runs_notes_edit_btn").style.display = "inline-block";
+    document.getElementById("runs_notes_status").textContent = "";
+  } catch (e) {
+    document.getElementById("runs_notes_status").textContent = "ERROR: " + e.message;
+  }
+}
 
 function esc(s) {
   return (s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
@@ -455,6 +675,70 @@ function setLog(id, s) {
 function imgTag(path) {
   const url = "/file?path=" + encodeURIComponent(path);
   return `<div style="margin-top:10px"><div class="small">${esc(path)}</div><img src="${url}" /></div>`;
+}
+
+function optStr(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  if (s.toLowerCase() === "null" || s.toLowerCase() === "none") return "";
+  return s;
+}
+
+function escId(s) {
+  // safe-ish HTML id: keep alnum, dash, underscore; everything else becomes "_"
+  return String(s || "").replace(/[^a-zA-Z0-9_-]+/g, "_");
+}
+
+function renderRunHeader(summary, fallbackTitle, prefix, forceNotes) {
+  prefix = prefix || "run";
+  const run = (summary && summary.run) ? summary.run : {};
+  const name = optStr(run.name);
+  const notes = optStr(run.notes);
+  const createdUtc = optStr(run.created_at_utc);
+  const createdLocal = optStr(run.created_at_local);
+
+  const title = name || optStr(fallbackTitle) || "Run";
+
+  const topId = `${prefix}_top`;
+  const notesId = `${prefix}_notes`;
+  const jsonId = `${prefix}_json`;
+  const imgsId = `${prefix}_imgs`;
+
+  const showNotes = !!forceNotes || !!notes;
+
+  let meta = "";
+  if (createdUtc || createdLocal) {
+    meta += `<div class="meta">Ran on:</div>`;
+    if (createdUtc) meta += `<div class="meta"><span class="mono">${esc(createdUtc)}</span> (UTC)</div>`;
+    if (createdLocal) meta += `<div class="meta"><span class="mono">${esc(createdLocal)}</span> (local)</div>`;
+  }
+
+  const toc = `
+    <div class="toc">
+      Jump:
+      ${showNotes ? `<a href="#${notesId}">notes</a> | ` : ``}
+      <a href="#${imgsId}">images</a> |
+      <a href="#${jsonId}">json</a> |
+      <a href="#${topId}">top</a>
+    </div>
+  `;
+
+  const notesBlock = showNotes ? `
+    <div class="block" id="${notesId}">
+      <h4>Notes <span class="small"><a href="#${notesId}">#</a></span></h4>
+      <div class="notes">${notes ? esc(notes) : "(no notes)"}</div>
+    </div>
+  ` : "";
+
+  return `
+    <div class="runhdr" id="${topId}">
+      <div class="title">${esc(title)}</div>
+      ${meta}
+      ${toc}
+      ${notesBlock}
+    </div>
+  `;
 }
 
 /* -------- modal browser -------- */
@@ -659,36 +943,200 @@ async function doDetect() {
   }
 }
 
+function renderImagesWithAnchors(summary, prefix) {
+  prefix = prefix || "run";
+  const imgsId = `${prefix}_imgs`;
+
+  const per = (summary && summary.per_channel) ? summary.per_channel : {};
+  const so = (summary && summary.stereo_outputs) ? summary.stereo_outputs : {};
+
+  const channels = Object.keys(per).sort();
+  let tocLinks = [];
+  let body = "";
+
+  // Per-channel sections
+  for (const ch of channels) {
+    const outs = (per[ch] && per[ch].outputs) ? per[ch].outputs : {};
+    const secId = `${prefix}_ch_${escId(ch)}`;
+
+    tocLinks.push(`<a href="#${secId}">${esc(ch)}</a>`);
+
+    let sec = `<div class="imgsec" id="${secId}">
+      <h4>Channel ${esc(ch)} <span class="small"><a href="#${secId}">#</a></span></h4>`;
+
+    const items = [
+      ["response_png", "Response"],
+      ["difference_png", "Difference"],
+      ["impulse_png", "Impulse"],
+    ];
+
+    let any = false;
+    for (const [key, label] of items) {
+      const p = outs[key];
+      if (!p) continue;
+      any = true;
+
+      const blockId = `${secId}_${key}`;
+      sec += `
+        <div class="block" id="${blockId}">
+          <div class="small"><b>${esc(label)}</b> <a href="#${blockId}">#</a> -- ${esc(p)}</div>
+          ${imgTag(p)}
+        </div>
+      `;
+    }
+
+    if (!any) {
+      sec += `<div class="small">No images for this channel.</div>`;
+    }
+
+    sec += `</div>`;
+    body += sec;
+  }
+
+  // Stereo section
+  const stereoItems = [
+    ["lr_overlay_png", "L/R Overlay"],
+    ["lr_diff_png", "L-R Difference"],
+  ];
+
+  let stereoAny = false;
+  let stereoBody = "";
+  for (const [key, label] of stereoItems) {
+    const p = so[key];
+    if (!p) continue;
+    stereoAny = true;
+
+    const blockId = `${prefix}_stereo_${key}`;
+    stereoBody += `
+      <div class="block" id="${blockId}">
+        <div class="small"><b>${esc(label)}</b> <a href="#${blockId}">#</a> -- ${esc(p)}</div>
+        ${imgTag(p)}
+      </div>
+    `;
+  }
+
+  if (stereoAny) {
+    tocLinks.push(`<a href="#${prefix}_stereo">stereo</a>`);
+    body += `
+      <div class="imgsec" id="${prefix}_stereo">
+        <h4>Stereo <span class="small"><a href="#${prefix}_stereo">#</a></span></h4>
+        ${stereoBody}
+      </div>
+    `;
+  }
+
+  if (!body) {
+    return `<div id="${imgsId}" class="small">No images listed in summary.</div>`;
+  }
+
+  const toc = tocLinks.length
+    ? `<div class="toc" id="${imgsId}">Images: ${tocLinks.join(" | ")}</div>`
+    : `<div class="toc" id="${imgsId}">Images</div>`;
+
+  return `${toc}${body}`;
+}
+
 async function doAnalyze() {
   try {
     setLog("an_log", "running...");
+
+    // clear previous content
+    document.getElementById("an_header").innerHTML = "";
     document.getElementById("an_imgs").innerHTML = "";
 
     const ref = document.getElementById("an_ref").value;
     const rec = document.getElementById("an_rec").value;
     const loopback = document.getElementById("an_lb").value;
     const outdir = document.getElementById("an_outdir").value;
+    const run_name = document.getElementById("an_name").value;
 
-    const r = await api("/api/analyze", { ref, rec, loopback, outdir });
-    setLog("an_log", (r.log || "") + "\\n\\n" + JSON.stringify(r.summary, null, 2));
+    const run_notes = (document.getElementById("an_notes").value || "").trim();
 
-    const imgs = [];
-    const per = r.summary && r.summary.per_channel ? r.summary.per_channel : {};
-    for (const ch of Object.keys(per)) {
-      const outs = per[ch].outputs || {};
-      if (outs.response_png) imgs.push(outs.response_png);
-      if (outs.difference_png) imgs.push(outs.difference_png);
-      if (outs.impulse_png) imgs.push(outs.impulse_png);
-    }
-    const so = (r.summary && r.summary.stereo_outputs) ? r.summary.stereo_outputs : {};
-    if (so.lr_overlay_png) imgs.push(so.lr_overlay_png);
-    if (so.lr_diff_png) imgs.push(so.lr_diff_png);
+    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name, run_notes });
 
-    let html = "";
-    for (const p of imgs) html += imgTag(p);
-    document.getElementById("an_imgs").innerHTML = html || "<div class='small'>No images listed in summary.</div>";
+    // Header (includes notes block if summary.run.notes exists)
+    document.getElementById("an_header").innerHTML =
+      renderRunHeader(r.summary, "Most recent run", "an");
+
+    // JSON anchor wrapper is id="an_json" (see HTML change above)
+    setLog("an_log", (r.log || "") + "\n\n" + JSON.stringify(r.summary, null, 2));
+
+    // Images with per-channel anchors + blocks
+    document.getElementById("an_imgs").innerHTML =
+      renderImagesWithAnchors(r.summary, "an");
+
   } catch (e) {
     setLog("an_log", "ERROR: " + e.message);
+  }
+}
+
+async function refreshRuns() {
+  try {
+    // reset context + editor UI
+    RUNS_CTX.dir = "";
+    RUNS_CTX.summary = null;
+    document.getElementById("runs_notes_ctl").style.display = "none";
+    document.getElementById("runs_notes_status").textContent = "";
+    document.getElementById("runs_notes_edit_btn").style.display = "none";
+
+    // clear stale displayed run (header + images) right away
+    document.getElementById("runs_header").innerHTML = "";
+    document.getElementById("runs_imgs").innerHTML = "";
+    setLog("runs_log", "loading...");
+
+    const r = await apiGetJson("/api/runs");
+    const sel = document.getElementById("runs_sel");
+
+    let html = "";
+    for (const it of (r.runs || [])) {
+      const label = (it.label || it.dir || "");
+      const val = it.dir || "";
+      html += `<option value="${esc(val)}">${esc(label)}</option>`;
+    }
+    sel.innerHTML = html || "<option value=''>no runs found</option>";
+
+    setLog("runs_log", JSON.stringify(r, null, 2));
+  } catch (e) {
+    setLog("runs_log", "ERROR: " + e.message);
+  }
+}
+
+async function loadSelectedRun() {
+  try {
+    const sel = document.getElementById("runs_sel");
+    const dir = (sel && sel.value) ? sel.value : "";
+    if (!dir) return;
+
+    // clear previous content early
+    document.getElementById("runs_header").innerHTML = "";
+    document.getElementById("runs_imgs").innerHTML = "";
+    setLog("runs_log", "loading run: " + dir);
+
+    // reset editor UI
+    document.getElementById("runs_notes_ctl").style.display = "none";
+    document.getElementById("runs_notes_status").textContent = "";
+    document.getElementById("runs_notes_edit_btn").style.display = "none";
+
+    const sumPath = dir.replace(/\/+$/,"") + "/summary.json";
+    const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
+
+    RUNS_CTX.dir = dir;
+    RUNS_CTX.summary = summary;
+
+    // show edit button now that we have a run loaded
+    document.getElementById("runs_notes_edit_btn").style.display = "inline-block";
+
+    document.getElementById("runs_header").innerHTML =
+      renderRunHeader(summary, "Selected run", "runs", true) +
+      `<div class="runhdr"><div class="meta">Dir: <span class="mono">${esc(dir)}</span></div></div>`;
+
+    setLog("runs_log", JSON.stringify(summary, null, 2));
+
+    document.getElementById("runs_imgs").innerHTML =
+      renderImagesWithAnchors(summary, "runs");
+
+  } catch (e) {
+    setLog("runs_log", "ERROR: " + e.message);
   }
 }
 
@@ -697,6 +1145,8 @@ Object.assign(window, {
   doGen,
   doDetect,
   doAnalyze,
+  refreshRuns,
+  loadSelectedRun,
   openBrowser,
   closeBrowser,
   mbUp,
@@ -705,7 +1155,10 @@ Object.assign(window, {
   mbPick,
   mbPickValue,
   mbCreateDir,
-  mbRefresh
+  mbRefresh,
+  runsEditNotes,
+  runsSaveNotes,
+  runsCancelNotes
 });
 
 console.log("webui script loaded; handlers exported to window");
@@ -714,7 +1167,6 @@ console.log("webui script loaded; handlers exported to window");
 </body>
 </html>
 """
-
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "cassette-calibrator-webui/0.2"
@@ -749,6 +1201,13 @@ class Handler(BaseHTTPRequestHandler):
             st = {
                 "wavs": _list_files((".wav",)),
                 "results": _list_result_dirs(),
+            }
+            self._json(200, st)
+            return
+
+        if u.path == "/api/runs":
+            st = {
+                "runs": _list_runs(),
             }
             self._json(200, st)
             return
@@ -835,18 +1294,58 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
+        if u.path == "/api/run_notes":
+            try:
+                run_dir = str(payload.get("dir", "") or "").strip()
+                if not run_dir:
+                    raise ValueError("dir is required")
+
+                rel_dir = _rel_to_root_checked(run_dir)
+                if rel_dir in ("", "."):
+                    raise ValueError("invalid run dir")
+
+                summary_path = (ROOT / rel_dir / "summary.json")
+                if not summary_path.exists() or not summary_path.is_file():
+                    raise ValueError("summary.json not found for run")
+
+                obj = json.loads(summary_path.read_text(encoding="utf-8"))
+                if not isinstance(obj, dict):
+                    raise ValueError("summary.json is not an object")
+
+                run = obj.get("run")
+                if not isinstance(run, dict):
+                    run = {}
+                    obj["run"] = run
+
+                notes_raw = str(payload.get("notes", "") or "")
+                # normalize line endings
+                notes = notes_raw.replace("\r\n", "\n").replace("\r", "\n")
+
+                if notes.strip() == "":
+                    run.pop("notes", None)
+                else:
+                    run["notes"] = notes
+
+                _write_json_atomic_preserve_mtime(summary_path, obj)
+
+                self._json(200, {"ok": True, "summary": obj})
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+            return
+
         if u.path == "/api/gen":
             try:
-              out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
-              # Ensure parent directory exists for the output wav
-              (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
+                out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
+                # Ensure parent directory exists for the output wav
+                (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
 
-              args = _make_args("gen", cfg, {"out": out})
+                args = _make_args("gen", cfg, {"out": out})
 
-              buf = io.StringIO()
-              with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                  cc.cmd_gen(args)
-              self._json(200, {"ok": True, "out": out, "log": buf.getvalue()})
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    cc.cmd_gen(args)
+
+                self._json(200, {"ok": True, "out": out, "log": buf.getvalue()})
             except Exception as e:
                 self._json(400, {"error": str(e)})
             return
@@ -875,6 +1374,33 @@ class Handler(BaseHTTPRequestHandler):
                 outdir = _ensure_outdir_rel(str(payload.get("outdir", "data/cassette_results")))
 
                 overrides = {"ref": ref, "rec": rec, "outdir": outdir}
+
+                run_name = _opt_str(payload.get("run_name"))
+                if run_name:
+                    # match whatever cassette_calibrator's argparse uses
+                    dfl = _cmd_argparse_defaults("analyze")
+                    if "run_name" in dfl:
+                        overrides["run_name"] = run_name
+                    elif "name" in dfl:
+                        overrides["name"] = run_name
+                    else:
+                        # last-resort: set both
+                        overrides["run_name"] = run_name
+                        overrides["name"] = run_name
+
+                # Run notes (optional) -- pass to core so it can persist into summary.json
+                run_notes = _opt_str(payload.get("run_notes"))
+                if run_notes:
+                    dfl = _cmd_argparse_defaults("analyze")
+                    if "run_notes" in dfl:
+                        overrides["run_notes"] = run_notes
+                    elif "notes" in dfl:
+                        overrides["notes"] = run_notes
+                    else:
+                        # last-resort: set both
+                        overrides["run_notes"] = run_notes
+                        overrides["notes"] = run_notes
+
                 if loopback:
                     overrides["loopback"] = loopback
 
@@ -884,12 +1410,18 @@ class Handler(BaseHTTPRequestHandler):
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                     cc.cmd_analyze(args)
 
-                summary_path = ROOT / outdir / "summary.json"
-                if not summary_path.exists():
+                base = ROOT / outdir
+                # Find newest summary.json under base outdir (supports run-subdir mode)
+                candidates = list(base.rglob("summary.json")) if base.exists() else []
+                if not candidates:
                     raise RuntimeError("analyze finished but summary.json was not created")
+
+                candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+                summary_path = candidates[0]
 
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
                 self._json(200, {"ok": True, "summary": summary, "log": buf.getvalue()})
+
             except Exception as e:
                 self._json(400, {"error": str(e)})
             return

@@ -60,6 +60,27 @@ port = 8765
 open_browser = true
 ```
 
+### WebUI features
+
+* Run `gen`, `detect`, `analyze` with the same defaults you use from CLI
+* Browse files safely (relative paths only) and create output directories
+* Browse prior runs by scanning for `summary.json`
+* View plots/images referenced in `summary.json`
+* **Edit run notes for an existing run** (Save or Cancel) without re-running analysis
+
+### Editing run notes (WebUI)
+
+When you load a run under the "runs" card, you can click **Edit notes** to change the run notes stored in that run's `summary.json`.
+
+Behavior:
+
+* Saves to `<run-dir>/summary.json` under `run.notes`
+* Clearing notes (blank) removes `run.notes`
+* Uses an atomic write (temp file + replace)
+* Preserves `mtime` so the run list ordering does not change just because notes were edited
+
+### Path rules (important)
+
 **Important:** the WebUI only accepts **relative paths under the project directory** (no absolute paths, no "..").
 If you paste `/home/you/recorded.wav`, you'll get:
 
@@ -72,6 +93,7 @@ Security posture:
 * Binds to `127.0.0.1` by default.
 * Rejects absolute paths and any `..` traversal.
 * Only serves/browses files under the project directory.
+* Can write only within the project directory (for output dirs and run note edits).
 
 ## Workflow
 
@@ -144,9 +166,14 @@ For mono:
 python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align --channels mono
 ```
 
+Run name/notes:
+
+* You can set a run name and run notes via CLI flags (see `python3 cassette_calibrator.py analyze --help`) and/or via the WebUI.
+* WebUI can also edit notes later for an existing run by updating that run's `summary.json`.
+
 ### 4b) Optional: ticks mode (non-linear drift correction)
 
-Cassette transports can drift *non-linearly* (wow/flutter). The default method uses a single linear warp based on the start/end markers, which corrects overall speed mismatch but can't fully fix curvature within the sweep.
+Cassette transports can drift non-linearly (wow/flutter). The default method uses a single linear warp based on the start/end markers, which corrects overall speed mismatch but can't fully fix curvature within the sweep.
 
 Ticks mode embeds short periodic DTMF symbols inside the sweep, then uses them to build a piecewise time warp. Use it if you see "wavy" response curves or inconsistent alignment between runs.
 
@@ -191,7 +218,7 @@ In `--outdir`:
 
   * `response.png` -- smoothed magnitude response (log frequency)
   * `response.csv` -- raw + smoothed response data
-  * `summary.json` -- marker times, drift ratio, SNR estimate, settings used
+  * `summary.json` -- marker times, drift ratio, SNR estimate, settings used (plus optional run name/notes metadata)
   * `difference.png` -- only if `--loopback` is provided
   * `impulse.png` -- only if `--save-ir` is used
 
@@ -199,7 +226,7 @@ In `--outdir`:
 
   * `response_l.png`, `response_r.png`
   * `response_l.csv`, `response_r.csv`
-  * `summary.json`
+  * `summary.json` (includes optional run name/notes metadata)
   * `response_lr_overlay.png` -- L/R overlay plot (smoothed)
   * `lr_diff.png` -- L minus R mismatch (smoothed)
   * `difference_l.png`, `difference_r.png` -- only if `--loopback` is provided
@@ -226,30 +253,39 @@ In `--outdir`:
 
 * WebUI paths are **relative to the project root**. Put files under `data/` and browse/pick them.
 
-## TODO / WIP:
+## TODO / WIP
 
-- A/B spectrogram view: one horizontal spectrogram for the reference “input” WAV and one for the synced recorded capture -- with optional L/R split if the files are stereo.
+* A/B spectrogram view: one horizontal spectrogram for the reference "input" WAV and one for the synced recorded capture -- with optional L/R split if the files are stereo.
 
-- Comparative spectrum analyzer / visualizer: timeline + playhead, with color-coded overlay (baseline vs cassette-looped) so you can see how they interact/differ over time.
+* Comparative spectrum analyzer / visualizer: timeline + playhead, with color-coded overlay (baseline vs cassette-looped) so you can see how they interact/differ over time.
 
-- Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
+* Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
 
 ## Changelog / History
 
+* 0.1.6 - WebUI: edit notes for existing runs
+
+  * Added "Edit notes" UI for loaded runs with Save/Cancel.
+  * Added `/api/run_notes` endpoint to update `summary.json` -> `run.notes` for a run directory.
+  * Atomic JSON write with mtime preservation so run list ordering does not change due to note edits.
+  * README updated to document the notes editor and write behavior.
 * 0.1.5 - Stereo outputs + tick-warp improvements; README/output docs sync
+
   * Added stereo analysis outputs: per-channel plots/CSVs (`response_l/r.*`) plus `lr_diff.png`.
   * Added optional L/R overlay plot output: `response_lr_overlay.png` (enabled by default when analyzing both L and R).
-  * Added tick-based non-linear drift correction (“ticks mode”) with matching/tolerance controls and a quality gate to avoid bad warps.
+  * Added tick-based non-linear drift correction ("ticks mode") with matching/tolerance controls and a quality gate to avoid bad warps.
   * Improved DTMF detection stability: safer/auto dedupe behavior and optional timing stats logging (`--dtmf-stats`).
   * Config/TOML support expanded for new options (channels, marker_channel, overlay toggles/colors, tick settings, SNR section mapping).
   * WebUI now surfaces the new stereo outputs/overlay images from `summary.json`.
   * Documentation updated to reflect stereo-default outputs and filenames.
 * 0.1.4 - Local WebUI (stdlib) introduced; fixes
+
   * Added `webui.py` local-only WebUI (binds to 127.0.0.1 by default).
   * Modal file browser with directory creation and safe relative-path handling.
   * Fixed onclick/quoting issues in generated browse list buttons.
   * Documents relative-path requirement (no absolute paths / no "..").
 * 0.1.3 - x-axis plot style; drift alignment fixes and more
+
   * Improved plot x-axis formatting/ticks for audio frequencies (20 Hz–20 kHz readability).
   * Drift alignment fixes for more reliable marker-to-marker speed compensation.
   * Better exports/plot naming consistency (response plots + CSV + summary JSON).
