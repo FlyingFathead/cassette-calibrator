@@ -206,6 +206,14 @@ In `--outdir`:
 
 * WebUI paths are **relative to the project root**. Put files under `data/` and browse/pick them.
 
+## TODO / WIP:
+
+- A/B spectrogram view: one horizontal spectrogram for the reference “input” WAV and one for the synced recorded capture -- with optional L/R split if the files are stereo.
+
+- Comparative spectrum analyzer / visualizer: timeline + playhead, with color-coded overlay (baseline vs cassette-looped) so you can see how they interact/differ over time.
+
+- Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
+
 ## Changelog / History
 
 * 0.1.4 - Local WebUI (stdlib) introduced; fixes
