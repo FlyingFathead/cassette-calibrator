@@ -437,6 +437,83 @@ INDEX_HTML = r"""<!doctype html>
     .imgsec { margin-top: 14px; padding-top: 10px; border-top: 1px dashed #ccc; }
     .imgsec h4 { margin: 0 0 8px 0; }
 
+    /* ---- Image viewer / clickable images ---- */
+
+    .imgwrap { margin-top: 10px; }
+    .imgmeta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .imglinks { display: flex; gap: 10px; align-items: center; }
+    .imglink {
+      font-size: 12px;
+      color: #444;
+      text-decoration: none;
+      border-bottom: 1px dotted #999;
+    }
+    .imglink:hover { border-bottom-style: solid; }
+    .imgbtn { padding: 4px 8px; font-size: 12px; margin-top: 0; }
+
+    .imgthumb { cursor: zoom-in; }
+
+    /* Fullscreen-ish image viewer */
+    .iv-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      display: none;
+      z-index: 20000;
+    }
+    .iv {
+      position: fixed;
+      inset: 26px;
+      background: #fff;
+      border-radius: 12px;
+      padding: 10px;
+      display: none;
+      z-index: 20001;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    }
+    .iv-head { display: flex; gap: 10px; align-items: center; }
+    .iv-title {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .iv-actions { display: flex; gap: 8px; align-items: center; }
+    .iv-meta { margin-top: 6px; font-size: 12px; color: #666; }
+
+    .iv-body {
+      margin-top: 10px;
+      height: calc(100% - 56px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: auto;
+      background: #111;
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .iv-body img {
+      max-width: 100%;
+      max-height: 100%;
+      border-radius: 8px;
+      border: 1px solid #333;
+      cursor: zoom-in;
+    }
+
+    /* “Actual” (1:1) mode: image can be larger than viewport; you pan via scrolling */
+    .iv-body img.iv-actual {
+      max-width: none;
+      max-height: none;
+      cursor: grab;
+    }
+
   </style>
 </head>
 <body>
@@ -547,6 +624,23 @@ INDEX_HTML = r"""<!doctype html>
 
   </div>      
 
+  <!-- Image viewer (fullscreen-ish) -->
+  <div id="iv_backdrop" class="iv-backdrop" onclick="closeImgViewer()"></div>
+  <div id="iv" class="iv" role="dialog" aria-modal="true">
+    <div class="iv-head">
+      <div id="iv_title" class="iv-title"></div>
+      <div class="iv-actions">
+        <a id="iv_open" class="imglink" href="#" target="_blank" rel="noopener">Open in new tab ↗</a>
+        <button id="iv_fitbtn" class="imgbtn" onclick="ivToggleFit()">Fit</button>
+        <button class="imgbtn" onclick="closeImgViewer()">Close</button>
+      </div>
+    </div>
+    <div id="iv_meta" class="iv-meta"></div>
+    <div class="iv-body">
+      <img id="iv_img" src="" alt="" />
+    </div>
+  </div>
+
   <!-- Modal file browser -->
   <div id="mb_backdrop" class="modal-backdrop" onclick="closeBrowser()"></div>
   <div id="mb" class="modal" role="dialog" aria-modal="true">
@@ -582,6 +676,100 @@ let RUNS_CTX = {
   dir: "",
   summary: null
 };
+
+let IV = {
+  open: false,
+  fit: true,
+  path: ""
+};
+
+function imgUrl(path) {
+  return "/file?path=" + encodeURIComponent(path);
+}
+
+function ivSetFit(fit) {
+  IV.fit = !!fit;
+  const img = document.getElementById("iv_img");
+  const btn = document.getElementById("iv_fitbtn");
+  if (!img || !btn) return;
+
+  if (IV.fit) {
+    img.classList.remove("iv-actual");
+    btn.textContent = "Actual";
+  } else {
+    img.classList.add("iv-actual");
+    btn.textContent = "Fit";
+  }
+}
+
+function ivToggleFit() {
+  ivSetFit(!IV.fit);
+}
+
+async function openImgViewer(path) {
+  try {
+    path = String(path || "").trim();
+    if (!path) return;
+
+    IV.open = true;
+    IV.path = path;
+
+    const url = imgUrl(path);
+
+    document.getElementById("iv_backdrop").style.display = "block";
+    document.getElementById("iv").style.display = "block";
+    document.getElementById("iv_title").textContent = path;
+
+    const img = document.getElementById("iv_img");
+    img.src = url;
+    img.alt = path;
+
+    // Click in viewer toggles Fit/Actual
+    img.onclick = ivToggleFit;
+
+    const open = document.getElementById("iv_open");
+    open.href = url;
+
+    document.getElementById("iv_meta").textContent = "loading…";
+
+    // Fetch basic file stats (bytes + mtime) from server
+    try {
+      const st = await apiGetJson("/api/stat?path=" + encodeURIComponent(path));
+      const size = (st && st.size != null) ? (st.size + " bytes") : "";
+      const mtime = (st && st.mtime) ? (new Date(st.mtime * 1000).toLocaleString()) : "";
+
+      let line = "";
+      if (size) line += size;
+      if (mtime) line += (line ? " -- " : "") + mtime;
+
+      document.getElementById("iv_meta").textContent = line;
+    } catch (e) {
+      document.getElementById("iv_meta").textContent = "";
+    }
+
+    // Default to fit mode on open
+    ivSetFit(true);
+  } catch (e) {
+    console.log("openImgViewer error:", e);
+  }
+}
+
+function closeImgViewer() {
+  IV.open = false;
+  document.getElementById("iv_backdrop").style.display = "none";
+  document.getElementById("iv").style.display = "none";
+
+  const img = document.getElementById("iv_img");
+  if (img) {
+    img.src = "";
+    img.alt = "";
+    img.onclick = null;
+  }
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeImgViewer();
+});
 
 function runsEditNotes() {
   if (!RUNS_CTX.dir || !RUNS_CTX.summary) return;
@@ -673,8 +861,20 @@ function setLog(id, s) {
 }
 
 function imgTag(path) {
-  const url = "/file?path=" + encodeURIComponent(path);
-  return `<div style="margin-top:10px"><div class="small">${esc(path)}</div><img src="${url}" /></div>`;
+  const url = imgUrl(path);
+  return `
+    <div class="imgwrap">
+      <div class="imgmeta">
+        <div class="small"><span class="mono">${esc(path)}</span></div>
+        <div class="imglinks">
+          <a class="imglink" href="${url}" target="_blank" rel="noopener">Open in new tab ↗</a>
+          <button class="imgbtn" onclick='openImgViewer(${jsq(path)})'>Fullscreen ⤢</button>
+        </div>
+      </div>
+      <img class="imgthumb" src="${url}" alt="${esc(path)}" loading="lazy"
+           onclick='openImgViewer(${jsq(path)})' />
+    </div>
+  `;
 }
 
 function optStr(v) {
@@ -1158,7 +1358,10 @@ Object.assign(window, {
   mbRefresh,
   runsEditNotes,
   runsSaveNotes,
-  runsCancelNotes
+  runsCancelNotes,
+  openImgViewer,
+  closeImgViewer,
+  ivToggleFit  
 });
 
 console.log("webui script loaded; handlers exported to window");
@@ -1226,6 +1429,25 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 out = _browse_dir(rel_dir, mode=mode, exts=exts, q=q)
                 self._json(200, out)
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+            return
+
+        if u.path == "/api/stat":
+            qs = parse_qs(u.query)
+            p = (qs.get("path", [""])[0] or "").strip()
+            try:
+                rel = _rel_to_root_checked(p)
+                full = (ROOT / rel)
+                if not full.exists() or not full.is_file():
+                    self._json(404, {"error": "file not found"})
+                    return
+                st = full.stat()
+                self._json(200, {
+                    "path": rel,
+                    "size": int(st.st_size),
+                    "mtime": int(st.st_mtime),
+                })
             except Exception as e:
                 self._json(400, {"error": str(e)})
             return
