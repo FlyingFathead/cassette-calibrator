@@ -47,6 +47,22 @@ IGNORE_DIRS = {
 }
 MAX_LIST_ITEMS = 4000
 
+# -----------------------
+# HELPERS
+# -----------------------
+
+def _opt_str(v) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        if s.lower() in ("null", "none"):
+            return None
+        return s
+    s = str(v).strip()
+    return s or None
 
 def _is_rel_safe(p: str) -> bool:
     if p is None:
@@ -61,7 +77,6 @@ def _is_rel_safe(p: str) -> bool:
         return False
     return True
 
-
 def _rel_to_root_checked(p: str) -> str:
     p = (p or "").strip()
     if not _is_rel_safe(p):
@@ -74,7 +89,6 @@ def _rel_to_root_checked(p: str) -> str:
         raise ValueError("path escapes project root") from e
     return str(full.relative_to(ROOT))
 
-
 def _ensure_outdir_rel(p: str) -> str:
     p = (p or "").strip()
     if not p:
@@ -83,10 +97,8 @@ def _ensure_outdir_rel(p: str) -> str:
     (ROOT / p).mkdir(parents=True, exist_ok=True)
     return p
 
-
 def _load_cfg(cfg_path: str | None) -> dict:
     return cc.load_toml_config(cfg_path)
-
 
 def _webui_cfg(cfg: dict) -> dict:
     w = cfg.get("webui", {})
@@ -224,8 +236,8 @@ def _list_runs(max_items: int = 500) -> list[dict]:
                 if isinstance(obj, dict):
                     run = obj.get("run", {})
                     if isinstance(run, dict):
-                        name = run.get("name") or None
-                        created = run.get("created_at_local") or run.get("created_at_utc") or None
+                        name = _opt_str(run.get("name"))
+                        created = _opt_str(run.get("created_at_local")) or _opt_str(run.get("created_at_utc"))
             except Exception:
                 pass
 
@@ -1023,9 +1035,18 @@ class Handler(BaseHTTPRequestHandler):
 
                 overrides = {"ref": ref, "rec": rec, "outdir": outdir}
 
-                run_name = str(payload.get("run_name", "") or "").strip()
+                run_name = _opt_str(payload.get("run_name"))
                 if run_name:
-                    overrides["run_name"] = run_name
+                    # match whatever cassette_calibrator's argparse uses
+                    dfl = _cmd_argparse_defaults("analyze")
+                    if "run_name" in dfl:
+                        overrides["run_name"] = run_name
+                    elif "name" in dfl:
+                        overrides["name"] = run_name
+                    else:
+                        # last-resort: set both
+                        overrides["run_name"] = run_name
+                        overrides["name"] = run_name
 
                 if loopback:
                     overrides["loopback"] = loopback
