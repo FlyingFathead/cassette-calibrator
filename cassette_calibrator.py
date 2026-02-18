@@ -61,6 +61,8 @@ except ModuleNotFoundError:  # py3.10-
 import logging
 LOG = logging.getLogger("cassette_calibrator")
 
+__version__ = "0.1.0"
+
 # -------------------------
 # Config loaders & helpers
 # -------------------------
@@ -1583,6 +1585,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         stereo_outputs["lr_diff_png"] = str(outdir / "lr_diff.png")
 
     summary = {
+        "version": __version__,
         "sr": sr,
         "ref": str(args.ref),
         "rec": str(args.rec),
@@ -1660,6 +1663,13 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
 def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.ArgumentParser]]:
     ap = argparse.ArgumentParser(prog="cassette_calibrator.py")
+
+    ap.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -1864,6 +1874,9 @@ def main() -> None:
 
     argv2 = _strip_known_opts(argv, ["--config", "--preset"])
     args = ap.parse_args(argv2)
+
+    if getattr(args, "cmd", None) in {"gen", "detect", "analyze"}:
+        print(f"cassette-calibrator {__version__}")
 
     # Basic console logging (only if nothing configured yet)
     if not logging.getLogger().handlers:

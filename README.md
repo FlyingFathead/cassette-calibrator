@@ -159,6 +159,9 @@ In `--outdir`:
 * Set record level using the 1 kHz reference tone (avoid clipping / redlining).
 * Keep any NR / enhancers off unless you are specifically measuring them.
 
+## Changelog / History
+- 0.1.0 - Initial release
+
 ## About
 
 By [FlyingFathead](https://github.com/FlyingFathead) with bits and bytes of help from ChaosWhisperer.
