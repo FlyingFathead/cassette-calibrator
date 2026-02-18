@@ -359,12 +359,13 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
     }
 
 
-INDEX_HTML = """<!doctype html>
+INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>cassette-calibrator -- local WebUI</title>
   <style>
+
     body { font-family: system-ui, sans-serif; margin: 20px; }
     .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
     .card { border: 1px solid #ccc; border-radius: 10px; padding: 14px; min-width: 340px; max-width: 560px; flex: 1; }
@@ -395,6 +396,29 @@ INDEX_HTML = """<!doctype html>
     .runhdr .title { font-size: 22px; font-weight: 700; margin: 0 0 4px 0; }
     .runhdr .meta { font-size: 12px; color: #666; line-height: 1.35; }
     .runhdr .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }    
+    
+    textarea { width: 100%; padding: 6px; margin-top: 4px; resize: vertical; }  
+
+    .toc { margin-top: 6px; font-size: 12px; color: #666; }
+    .toc a { color: inherit; text-decoration: none; border-bottom: 1px dotted #999; }
+    .toc a:hover { border-bottom-style: solid; }
+
+    .block { border: 1px solid #ddd; border-radius: 10px; padding: 10px; margin-top: 10px; }
+    .block h4 { margin: 0 0 8px 0; }
+
+    .notes {
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #f6f6f6;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+    }
+
+    .imgsec { margin-top: 14px; padding-top: 10px; border-top: 1px dashed #ccc; }
+    .imgsec h4 { margin: 0 0 8px 0; }
+
   </style>
 </head>
 <body>
@@ -432,6 +456,9 @@ INDEX_HTML = """<!doctype html>
       <label>Run name (optional)</label>
       <input id="an_name" placeholder="e.g.: this cassette => that deck" />
 
+      <label>Run notes (optional)</label>
+      <textarea id="an_notes" rows="7" placeholder="Long notes: deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
+      
       <label>Ref WAV</label>
       <div class="grid2">
         <input id="an_ref" placeholder="data/sweepcass.wav" />
@@ -458,8 +485,13 @@ INDEX_HTML = """<!doctype html>
 
       <button onclick="doAnalyze()">Analyze</button>
       <div id="an_header"></div>
-      <pre id="an_log"></pre>
+
+      <div id="an_json">
+        <pre id="an_log"></pre>
+      </div>
+
       <div id="an_imgs"></div>
+
     </div>
   </div>
 
@@ -473,8 +505,13 @@ INDEX_HTML = """<!doctype html>
 
     <button onclick="loadSelectedRun()">Load run</button>
     <div id="runs_header"></div>
-    <pre id="runs_log"></pre>
+
+    <div id="runs_json">
+      <pre id="runs_log"></pre>
+    </div>
+
     <div id="runs_imgs"></div>
+
   </div>      
 
   <!-- Modal file browser -->
@@ -562,29 +599,56 @@ function optStr(v) {
   return s;
 }
 
-function renderRunHeader(summary, fallbackTitle) {
+function escId(s) {
+  // safe-ish HTML id: keep alnum, dash, underscore; everything else becomes "_"
+  return String(s || "").replace(/[^a-zA-Z0-9_-]+/g, "_");
+}
+
+function renderRunHeader(summary, fallbackTitle, prefix) {
+  prefix = prefix || "run";
   const run = (summary && summary.run) ? summary.run : {};
   const name = optStr(run.name);
+  const notes = optStr(run.notes);
   const createdUtc = optStr(run.created_at_utc);
   const createdLocal = optStr(run.created_at_local);
 
   const title = name || optStr(fallbackTitle) || "Run";
 
+  const topId = `${prefix}_top`;
+  const notesId = `${prefix}_notes`;
+  const jsonId = `${prefix}_json`;
+  const imgsId = `${prefix}_imgs`;
+
   let meta = "";
   if (createdUtc || createdLocal) {
     meta += `<div class="meta">Ran on:</div>`;
-    if (createdUtc) {
-      meta += `<div class="meta"><span class="mono">${esc(createdUtc)}</span> (UTC)</div>`;
-    }
-    if (createdLocal) {
-      meta += `<div class="meta"><span class="mono">${esc(createdLocal)}</span> (local)</div>`;
-    }
+    if (createdUtc) meta += `<div class="meta"><span class="mono">${esc(createdUtc)}</span> (UTC)</div>`;
+    if (createdLocal) meta += `<div class="meta"><span class="mono">${esc(createdLocal)}</span> (local)</div>`;
   }
 
+  const toc = `
+    <div class="toc">
+      Jump:
+      ${notes ? `<a href="#${notesId}">notes</a> | ` : ``}
+      <a href="#${imgsId}">images</a> |
+      <a href="#${jsonId}">json</a> |
+      <a href="#${topId}">top</a>
+    </div>
+  `;
+
+  const notesBlock = notes ? `
+    <div class="block" id="${notesId}">
+      <h4>Notes <span class="small"><a href="#${notesId}">#</a></span></h4>
+      <div class="notes">${esc(notes)}</div>
+    </div>
+  ` : "";
+
   return `
-    <div class="runhdr">
+    <div class="runhdr" id="${topId}">
       <div class="title">${esc(title)}</div>
       ${meta}
+      ${toc}
+      ${notesBlock}
     </div>
   `;
 }
@@ -791,6 +855,99 @@ async function doDetect() {
   }
 }
 
+function renderImagesWithAnchors(summary, prefix) {
+  prefix = prefix || "run";
+  const imgsId = `${prefix}_imgs`;
+
+  const per = (summary && summary.per_channel) ? summary.per_channel : {};
+  const so = (summary && summary.stereo_outputs) ? summary.stereo_outputs : {};
+
+  const channels = Object.keys(per).sort();
+  let tocLinks = [];
+  let body = "";
+
+  // Per-channel sections
+  for (const ch of channels) {
+    const outs = (per[ch] && per[ch].outputs) ? per[ch].outputs : {};
+    const secId = `${prefix}_ch_${escId(ch)}`;
+
+    tocLinks.push(`<a href="#${secId}">${esc(ch)}</a>`);
+
+    let sec = `<div class="imgsec" id="${secId}">
+      <h4>Channel ${esc(ch)} <span class="small"><a href="#${secId}">#</a></span></h4>`;
+
+    const items = [
+      ["response_png", "Response"],
+      ["difference_png", "Difference"],
+      ["impulse_png", "Impulse"],
+    ];
+
+    let any = false;
+    for (const [key, label] of items) {
+      const p = outs[key];
+      if (!p) continue;
+      any = true;
+
+      const blockId = `${secId}_${key}`;
+      sec += `
+        <div class="block" id="${blockId}">
+          <div class="small"><b>${esc(label)}</b> <a href="#${blockId}">#</a> -- ${esc(p)}</div>
+          ${imgTag(p)}
+        </div>
+      `;
+    }
+
+    if (!any) {
+      sec += `<div class="small">No images for this channel.</div>`;
+    }
+
+    sec += `</div>`;
+    body += sec;
+  }
+
+  // Stereo section
+  const stereoItems = [
+    ["lr_overlay_png", "L/R Overlay"],
+    ["lr_diff_png", "L-R Difference"],
+  ];
+
+  let stereoAny = false;
+  let stereoBody = "";
+  for (const [key, label] of stereoItems) {
+    const p = so[key];
+    if (!p) continue;
+    stereoAny = true;
+
+    const blockId = `${prefix}_stereo_${key}`;
+    stereoBody += `
+      <div class="block" id="${blockId}">
+        <div class="small"><b>${esc(label)}</b> <a href="#${blockId}">#</a> -- ${esc(p)}</div>
+        ${imgTag(p)}
+      </div>
+    `;
+  }
+
+  if (stereoAny) {
+    tocLinks.push(`<a href="#${prefix}_stereo">stereo</a>`);
+    body += `
+      <div class="imgsec" id="${prefix}_stereo">
+        <h4>Stereo <span class="small"><a href="#${prefix}_stereo">#</a></span></h4>
+        ${stereoBody}
+      </div>
+    `;
+  }
+
+  if (!body) {
+    return `<div id="${imgsId}" class="small">No images listed in summary.</div>`;
+  }
+
+  const toc = tocLinks.length
+    ? `<div class="toc" id="${imgsId}">Images: ${tocLinks.join(" | ")}</div>`
+    : `<div class="toc" id="${imgsId}">Images</div>`;
+
+  return `${toc}${body}`;
+}
+
 async function doAnalyze() {
   try {
     setLog("an_log", "running...");
@@ -805,30 +962,21 @@ async function doAnalyze() {
     const outdir = document.getElementById("an_outdir").value;
     const run_name = document.getElementById("an_name").value;
 
-    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name });
+    const run_notes = (document.getElementById("an_notes").value || "").trim();
 
-    // >>> THIS is where the header goes <<<
+    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name, run_notes });
+
+    // Header (includes notes block if summary.run.notes exists)
     document.getElementById("an_header").innerHTML =
-      renderRunHeader(r.summary, "Most recent run");
+      renderRunHeader(r.summary, "Most recent run", "an");
 
-    setLog("an_log", (r.log || "") + "\\n\\n" + JSON.stringify(r.summary, null, 2));
+    // JSON anchor wrapper is id="an_json" (see HTML change above)
+    setLog("an_log", (r.log || "") + "\n\n" + JSON.stringify(r.summary, null, 2));
 
-    const imgs = [];
-    const per = r.summary && r.summary.per_channel ? r.summary.per_channel : {};
-    for (const ch of Object.keys(per)) {
-      const outs = per[ch].outputs || {};
-      if (outs.response_png) imgs.push(outs.response_png);
-      if (outs.difference_png) imgs.push(outs.difference_png);
-      if (outs.impulse_png) imgs.push(outs.impulse_png);
-    }
-    const so = (r.summary && r.summary.stereo_outputs) ? r.summary.stereo_outputs : {};
-    if (so.lr_overlay_png) imgs.push(so.lr_overlay_png);
-    if (so.lr_diff_png) imgs.push(so.lr_diff_png);
-
-    let html = "";
-    for (const p of imgs) html += imgTag(p);
+    // Images with per-channel anchors + blocks
     document.getElementById("an_imgs").innerHTML =
-      html || "<div class='small'>No images listed in summary.</div>";
+      renderImagesWithAnchors(r.summary, "an");
+
   } catch (e) {
     setLog("an_log", "ERROR: " + e.message);
   }
@@ -869,34 +1017,18 @@ async function loadSelectedRun() {
     document.getElementById("runs_imgs").innerHTML = "";
     setLog("runs_log", "loading run: " + dir);
 
-    const sumPath = dir.replace(/\\/+$/,"") + "/summary.json";
+    const sumPath = dir.replace(/\/+$/,"") + "/summary.json";
     const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
 
-    // header FIRST (so it doesn't get buried by log scroll)
     document.getElementById("runs_header").innerHTML =
-      renderRunHeader(summary, "Selected run") +
+      renderRunHeader(summary, "Selected run", "runs") +
       `<div class="runhdr"><div class="meta">Dir: <span class="mono">${esc(dir)}</span></div></div>`;
 
-    // then the JSON log
     setLog("runs_log", JSON.stringify(summary, null, 2));
 
-    // Render images like analyze does
-    const imgs = [];
-    const per = summary && summary.per_channel ? summary.per_channel : {};
-    for (const ch of Object.keys(per)) {
-      const outs = per[ch].outputs || {};
-      if (outs.response_png) imgs.push(outs.response_png);
-      if (outs.difference_png) imgs.push(outs.difference_png);
-      if (outs.impulse_png) imgs.push(outs.impulse_png);
-    }
-    const so = (summary && summary.stereo_outputs) ? summary.stereo_outputs : {};
-    if (so.lr_overlay_png) imgs.push(so.lr_overlay_png);
-    if (so.lr_diff_png) imgs.push(so.lr_diff_png);
-
-    let html = "";
-    for (const p of imgs) html += imgTag(p);
     document.getElementById("runs_imgs").innerHTML =
-      html || "<div class='small'>No images listed in summary.</div>";
+      renderImagesWithAnchors(summary, "runs");
+
   } catch (e) {
     setLog("runs_log", "ERROR: " + e.message);
   }
@@ -1107,6 +1239,19 @@ class Handler(BaseHTTPRequestHandler):
                         # last-resort: set both
                         overrides["run_name"] = run_name
                         overrides["name"] = run_name
+
+                # Run notes (optional) -- pass to core so it can persist into summary.json
+                run_notes = _opt_str(payload.get("run_notes"))
+                if run_notes:
+                    dfl = _cmd_argparse_defaults("analyze")
+                    if "run_notes" in dfl:
+                        overrides["run_notes"] = run_notes
+                    elif "notes" in dfl:
+                        overrides["notes"] = run_notes
+                    else:
+                        # last-resort: set both
+                        overrides["run_notes"] = run_notes
+                        overrides["notes"] = run_notes
 
                 if loopback:
                     overrides["loopback"] = loopback

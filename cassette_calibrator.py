@@ -1322,6 +1322,15 @@ def cmd_detect(args: argparse.Namespace) -> None:
 def cmd_analyze(args: argparse.Namespace) -> None:
     outdir, run_meta = resolve_analyze_outdir(args)
 
+    run_notes = str(getattr(args, "run_notes", "") or "").strip()
+    run_meta["notes"] = run_notes or None
+
+    if run_notes:
+        now_local = datetime.now().astimezone()
+        now_utc = datetime.now(timezone.utc)
+        run_meta["notes_updated_at_local"] = now_local.isoformat(timespec="seconds")
+        run_meta["notes_updated_at_utc"] = now_utc.isoformat(timespec="seconds")
+
     # Keep args.outdir in sync for any downstream prints/summary fields
     args.outdir = str(outdir)
 
@@ -2042,6 +2051,13 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         default=None,
         help="Optional label for this analysis run (stored in summary.json; also used in run directory name).",
     )
+    
+    a.add_argument(
+        "--run-notes",
+        default=None,
+        help="Optional long-form notes for this run (stored in summary.json).",
+    )
+
     a.add_argument(
         "--run-subdir",
         action=argparse.BooleanOptionalAction,
