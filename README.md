@@ -160,7 +160,10 @@ In `--outdir`:
 * Keep any NR / enhancers off unless you are specifically measuring them.
 
 ## Changelog / History
-- 0.1.3 - x-axis plot style; drift alignment fixes
+- 0.1.3 - x-axis plot style; drift alignment fixes and more
+  - Improved plot x-axis formatting/ticks for audio frequencies (20 Hz–20 kHz readability).
+  - Drift alignment fixes for more reliable marker-to-marker speed compensation.
+  - Better exports/plot naming consistency (response plots + CSV + summary JSON).
 - 0.1.2 - bugfixes; config changes; dedupe parsing
 - 0.1.1 - Patches to `--help` etc
 - 0.1.0 - Initial release
