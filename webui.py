@@ -358,6 +358,24 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
         "now": int(time.time()),
     }
 
+def _write_json_atomic_preserve_mtime(path: Path, obj: object) -> None:
+    old_times = None
+    try:
+        st = path.stat()
+        old_times = (st.st_atime, st.st_mtime)
+    except Exception:
+        old_times = None
+
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+    # Keep mtime so the run list ordering doesn't change just because notes were edited
+    if old_times:
+        try:
+            os.utime(path, old_times)
+        except Exception:
+            pass
 
 INDEX_HTML = r"""<!doctype html>
 <html>
@@ -506,6 +524,21 @@ INDEX_HTML = r"""<!doctype html>
     <button onclick="loadSelectedRun()">Load run</button>
     <div id="runs_header"></div>
 
+    <div style="margin-top:8px;">
+      <button id="runs_notes_edit_btn" onclick="runsEditNotes()" style="display:none">Edit notes</button>
+    </div>
+
+    <div id="runs_notes_ctl" class="block" style="display:none">
+      <h4>Edit notes</h4>
+      <textarea id="runs_notes_text" rows="7"
+        placeholder="Deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <button onclick="runsSaveNotes()">Save</button>
+        <button onclick="runsCancelNotes()">Cancel</button>
+      </div>
+      <div id="runs_notes_status" class="small"></div>
+    </div>
+    
     <div id="runs_json">
       <pre id="runs_log"></pre>
     </div>
@@ -544,6 +577,59 @@ let MB = {
   title: "Browse",
   allowNew: false
 };
+
+let RUNS_CTX = {
+  dir: "",
+  summary: null
+};
+
+function runsEditNotes() {
+  if (!RUNS_CTX.dir || !RUNS_CTX.summary) return;
+
+  const run = (RUNS_CTX.summary && RUNS_CTX.summary.run) ? RUNS_CTX.summary.run : {};
+  const notes = optStr(run.notes);
+
+  document.getElementById("runs_notes_text").value = notes;
+  document.getElementById("runs_notes_status").textContent = "";
+
+  document.getElementById("runs_notes_ctl").style.display = "block";
+  document.getElementById("runs_notes_edit_btn").style.display = "none";
+}
+
+function runsCancelNotes() {
+  document.getElementById("runs_notes_status").textContent = "";
+  document.getElementById("runs_notes_ctl").style.display = "none";
+  document.getElementById("runs_notes_edit_btn").style.display = RUNS_CTX.dir ? "inline-block" : "none";
+}
+
+async function runsSaveNotes() {
+  try {
+    if (!RUNS_CTX.dir || !RUNS_CTX.summary) return;
+
+    const notes = document.getElementById("runs_notes_text").value || "";
+    document.getElementById("runs_notes_status").textContent = "saving...";
+
+    const r = await api("/api/run_notes", { dir: RUNS_CTX.dir, notes });
+    const summary = (r && r.summary) ? r.summary : RUNS_CTX.summary;
+
+    RUNS_CTX.summary = summary;
+
+    // Re-render header + json + images
+    document.getElementById("runs_header").innerHTML =
+      renderRunHeader(summary, "Selected run", "runs", true) +
+      `<div class="runhdr"><div class="meta">Dir: <span class="mono">${esc(RUNS_CTX.dir)}</span></div></div>`;
+
+    setLog("runs_log", JSON.stringify(summary, null, 2));
+    document.getElementById("runs_imgs").innerHTML =
+      renderImagesWithAnchors(summary, "runs");
+
+    document.getElementById("runs_notes_ctl").style.display = "none";
+    document.getElementById("runs_notes_edit_btn").style.display = "inline-block";
+    document.getElementById("runs_notes_status").textContent = "";
+  } catch (e) {
+    document.getElementById("runs_notes_status").textContent = "ERROR: " + e.message;
+  }
+}
 
 function esc(s) {
   return (s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
@@ -604,7 +690,7 @@ function escId(s) {
   return String(s || "").replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
 
-function renderRunHeader(summary, fallbackTitle, prefix) {
+function renderRunHeader(summary, fallbackTitle, prefix, forceNotes) {
   prefix = prefix || "run";
   const run = (summary && summary.run) ? summary.run : {};
   const name = optStr(run.name);
@@ -619,6 +705,8 @@ function renderRunHeader(summary, fallbackTitle, prefix) {
   const jsonId = `${prefix}_json`;
   const imgsId = `${prefix}_imgs`;
 
+  const showNotes = !!forceNotes || !!notes;
+
   let meta = "";
   if (createdUtc || createdLocal) {
     meta += `<div class="meta">Ran on:</div>`;
@@ -629,17 +717,17 @@ function renderRunHeader(summary, fallbackTitle, prefix) {
   const toc = `
     <div class="toc">
       Jump:
-      ${notes ? `<a href="#${notesId}">notes</a> | ` : ``}
+      ${showNotes ? `<a href="#${notesId}">notes</a> | ` : ``}
       <a href="#${imgsId}">images</a> |
       <a href="#${jsonId}">json</a> |
       <a href="#${topId}">top</a>
     </div>
   `;
 
-  const notesBlock = notes ? `
+  const notesBlock = showNotes ? `
     <div class="block" id="${notesId}">
       <h4>Notes <span class="small"><a href="#${notesId}">#</a></span></h4>
-      <div class="notes">${esc(notes)}</div>
+      <div class="notes">${notes ? esc(notes) : "(no notes)"}</div>
     </div>
   ` : "";
 
@@ -984,6 +1072,13 @@ async function doAnalyze() {
 
 async function refreshRuns() {
   try {
+    // reset context + editor UI
+    RUNS_CTX.dir = "";
+    RUNS_CTX.summary = null;
+    document.getElementById("runs_notes_ctl").style.display = "none";
+    document.getElementById("runs_notes_status").textContent = "";
+    document.getElementById("runs_notes_edit_btn").style.display = "none";
+
     // clear stale displayed run (header + images) right away
     document.getElementById("runs_header").innerHTML = "";
     document.getElementById("runs_imgs").innerHTML = "";
@@ -1017,11 +1112,22 @@ async function loadSelectedRun() {
     document.getElementById("runs_imgs").innerHTML = "";
     setLog("runs_log", "loading run: " + dir);
 
+    // reset editor UI
+    document.getElementById("runs_notes_ctl").style.display = "none";
+    document.getElementById("runs_notes_status").textContent = "";
+    document.getElementById("runs_notes_edit_btn").style.display = "none";
+
     const sumPath = dir.replace(/\/+$/,"") + "/summary.json";
     const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
 
+    RUNS_CTX.dir = dir;
+    RUNS_CTX.summary = summary;
+
+    // show edit button now that we have a run loaded
+    document.getElementById("runs_notes_edit_btn").style.display = "inline-block";
+
     document.getElementById("runs_header").innerHTML =
-      renderRunHeader(summary, "Selected run", "runs") +
+      renderRunHeader(summary, "Selected run", "runs", true) +
       `<div class="runhdr"><div class="meta">Dir: <span class="mono">${esc(dir)}</span></div></div>`;
 
     setLog("runs_log", JSON.stringify(summary, null, 2));
@@ -1049,7 +1155,10 @@ Object.assign(window, {
   mbPick,
   mbPickValue,
   mbCreateDir,
-  mbRefresh
+  mbRefresh,
+  runsEditNotes,
+  runsSaveNotes,
+  runsCancelNotes
 });
 
 console.log("webui script loaded; handlers exported to window");
@@ -1058,7 +1167,6 @@ console.log("webui script loaded; handlers exported to window");
 </body>
 </html>
 """
-
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "cassette-calibrator-webui/0.2"
@@ -1186,18 +1294,58 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
+        if u.path == "/api/run_notes":
+            try:
+                run_dir = str(payload.get("dir", "") or "").strip()
+                if not run_dir:
+                    raise ValueError("dir is required")
+
+                rel_dir = _rel_to_root_checked(run_dir)
+                if rel_dir in ("", "."):
+                    raise ValueError("invalid run dir")
+
+                summary_path = (ROOT / rel_dir / "summary.json")
+                if not summary_path.exists() or not summary_path.is_file():
+                    raise ValueError("summary.json not found for run")
+
+                obj = json.loads(summary_path.read_text(encoding="utf-8"))
+                if not isinstance(obj, dict):
+                    raise ValueError("summary.json is not an object")
+
+                run = obj.get("run")
+                if not isinstance(run, dict):
+                    run = {}
+                    obj["run"] = run
+
+                notes_raw = str(payload.get("notes", "") or "")
+                # normalize line endings
+                notes = notes_raw.replace("\r\n", "\n").replace("\r", "\n")
+
+                if notes.strip() == "":
+                    run.pop("notes", None)
+                else:
+                    run["notes"] = notes
+
+                _write_json_atomic_preserve_mtime(summary_path, obj)
+
+                self._json(200, {"ok": True, "summary": obj})
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+            return
+
         if u.path == "/api/gen":
             try:
-              out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
-              # Ensure parent directory exists for the output wav
-              (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
+                out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
+                # Ensure parent directory exists for the output wav
+                (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
 
-              args = _make_args("gen", cfg, {"out": out})
+                args = _make_args("gen", cfg, {"out": out})
 
-              buf = io.StringIO()
-              with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                  cc.cmd_gen(args)
-              self._json(200, {"ok": True, "out": out, "log": buf.getvalue()})
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    cc.cmd_gen(args)
+
+                self._json(200, {"ok": True, "out": out, "log": buf.getvalue()})
             except Exception as e:
                 self._json(400, {"error": str(e)})
             return
