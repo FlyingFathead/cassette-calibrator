@@ -1,4 +1,6 @@
 [gen]
+out = "data/sweepcass.wav"
+dtmf_ramp_ms = 5.0
 marker_start = "D#B*"
 marker_end   = "*B#D"
 sr = 44100
@@ -27,6 +29,7 @@ thresh = 6.0
 min_dbfs = -55.0
 
 [analyze]
+outdir = "data/cassette_results"
 marker_start = "D#B*"
 marker_end   = "*B#D"
 noisewin_s   = 2.0
@@ -59,3 +62,8 @@ smooth_oct = 6
 
 [presets.walkman.analyze.snr]
 tone_s = 2.0
+
+[webui]
+host = "127.0.0.1"
+port = 8765
+open_browser = true
