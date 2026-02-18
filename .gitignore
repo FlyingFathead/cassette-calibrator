@@ -17,3 +17,6 @@ log/
 *.patch
 *.log
 results_loop/
+audio/
+wav/
+

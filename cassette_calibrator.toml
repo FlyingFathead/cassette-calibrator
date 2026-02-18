@@ -1,4 +1,6 @@
 [gen]
+marker_start = "D#B*"
+marker_end   = "*B#D"
 sr = 44100
 pre_s = 3.0
 post_s = 1.0
@@ -23,6 +25,16 @@ thresh = 6.0
 min_dbfs = -55.0
 
 [analyze]
+marker_start = "D#B*"
+marker_end   = "*B#D"
+noisewin_s   = 2.0
+pad_s        = 0.30
+countdown    = true
+countdown_from = 10
+tone_s       = 10.0
+sweep_s      = 30.0
+marker_tone_s = 0.22
+marker_gap_s  = 0.04
 channels = "stereo"
 marker_channel = "mono"
 drift_warn = 0.002
