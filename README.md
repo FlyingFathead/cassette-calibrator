@@ -263,14 +263,22 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.1.7 - WebUI: clickable images + fullscreen viewer
+
+  * Thumbnails are now clickable: opens a fullscreen overlay viewer for easier inspection/zooming.
+  * Added "Open in new tab" link per image so you can view the raw PNG directly (browser zoom works properly).
+  * Viewer shows basic file details (path + dimensions + byte size) for quick sanity checks.
+  * Added fit/actual-size toggle controls (plus keyboard ESC to close).
+  * Added lightweight file stat endpoint used by the viewer to display image metadata.
+
 * 0.1.6 - WebUI: edit notes for existing runs
 
   * Added "Edit notes" UI for loaded runs with Save/Cancel.
   * Added `/api/run_notes` endpoint to update `summary.json` -> `run.notes` for a run directory.
   * Atomic JSON write with mtime preservation so run list ordering does not change due to note edits.
   * README updated to document the notes editor and write behavior.
-* 0.1.5 - Stereo outputs + tick-warp improvements; README/output docs sync
 
+* 0.1.5 - Stereo outputs + tick-warp improvements; README/output docs sync
   * Added stereo analysis outputs: per-channel plots/CSVs (`response_l/r.*`) plus `lr_diff.png`.
   * Added optional L/R overlay plot output: `response_lr_overlay.png` (enabled by default when analyzing both L and R).
   * Added tick-based non-linear drift correction ("ticks mode") with matching/tolerance controls and a quality gate to avoid bad warps.
@@ -278,17 +286,20 @@ In `--outdir`:
   * Config/TOML support expanded for new options (channels, marker_channel, overlay toggles/colors, tick settings, SNR section mapping).
   * WebUI now surfaces the new stereo outputs/overlay images from `summary.json`.
   * Documentation updated to reflect stereo-default outputs and filenames.
+
 * 0.1.4 - Local WebUI (stdlib) introduced; fixes
 
   * Added `webui.py` local-only WebUI (binds to 127.0.0.1 by default).
   * Modal file browser with directory creation and safe relative-path handling.
   * Fixed onclick/quoting issues in generated browse list buttons.
   * Documents relative-path requirement (no absolute paths / no "..").
+
 * 0.1.3 - x-axis plot style; drift alignment fixes and more
 
   * Improved plot x-axis formatting/ticks for audio frequencies (20 Hz–20 kHz readability).
   * Drift alignment fixes for more reliable marker-to-marker speed compensation.
   * Better exports/plot naming consistency (response plots + CSV + summary JSON).
+
 * 0.1.2 - bugfixes; config changes; dedupe parsing
 * 0.1.1 - Patches to `--help` etc
 * 0.1.0 - Initial release
