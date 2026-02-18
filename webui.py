@@ -391,6 +391,10 @@ INDEX_HTML = """<!doctype html>
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #ccc; color: #333; }
     .muted { color: #777; font-size: 12px; }
+    .runhdr { margin-top: 10px; margin-bottom: 6px; }
+    .runhdr .title { font-size: 22px; font-weight: 700; margin: 0 0 4px 0; }
+    .runhdr .meta { font-size: 12px; color: #666; line-height: 1.35; }
+    .runhdr .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }    
   </style>
 </head>
 <body>
@@ -453,6 +457,7 @@ INDEX_HTML = """<!doctype html>
       </div>
 
       <button onclick="doAnalyze()">Analyze</button>
+      <div id="an_header"></div>
       <pre id="an_log"></pre>
       <div id="an_imgs"></div>
     </div>
@@ -467,6 +472,7 @@ INDEX_HTML = """<!doctype html>
     <select id="runs_sel" style="width:100%; padding:6px; margin-top:4px;"></select>
 
     <button onclick="loadSelectedRun()">Load run</button>
+    <div id="runs_header"></div>
     <pre id="runs_log"></pre>
     <div id="runs_imgs"></div>
   </div>      
@@ -546,6 +552,41 @@ function setLog(id, s) {
 function imgTag(path) {
   const url = "/file?path=" + encodeURIComponent(path);
   return `<div style="margin-top:10px"><div class="small">${esc(path)}</div><img src="${url}" /></div>`;
+}
+
+function optStr(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  if (s.toLowerCase() === "null" || s.toLowerCase() === "none") return "";
+  return s;
+}
+
+function renderRunHeader(summary, fallbackTitle) {
+  const run = (summary && summary.run) ? summary.run : {};
+  const name = optStr(run.name);
+  const createdUtc = optStr(run.created_at_utc);
+  const createdLocal = optStr(run.created_at_local);
+
+  const title = name || optStr(fallbackTitle) || "Run";
+
+  let meta = "";
+  if (createdUtc || createdLocal) {
+    meta += `<div class="meta">Ran on:</div>`;
+    if (createdUtc) {
+      meta += `<div class="meta"><span class="mono">${esc(createdUtc)}</span> (UTC)</div>`;
+    }
+    if (createdLocal) {
+      meta += `<div class="meta"><span class="mono">${esc(createdLocal)}</span> (local)</div>`;
+    }
+  }
+
+  return `
+    <div class="runhdr">
+      <div class="title">${esc(title)}</div>
+      ${meta}
+    </div>
+  `;
 }
 
 /* -------- modal browser -------- */
@@ -753,6 +794,9 @@ async function doDetect() {
 async function doAnalyze() {
   try {
     setLog("an_log", "running...");
+
+    // clear previous content
+    document.getElementById("an_header").innerHTML = "";
     document.getElementById("an_imgs").innerHTML = "";
 
     const ref = document.getElementById("an_ref").value;
@@ -762,6 +806,11 @@ async function doAnalyze() {
     const run_name = document.getElementById("an_name").value;
 
     const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name });
+
+    // >>> THIS is where the header goes <<<
+    document.getElementById("an_header").innerHTML =
+      renderRunHeader(r.summary, "Most recent run");
+
     setLog("an_log", (r.log || "") + "\\n\\n" + JSON.stringify(r.summary, null, 2));
 
     const imgs = [];
@@ -778,7 +827,8 @@ async function doAnalyze() {
 
     let html = "";
     for (const p of imgs) html += imgTag(p);
-    document.getElementById("an_imgs").innerHTML = html || "<div class='small'>No images listed in summary.</div>";
+    document.getElementById("an_imgs").innerHTML =
+      html || "<div class='small'>No images listed in summary.</div>";
   } catch (e) {
     setLog("an_log", "ERROR: " + e.message);
   }
@@ -786,8 +836,10 @@ async function doAnalyze() {
 
 async function refreshRuns() {
   try {
-    setLog("runs_log", "loading...");
+    // clear stale displayed run (header + images) right away
+    document.getElementById("runs_header").innerHTML = "";
     document.getElementById("runs_imgs").innerHTML = "";
+    setLog("runs_log", "loading...");
 
     const r = await apiGetJson("/api/runs");
     const sel = document.getElementById("runs_sel");
@@ -812,13 +864,20 @@ async function loadSelectedRun() {
     const dir = (sel && sel.value) ? sel.value : "";
     if (!dir) return;
 
-    setLog("runs_log", "loading run: " + dir);
+    // clear previous content early
+    document.getElementById("runs_header").innerHTML = "";
     document.getElementById("runs_imgs").innerHTML = "";
+    setLog("runs_log", "loading run: " + dir);
 
     const sumPath = dir.replace(/\\/+$/,"") + "/summary.json";
     const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
 
-    // Show summary
+    // header FIRST (so it doesn't get buried by log scroll)
+    document.getElementById("runs_header").innerHTML =
+      renderRunHeader(summary, "Selected run") +
+      `<div class="runhdr"><div class="meta">Dir: <span class="mono">${esc(dir)}</span></div></div>`;
+
+    // then the JSON log
     setLog("runs_log", JSON.stringify(summary, null, 2));
 
     // Render images like analyze does
@@ -836,7 +895,8 @@ async function loadSelectedRun() {
 
     let html = "";
     for (const p of imgs) html += imgTag(p);
-    document.getElementById("runs_imgs").innerHTML = html || "<div class='small'>No images listed in summary.</div>";
+    document.getElementById("runs_imgs").innerHTML =
+      html || "<div class='small'>No images listed in summary.</div>";
   } catch (e) {
     setLog("runs_log", "ERROR: " + e.message);
   }
