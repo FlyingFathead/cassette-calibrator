@@ -48,6 +48,9 @@ ir_win_s = 0.25
 smooth_oct = 12
 f_plot_min = 20.0
 f_plot_max = 20000.0
+lr_overlay = true
+lr_overlay_color_l = "tab:blue"
+lr_overlay_color_r = "tab:orange"
 
 [analyze.snr]
 noise_s = 1.0

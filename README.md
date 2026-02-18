@@ -130,10 +130,18 @@ python3 cassette_calibrator.py detect --wav recorded.wav --json
 
 ### 4) Analyze and export results
 
+For stereo:
+
 ```bash
-python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align
+python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align --channels stereo
 # or print summary JSON:
-python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align --json
+python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align --channels stereo --json
+```
+
+For mono:
+
+```bash
+python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align --channels mono
 ```
 
 ### 4b) Optional: ticks mode (non-linear drift correction)
@@ -179,11 +187,23 @@ This produces `difference.png` ("cassette chain minus loopback").
 
 In `--outdir`:
 
-* `response.png` -- smoothed magnitude response (log frequency)
-* `response.csv` -- raw + smoothed response data
-* `summary.json` -- marker times, drift ratio, SNR estimate, settings used
-* `difference.png` -- only if `--loopback` is provided
-* `impulse.png` -- only if `--save-ir` is used
+* If analyzing **mono** (`--channels mono`):
+
+  * `response.png` -- smoothed magnitude response (log frequency)
+  * `response.csv` -- raw + smoothed response data
+  * `summary.json` -- marker times, drift ratio, SNR estimate, settings used
+  * `difference.png` -- only if `--loopback` is provided
+  * `impulse.png` -- only if `--save-ir` is used
+
+* If analyzing **stereo** (default, `--channels stereo`):
+
+  * `response_l.png`, `response_r.png`
+  * `response_l.csv`, `response_r.csv`
+  * `summary.json`
+  * `response_lr_overlay.png` -- L/R overlay plot (smoothed)
+  * `lr_diff.png` -- L minus R mismatch (smoothed)
+  * `difference_l.png`, `difference_r.png` -- only if `--loopback` is provided
+  * `impulse_l.png`, `impulse_r.png` -- only if `--save-ir` is used
 
 ## Notes and gotchas
 
@@ -216,6 +236,14 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.1.5 - Stereo outputs + tick-warp improvements; README/output docs sync
+  * Added stereo analysis outputs: per-channel plots/CSVs (`response_l/r.*`) plus `lr_diff.png`.
+  * Added optional L/R overlay plot output: `response_lr_overlay.png` (enabled by default when analyzing both L and R).
+  * Added tick-based non-linear drift correction (“ticks mode”) with matching/tolerance controls and a quality gate to avoid bad warps.
+  * Improved DTMF detection stability: safer/auto dedupe behavior and optional timing stats logging (`--dtmf-stats`).
+  * Config/TOML support expanded for new options (channels, marker_channel, overlay toggles/colors, tick settings, SNR section mapping).
+  * WebUI now surfaces the new stereo outputs/overlay images from `summary.json`.
+  * Documentation updated to reflect stereo-default outputs and filenames.
 * 0.1.4 - Local WebUI (stdlib) introduced; fixes
   * Added `webui.py` local-only WebUI (binds to 127.0.0.1 by default).
   * Modal file browser with directory creation and safe relative-path handling.
