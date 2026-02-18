@@ -101,6 +101,7 @@ __version__ = _get_version()
 
 TOP_DESC = f"""\
 cassette-calibrator {__version__}
+By FlyingFathead / https://github.com/FlyingFathead/cassette-calibrator
 
 Generate DTMF-marked test tapes and analyze cassette playback for:
 - frequency response (ESS deconvolution)
