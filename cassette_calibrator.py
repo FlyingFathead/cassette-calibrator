@@ -41,6 +41,9 @@ import textwrap
 import csv
 import json
 import math
+import re
+import unicodedata
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -353,6 +356,93 @@ def amp_from_dbfs(dbfs: float) -> float:
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _run_id_now(now: Optional[datetime] = None) -> str:
+    """
+    Filesystem-friendly timestamp id, local time:
+      YYYYMMDD-HHMMSS
+    """
+    now = now or datetime.now().astimezone()
+    return now.strftime("%Y%m%d-%H%M%S")
+
+
+def _slugify(s: str, maxlen: int = 48) -> str:
+    """
+    Turn arbitrary label into a safe ASCII-ish slug for directory names.
+    Keeps: a-z 0-9 _ - .
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+
+    # NFKD -> ASCII best-effort (drops accents/umlauts cleanly)
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+
+    s = s.lower()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^a-z0-9._-]+", "", s)
+    s = re.sub(r"_+", "_", s)
+    s = s.strip("_-.")
+    if len(s) > maxlen:
+        s = s[:maxlen].rstrip("_-.")
+    return s
+
+
+def _unique_dir(p: Path, *, max_tries: int = 999) -> Path:
+    """
+    If p exists, append -NN until it doesn't.
+    """
+    if not p.exists():
+        return p
+
+    base = p
+    for i in range(2, max_tries + 1):
+        cand = base.parent / f"{base.name}-{i:02d}"
+        if not cand.exists():
+            return cand
+    raise RuntimeError(f"Could not allocate a unique run directory under: {base.parent}")
+
+
+def resolve_analyze_outdir(args: argparse.Namespace) -> Tuple[Path, dict]:
+    """
+    If --run-subdir is enabled (default), write into:
+      <base_outdir>/<timestamp>[--<slug>]/...
+
+    Returns:
+      (resolved_outdir_path, run_meta_dict)
+    """
+    base_outdir = Path(str(getattr(args, "outdir", "") or "cassette_results"))
+    run_name = str(getattr(args, "run_name", "") or "").strip() or None
+
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+    run_id = _run_id_now(now_local)
+
+    slug = _slugify(run_name or "")
+    dir_name = f"{run_id}--{slug}" if slug else run_id
+
+    run_subdir = bool(getattr(args, "run_subdir", True))
+
+    if run_subdir:
+        ensure_dir(base_outdir)
+        outdir = _unique_dir(base_outdir / dir_name)
+        ensure_dir(outdir)
+    else:
+        outdir = base_outdir
+        ensure_dir(outdir)
+
+    run_meta = {
+        "id": run_id,
+        "name": run_name,
+        "created_at_local": now_local.isoformat(timespec="seconds"),
+        "created_at_utc": now_utc.isoformat(timespec="seconds"),
+        "base_outdir": str(base_outdir),
+        "outdir": str(outdir),
+        "run_subdir": run_subdir,
+    }
+    return outdir, run_meta
 
 def json_sanitize(obj):
     """Convert NaN/Inf into None and make common NumPy types JSON-safe."""
@@ -1230,8 +1320,10 @@ def cmd_detect(args: argparse.Namespace) -> None:
         plt.close(fig)
 
 def cmd_analyze(args: argparse.Namespace) -> None:
-    outdir = Path(args.outdir)
-    ensure_dir(outdir)
+    outdir, run_meta = resolve_analyze_outdir(args)
+
+    # Keep args.outdir in sync for any downstream prints/summary fields
+    args.outdir = str(outdir)
 
     sr_ref, ref_y = read_wav(Path(args.ref))
     sr_rec, rec_y = read_wav(Path(args.rec))
@@ -1759,6 +1851,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     summary = {
         "version": __version__,
+        "run": run_meta,
+
         "sr": sr,
         "ref": str(args.ref),
         "rec": str(args.rec),
@@ -1942,6 +2036,18 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     a.add_argument("--rec", required=True, help="recorded capture from cassette playback")
     a.add_argument("--loopback", default=None, help="optional loopback capture to subtract interface coloration")
     a.add_argument("--outdir", default="cassette_results")
+
+    a.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional label for this analysis run (stored in summary.json; also used in run directory name).",
+    )
+    a.add_argument(
+        "--run-subdir",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write outputs into a unique timestamped subdirectory under --outdir (default: on). Use --no-run-subdir for the old flat behavior.",
+    )
 
     a.add_argument(
         "--dtmf-dedupe-s",

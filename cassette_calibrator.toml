@@ -29,7 +29,7 @@ thresh = 6.0
 min_dbfs = -55.0
 
 [analyze]
-outdir = "data/cassette_results"
+outdir = "data/runs"
 marker_start = "D#B*"
 marker_end   = "*B#D"
 noisewin_s   = 2.0

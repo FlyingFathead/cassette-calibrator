@@ -186,6 +186,69 @@ def _list_result_dirs(max_items: int = 2000) -> list[str]:
     return sorted(set(out))
 
 
+def _list_runs(max_items: int = 500) -> list[dict]:
+    """
+    Return runs with lightweight metadata:
+      {dir, mtime, name, created_at, label}
+    Prefers scanning under data/ if it exists.
+    """
+    runs: list[dict] = []
+
+    bases = []
+    if (ROOT / "data").exists():
+        bases.append(ROOT / "data")
+    bases.append(ROOT)
+
+    seen = set()
+
+    for base in bases:
+        for p in base.rglob("summary.json"):
+            try:
+                run_dir = str(p.parent.relative_to(ROOT))
+            except Exception:
+                continue
+            if run_dir in seen:
+                continue
+            seen.add(run_dir)
+
+            try:
+                st = p.stat()
+                mtime = int(st.st_mtime)
+            except Exception:
+                mtime = 0
+
+            name = None
+            created = None
+            try:
+                obj = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(obj, dict):
+                    run = obj.get("run", {})
+                    if isinstance(run, dict):
+                        name = run.get("name") or None
+                        created = run.get("created_at_local") or run.get("created_at_utc") or None
+            except Exception:
+                pass
+
+            # label: "name -- dir" or just dir
+            label = (f"{name} -- {run_dir}" if name else run_dir)
+
+            runs.append({
+                "dir": run_dir,
+                "mtime": mtime,
+                "name": name,
+                "created_at": created,
+                "label": label,
+            })
+
+            if len(runs) >= max_items:
+                break
+        if len(runs) >= max_items:
+            break
+
+    runs.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+    return runs
+
+
 def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | None) -> dict:
     """
     mode: "file" or "dir"
@@ -350,6 +413,9 @@ INDEX_HTML = """<!doctype html>
     <div class="card">
       <h3>analyze</h3>
 
+      <label>Run name (optional)</label>
+      <input id="an_name" placeholder="e.g.: this cassette => that deck" />
+
       <label>Ref WAV</label>
       <div class="grid2">
         <input id="an_ref" placeholder="data/sweepcass.wav" />
@@ -379,6 +445,19 @@ INDEX_HTML = """<!doctype html>
       <div id="an_imgs"></div>
     </div>
   </div>
+
+  <div class="card">
+    <h3>runs</h3>
+    <div class="small">Browse previous analysis runs (reads run name from summary.json).</div>
+
+    <button onclick="refreshRuns()">Refresh list</button>
+    <label>Pick a run</label>
+    <select id="runs_sel" style="width:100%; padding:6px; margin-top:4px;"></select>
+
+    <button onclick="loadSelectedRun()">Load run</button>
+    <pre id="runs_log"></pre>
+    <div id="runs_imgs"></div>
+  </div>      
 
   <!-- Modal file browser -->
   <div id="mb_backdrop" class="modal-backdrop" onclick="closeBrowser()"></div>
@@ -668,8 +747,9 @@ async function doAnalyze() {
     const rec = document.getElementById("an_rec").value;
     const loopback = document.getElementById("an_lb").value;
     const outdir = document.getElementById("an_outdir").value;
+    const run_name = document.getElementById("an_name").value;
 
-    const r = await api("/api/analyze", { ref, rec, loopback, outdir });
+    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name });
     setLog("an_log", (r.log || "") + "\\n\\n" + JSON.stringify(r.summary, null, 2));
 
     const imgs = [];
@@ -692,11 +772,71 @@ async function doAnalyze() {
   }
 }
 
+async function refreshRuns() {
+  try {
+    setLog("runs_log", "loading...");
+    document.getElementById("runs_imgs").innerHTML = "";
+
+    const r = await apiGetJson("/api/runs");
+    const sel = document.getElementById("runs_sel");
+
+    let html = "";
+    for (const it of (r.runs || [])) {
+      const label = (it.label || it.dir || "");
+      const val = it.dir || "";
+      html += `<option value="${esc(val)}">${esc(label)}</option>`;
+    }
+    sel.innerHTML = html || "<option value=''>no runs found</option>";
+
+    setLog("runs_log", JSON.stringify(r, null, 2));
+  } catch (e) {
+    setLog("runs_log", "ERROR: " + e.message);
+  }
+}
+
+async function loadSelectedRun() {
+  try {
+    const sel = document.getElementById("runs_sel");
+    const dir = (sel && sel.value) ? sel.value : "";
+    if (!dir) return;
+
+    setLog("runs_log", "loading run: " + dir);
+    document.getElementById("runs_imgs").innerHTML = "";
+
+    const sumPath = dir.replace(/\\/+$/,"") + "/summary.json";
+    const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
+
+    // Show summary
+    setLog("runs_log", JSON.stringify(summary, null, 2));
+
+    // Render images like analyze does
+    const imgs = [];
+    const per = summary && summary.per_channel ? summary.per_channel : {};
+    for (const ch of Object.keys(per)) {
+      const outs = per[ch].outputs || {};
+      if (outs.response_png) imgs.push(outs.response_png);
+      if (outs.difference_png) imgs.push(outs.difference_png);
+      if (outs.impulse_png) imgs.push(outs.impulse_png);
+    }
+    const so = (summary && summary.stereo_outputs) ? summary.stereo_outputs : {};
+    if (so.lr_overlay_png) imgs.push(so.lr_overlay_png);
+    if (so.lr_diff_png) imgs.push(so.lr_diff_png);
+
+    let html = "";
+    for (const p of imgs) html += imgTag(p);
+    document.getElementById("runs_imgs").innerHTML = html || "<div class='small'>No images listed in summary.</div>";
+  } catch (e) {
+    setLog("runs_log", "ERROR: " + e.message);
+  }
+}
+
 // Make inline onclick= handlers work no matter what scope rules apply
 Object.assign(window, {
   doGen,
   doDetect,
   doAnalyze,
+  refreshRuns,
+  loadSelectedRun,
   openBrowser,
   closeBrowser,
   mbUp,
@@ -749,6 +889,13 @@ class Handler(BaseHTTPRequestHandler):
             st = {
                 "wavs": _list_files((".wav",)),
                 "results": _list_result_dirs(),
+            }
+            self._json(200, st)
+            return
+
+        if u.path == "/api/runs":
+            st = {
+                "runs": _list_runs(),
             }
             self._json(200, st)
             return
@@ -875,6 +1022,11 @@ class Handler(BaseHTTPRequestHandler):
                 outdir = _ensure_outdir_rel(str(payload.get("outdir", "data/cassette_results")))
 
                 overrides = {"ref": ref, "rec": rec, "outdir": outdir}
+
+                run_name = str(payload.get("run_name", "") or "").strip()
+                if run_name:
+                    overrides["run_name"] = run_name
+
                 if loopback:
                     overrides["loopback"] = loopback
 
@@ -884,12 +1036,18 @@ class Handler(BaseHTTPRequestHandler):
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                     cc.cmd_analyze(args)
 
-                summary_path = ROOT / outdir / "summary.json"
-                if not summary_path.exists():
+                base = ROOT / outdir
+                # Find newest summary.json under base outdir (supports run-subdir mode)
+                candidates = list(base.rglob("summary.json")) if base.exists() else []
+                if not candidates:
                     raise RuntimeError("analyze finished but summary.json was not created")
+
+                candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+                summary_path = candidates[0]
 
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
                 self._json(200, {"ok": True, "summary": summary, "log": buf.getvalue()})
+
             except Exception as e:
                 self._json(400, {"error": str(e)})
             return
