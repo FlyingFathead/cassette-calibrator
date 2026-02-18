@@ -681,6 +681,7 @@ async function doAnalyze() {
       if (outs.impulse_png) imgs.push(outs.impulse_png);
     }
     const so = (r.summary && r.summary.stereo_outputs) ? r.summary.stereo_outputs : {};
+    if (so.lr_overlay_png) imgs.push(so.lr_overlay_png);
     if (so.lr_diff_png) imgs.push(so.lr_diff_png);
 
     let html = "";

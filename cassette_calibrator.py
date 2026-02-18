@@ -1689,6 +1689,53 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if "L" in results and "R" in results:
         resL = results["L"]
         resR = results["R"]
+
+        # L/R overlay plot (smoothed)
+        if bool(getattr(args, "lr_overlay", True)):
+            if len(resL.freq) == len(resR.freq) and np.allclose(resL.freq, resR.freq):
+                lr_freq_ov = resL.freq
+                yL = resL.mag_db_s
+                yR = resR.mag_db_s
+            else:
+                lr_freq_ov = resL.freq
+                yL = resL.mag_db_s
+                yR = np.interp(lr_freq_ov, resR.freq, resR.mag_db_s)
+
+            fig, ax = plt.subplots()
+            ax.semilogx(
+                lr_freq_ov,
+                yL,
+                color=str(getattr(args, "lr_overlay_color_l", "tab:blue")),
+                label="Left (L)",
+            )
+            ax.semilogx(
+                lr_freq_ov,
+                yR,
+                color=str(getattr(args, "lr_overlay_color_r", "tab:orange")),
+                label="Right (R)",
+            )
+            ax.grid(True, which="both")
+
+            apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
+
+            ax.set_ylabel("Magnitude (dB, smoothed)")
+            ax.set_title("Cassette chain magnitude response (L/R overlay)")
+
+            # Legend under the plot
+            ax.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.14),
+                ncol=2,
+                frameon=False,
+            )
+
+            # Make room for the legend underneath
+            fig.tight_layout(rect=[0, 0.06, 1, 1])
+            fig.savefig(outdir / "response_lr_overlay.png", dpi=150)
+            plt.close(fig)
+
+            stereo_outputs["lr_overlay_png"] = str(outdir / "response_lr_overlay.png")
+
         if len(resL.freq) == len(resR.freq) and np.allclose(resL.freq, resR.freq):
             lr_diff = resL.mag_db_s - resR.mag_db_s
             lr_freq = resL.freq
@@ -1780,6 +1827,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 print(f"  impulse_{ch.lower()}.png")
         if "lr_diff_png" in stereo_outputs:
             print("  lr_diff.png")
+        if "lr_overlay_png" in stereo_outputs:
+            print("  response_lr_overlay.png")
         print("  summary.json")
 
 
@@ -1975,6 +2024,24 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
 
     a.add_argument("--json", action="store_true", help="print summary JSON to stdout")
     a.set_defaults(func=cmd_analyze)
+
+    # L/R overlay plot (only meaningful when both L and R are analyzed)
+    a.add_argument(
+        "--lr-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="if both L and R are analyzed, also save an L/R overlay plot (default: on)",
+    )
+    a.add_argument(
+        "--lr-overlay-color-l",
+        default="tab:blue",
+        help="matplotlib color for Left channel in overlay plot",
+    )
+    a.add_argument(
+        "--lr-overlay-color-r",
+        default="tab:orange",
+        help="matplotlib color for Right channel in overlay plot",
+    )
 
     return ap, {"gen": g, "detect": d, "analyze": a}
 
