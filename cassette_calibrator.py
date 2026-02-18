@@ -343,6 +343,126 @@ def resample_to_length(x: np.ndarray, target_len: int) -> np.ndarray:
         y = np.pad(y, (0, target_len - len(y)))
     return y
 
+def _interp_samples_linear(x: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """
+    Sample 1D signal x at fractional positions pos using linear interpolation.
+    pos is in sample indices (0..len(x)-1-ish).
+    """
+    x = np.asarray(x, dtype=np.float32)
+    pos = np.asarray(pos, dtype=np.float32)
+    if x.size == 0:
+        return np.zeros_like(pos, dtype=np.float32)
+
+    # Pad one sample so i0+1 is always valid after clipping
+    xp = np.pad(x, (0, 1), mode="edge")
+    n = len(xp)
+
+    i0 = np.floor(pos).astype(np.int64)
+    i0 = np.clip(i0, 0, n - 2)
+    frac = (pos - i0.astype(np.float32)).astype(np.float32)
+
+    y0 = xp[i0]
+    y1 = xp[i0 + 1]
+    return (y0 * (1.0 - frac) + y1 * frac).astype(np.float32)
+
+
+def warp_by_control_points(
+    rec: np.ndarray,
+    ref_pts: Sequence[float],
+    rec_pts: Sequence[float],
+    target_len: int,
+) -> np.ndarray:
+    """
+    Piecewise-linear time warp:
+      given control points mapping ref_sample_index -> rec_sample_index,
+      produce output of length target_len by interpolating rec at mapped positions.
+
+    ref_pts must be increasing; rec_pts must be nondecreasing.
+    """
+    rec = np.asarray(rec, dtype=np.float32)
+    if target_len <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if rec.size <= 1:
+        return np.zeros(target_len, dtype=np.float32)
+
+    if len(ref_pts) != len(rec_pts) or len(ref_pts) < 2:
+        return resample_to_length(rec, target_len)
+
+    rp = np.asarray(ref_pts, dtype=np.float32)
+    cp = np.asarray(rec_pts, dtype=np.float32)
+
+    # Clamp into bounds
+    rp = np.clip(rp, 0.0, float(target_len - 1))
+    cp = np.clip(cp, 0.0, float(len(rec) - 1))
+
+    # Enforce monotonicity + strict ref increase
+    ref_clean = [float(rp[0])]
+    rec_clean = [float(cp[0])]
+    for r, c in zip(rp[1:], cp[1:]):
+        if r <= ref_clean[-1] + 1e-6:
+            continue
+        if c < rec_clean[-1] - 1e-3:
+            continue
+        ref_clean.append(float(r))
+        rec_clean.append(float(c))
+
+    if len(ref_clean) < 2:
+        return resample_to_length(rec, target_len)
+
+    x_ref = np.arange(target_len, dtype=np.float32)
+    x_rec = np.interp(
+        x_ref,
+        np.asarray(ref_clean, dtype=np.float32),
+        np.asarray(rec_clean, dtype=np.float32),
+    ).astype(np.float32)
+
+    return _interp_samples_linear(rec, x_rec)
+
+
+def match_expected_to_detected(
+    expected: Sequence[Tuple[int, float]],
+    detected: Sequence[float],
+    tol_s: float,
+) -> List[Tuple[int, float, float]]:
+    """
+    expected: list of (k, expected_abs_time_s)
+    detected: sorted detected_abs_time_s
+    returns: list of (k, expected_abs_time_s, detected_abs_time_s) in increasing time order,
+             greedy 1:1 matching within tol_s.
+    """
+    det = list(map(float, detected))
+    det.sort()
+
+    out: List[Tuple[int, float, float]] = []
+    j = 0
+    tol_s = float(tol_s)
+    if not math.isfinite(tol_s) or tol_s < 0.0:
+        tol_s = 0.0
+
+    for k, te in expected:
+        te = float(te)
+
+        while j < len(det) and det[j] < (te - tol_s):
+            j += 1
+
+        candidates: List[Tuple[float, float, int]] = []
+        if j < len(det):
+            candidates.append((abs(det[j] - te), det[j], j))
+        if j > 0:
+            candidates.append((abs(det[j - 1] - te), det[j - 1], j - 1))
+
+        candidates = [c for c in candidates if c[0] <= tol_s]
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda x: x[0])
+        _, td, idx = candidates[0]
+        out.append((int(k), te, float(td)))
+        j = idx + 1
+
+    return out
+
+
 def parse_channels(s: str) -> str:
     s = (s or "").strip().lower()
     aliases = {
@@ -1112,15 +1232,25 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     actual_between = (t_me - t_ms)
     drift_ratio = expected_between / max(actual_between, 1e-9)
 
+    # recorded-seconds per layout-second (always useful for ticks)
+    layout_scale = 1.0 / max(drift_ratio, 1e-12)
+
     if abs(drift_ratio - 1.0) > args.drift_warn:
         drift_applied = True
-        rec_sweep_dur = args.sweep_s / max(drift_ratio, 1e-9)
-        sweep_start_offset_rec = sweep_start_offset / max(drift_ratio, 1e-9)
+        rec_sweep_dur = args.sweep_s * layout_scale
+        sweep_start_offset_rec = sweep_start_offset * layout_scale
         print(f"[warn] drift ratio {drift_ratio:.6f} (expected/actual) -- applying linear warp")
     else:
         drift_applied = False
-        rec_sweep_dur = args.sweep_s
-        sweep_start_offset_rec = sweep_start_offset
+
+        # If tick-warp is enabled, still use ratio-scaled sweep window so expected tick
+        # times stay close enough for matching.
+        if bool(getattr(args, "ticks", False)):
+            rec_sweep_dur = args.sweep_s * layout_scale
+            sweep_start_offset_rec = sweep_start_offset * layout_scale
+        else:
+            rec_sweep_dur = args.sweep_s
+            sweep_start_offset_rec = sweep_start_offset
 
     # Loopback pre-load (optional) + marker location for loopback
     lb_y = None
@@ -1204,7 +1334,99 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     for ch in ch_list:
         rec_ch = pick_channel(rec_y, ch)
         rec_sweep_raw = extract(rec_ch, t_ms + sweep_start_offset_rec, rec_sweep_dur, sr)
-        rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
+
+        # --- optional tick-based non-linear warp ---
+        tick_info = {"enabled": bool(getattr(args, "ticks", False)), "used": False, "matched": 0}
+
+        if bool(getattr(args, "ticks", False)):
+            sweep_abs_start = float(t_ms + sweep_start_offset_rec)
+
+            # Use a smaller dedupe window for ticks so we don't "eat" real repeated ticks.
+            # (marker_dedupe defaults are tuned for longer marker symbols, not 60 ms ticks)
+            win_s = float(args.win_ms) / 1000.0
+            tick_dedupe_s = max(float(args.tick_tone_s), win_s, 3.0 * (float(args.hop_ms) / 1000.0))
+            # Clamp so it can't collapse adjacent ticks
+            if float(args.tick_interval_s) > 0:
+                tick_dedupe_s = min(tick_dedupe_s, 0.45 * float(args.tick_interval_s))
+
+            # Detect DTMF events inside the extracted sweep window; keep only tick_sym
+            tick_events = detect_dtmf_events(
+                rec_sweep_raw, sr,
+                win_ms=args.win_ms,
+                hop_ms=args.hop_ms,
+                thresh_ratio=args.thresh,
+                min_dbfs=args.min_dbfs,
+                dedupe_s=tick_dedupe_s,
+                log_stats=False,
+            )
+            det_tick_abs = [sweep_abs_start + float(e.t) for e in tick_events if e.sym == args.tick_sym]
+            det_tick_abs.sort()
+
+            # Build expected tick center times (layout timeline), then map to recorded-time using layout_scale
+            expected: List[Tuple[int, float]] = []
+            tick_layout_centers: List[float] = []
+
+            k = 0
+            t0 = float(args.tick_offset_s)
+            while t0 < (float(args.sweep_s) - float(args.tick_tone_s)):
+                t_center_layout = t0 + 0.5 * float(args.tick_tone_s)
+                t_center_rec = sweep_abs_start + (t_center_layout * layout_scale)
+                expected.append((k, t_center_rec))
+                tick_layout_centers.append(t_center_layout)
+                k += 1
+                t0 += float(args.tick_interval_s)
+
+            matches = match_expected_to_detected(expected, det_tick_abs, float(args.tick_match_tol_s))
+
+            if len(matches) >= int(args.tick_min_matches):
+                # Control points map ref-sample -> rec-sample
+                ref_pts: List[float] = [0.0]
+                rec_pts: List[float] = [0.0]
+
+                errs = []
+                for kk, te, td in matches:
+                    if 0 <= kk < len(tick_layout_centers):
+                        t_layout = tick_layout_centers[kk]
+                    else:
+                        continue
+
+                    ref_i = float(int(round(t_layout * sr)))
+                    rec_i = float((td - sweep_abs_start) * sr)
+
+                    if 0.0 <= ref_i <= float(target_len - 1) and 0.0 <= rec_i <= float(max(len(rec_sweep_raw) - 1, 0)):
+                        ref_pts.append(ref_i)
+                        rec_pts.append(rec_i)
+                        errs.append(float(td - te))
+
+                # Endpoints to stabilize edges
+                ref_pts.append(float(target_len - 1))
+                rec_pts.append(float(max(len(rec_sweep_raw) - 1, 0)))
+
+                rec_sweep_warped = warp_by_control_points(rec_sweep_raw, ref_pts, rec_pts, target_len)
+
+                tick_info["used"] = True
+                tick_info["matched"] = int(max(0, len(ref_pts) - 2))  # exclude endpoints
+
+                if errs:
+                    tick_info["mean_abs_ms"] = float(1000.0 * np.mean(np.abs(errs)))
+                    tick_info["max_abs_ms"] = float(1000.0 * np.max(np.abs(errs)))
+
+                tick_info["tol_s"] = float(args.tick_match_tol_s)
+                tick_info["sym"] = str(args.tick_sym)
+                tick_info["interval_s"] = float(args.tick_interval_s)
+                tick_info["tone_s"] = float(args.tick_tone_s)
+
+                print(
+                    f"[info] ticks ({ch}) matched={tick_info['matched']} "
+                    f"mean_abs={tick_info.get('mean_abs_ms', 0.0):.1f} ms "
+                    f"max_abs={tick_info.get('max_abs_ms', 0.0):.1f} ms"
+                )
+            else:
+                rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
+                tick_info["matched"] = int(len(matches))
+                print(f"[warn] ticks ({ch}) enabled but only matched {len(matches)} (need {args.tick_min_matches}); falling back to linear warp")
+        else:
+            rec_sweep_warped = resample_to_length(rec_sweep_raw, target_len)
 
         if args.fine_align:
             corr = signal.fftconvolve(rec_sweep_warped, ref_sweep[::-1], mode="full")
@@ -1275,7 +1497,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             tone_hz=args.tone_hz,
             snr_noise_s=args.snr_noise_s,
             snr_tone_s=args.snr_tone_s,
-            layout_scale=(1.0 / drift_ratio) if drift_applied else 1.0,
+            layout_scale=layout_scale if (drift_applied or bool(getattr(args, "ticks", False))) else 1.0,
         )
 
         snrs[ch] = snr_db
@@ -1327,6 +1549,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             "snr_noise_rms": snr_parts.get("noise_rms"),
             "snr_tone_rms": snr_parts.get("tone_rms"),
             "snr_warnings": snr_warnings,
+            "ticks": tick_info,
             "outputs": {
                 "response_png": str(outdir / f"response{out_suffix(ch)}.png"),
                 "response_csv": str(outdir / f"response{out_suffix(ch)}.csv"),
@@ -1386,6 +1609,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         "sweep_s": args.sweep_s,
         "ir_win_s": args.ir_win_s,
         "smooth_oct": args.smooth_oct,
+
+        "ticks": {
+            "enabled": bool(getattr(args, "ticks", False)),
+            "sym": str(args.tick_sym),
+            "interval_s": float(args.tick_interval_s),
+            "tone_s": float(args.tick_tone_s),
+            "match_tol_s": float(args.tick_match_tol_s),
+            "min_matches": int(args.tick_min_matches),
+        },
 
         "per_channel": per_ch,
         "stereo_outputs": stereo_outputs,
