@@ -160,6 +160,7 @@ In `--outdir`:
 * Keep any NR / enhancers off unless you are specifically measuring them.
 
 ## Changelog / History
+- 0.1.1 - Patches to `--help` etc
 - 0.1.0 - Initial release
 
 ## About

@@ -37,6 +37,7 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import textwrap
 import csv
 import json
 import math
@@ -61,7 +62,38 @@ except ModuleNotFoundError:  # py3.10-
 import logging
 LOG = logging.getLogger("cassette_calibrator")
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
+
+# -------------------------
+# Help w/ descriptions
+# -------------------------
+
+TOP_DESC = f"""\
+cassette-calibrator {__version__}
+
+Generate DTMF-marked test tapes and analyze cassette playback for:
+- frequency response (ESS deconvolution)
+- drift (wow/flutter-ish via time warp)
+- SNR (noise window vs tone window)
+"""
+
+TOP_EPILOG = """\
+Commands:
+
+  gen
+    Build a WAV you can print to cassette:
+      [pre] [start marker] [noise window] [pad] [countdown] [pad]
+      [1 kHz tone] [pad] [ESS sweep (+optional ticks)] [pad] [end marker] [post]
+
+  detect
+    Scan a recording and locate start/end markers (timestamps).
+
+  analyze
+    Auto-align using markers, drift-correct (linear + optional tick warp),
+    deconvolve sweep -> impulse -> magnitude response, export plots + CSV + summary.json
+
+Run: cassette_calibrator.py <command> --help  for full options.
+"""
 
 # -------------------------
 # Config loaders & helpers
@@ -1662,24 +1694,31 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 # -------------------------
 
 def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.ArgumentParser]]:
-    ap = argparse.ArgumentParser(prog="cassette_calibrator.py")
 
-    ap.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
+    ap = argparse.ArgumentParser(
+        prog="cassette_calibrator.py",
+        description=textwrap.dedent(TOP_DESC),
+        epilog=textwrap.dedent(TOP_EPILOG),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--version", action="version", version=f"cassette-calibrator {__version__}")
+
+    sub = ap.add_subparsers(
+        dest="cmd",
+        required=True,
+        title="commands",
+        metavar="{gen,detect,analyze}",
+    )
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
     common.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
 
     # Create subcommands ONCE
-    g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV", parents=[common])
-    d = sub.add_parser("detect", help="Detect start/end markers in a recorded file", parents=[common])
-    a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data", parents=[common])
+    g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV")
+    d = sub.add_parser("detect", help="Detect start/end markers in a recorded file")
+    a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
 
     # -------- gen --------
     g.add_argument("--dtmf-ramp-ms", type=float, default=5.0,
@@ -1848,6 +1887,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
 
 def main() -> None:
     argv = sys.argv[1:]
+    ap, cmd_parsers = build_parser()
 
     # Grab config/preset anywhere in argv (before/after subcommand)
     cfg_path = _scan_argv_value(argv, "--config")
@@ -1856,6 +1896,13 @@ def main() -> None:
     cfg = load_toml_config(cfg_path)
 
     ap, cmd_parsers = build_parser()
+
+    if "--help-all" in argv:
+        print(ap.format_help())
+        for name in ("gen", "detect", "analyze"):
+            print("\n" + "="*80 + "\n")
+            print(cmd_parsers[name].format_help())
+        raise SystemExit(0)
 
     # Apply base sections: [gen], [detect], [analyze]
     for cmd, p in cmd_parsers.items():
