@@ -371,7 +371,7 @@ INDEX_HTML = """<!doctype html>
       <label>Outdir (relative path)</label>
       <div class="grid2">
         <input id="an_outdir" value="data/cassette_results" />
-        <button onclick="openBrowser('an_outdir', {mode:'dir', title:'Choose output directory'})">Browse</button>
+        <button onclick="openBrowser('an_outdir', {mode:'dir', title:'Choose or create output directory', allowNew:true})">Browse</button>
       </div>
 
       <button onclick="doAnalyze()">Analyze</button>
@@ -415,6 +415,11 @@ function esc(s) {
   return (s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
 }
 
+function jsq(s) {
+  // returns a quoted JS string literal, safe to embed inside onclick=...
+  return JSON.stringify(String(s || ""));
+}
+
 async function api(path, payload) {
   const r = await fetch(path, {
     method: "POST",
@@ -449,7 +454,7 @@ function setLog(id, s) {
 
 function imgTag(path) {
   const url = "/file?path=" + encodeURIComponent(path);
-  return "<div style=\\"margin-top:10px\\"><div class=\\"small\\">" + esc(path) + "</div><img src=\\"" + url + "\\" /></div>";
+  return `<div style="margin-top:10px"><div class="small">${esc(path)}</div><img src="${url}" /></div>`;
 }
 
 /* -------- modal browser -------- */
@@ -499,6 +504,27 @@ async function mbRefresh() {
   const list = document.getElementById("mb_list");
   let html = "";
 
+  // helper: join paths without making absolute
+  function joinPath(base, leaf) {
+    base = String(base || "");
+    leaf = String(leaf || "");
+    while (base.endsWith("/")) base = base.slice(0, -1);
+    while (leaf.startsWith("/")) leaf = leaf.slice(1);
+    if (!base || base === ".") return leaf;
+    if (!leaf) return base;
+    return base + "/" + leaf;
+  }
+
+  // Create-directory row (only when browsing dirs and allowNew=true)
+  if (MB.allowNew && MB.mode === "dir") {
+    html += "<div class='item'>"
+         + "<div><span class='pill'>new</span> "
+         + "<input id='mb_newdir' placeholder='e.g. cassette_results/run_001' style='margin-top:0; width:100%;' /></div>"
+         + "<div class='muted'>in <span class='mono'>" + esc(st.cwd) + "</span></div>"
+         + "<div><button onclick='mbCreateDir()'>Create</button></div>"
+         + "</div>";
+  }
+
   // Optional "use typed value" for allowNew outputs (gen out file)
   if (MB.allowNew && MB.mode === "file") {
     const current = document.getElementById(MB.targetId).value || "";
@@ -508,12 +534,11 @@ async function mbRefresh() {
   }
 
   for (const it of st.entries) {
-    const kind = it.is_dir ? "dir" : "file";
     const pill = it.is_dir ? "<span class='pill'>dir</span>" : "<span class='pill'>file</span>";
     const meta = it.is_dir ? "" : ("<span class='muted'>" + (it.size || 0) + " bytes</span>");
     const btn = it.is_dir
-      ? "<button onclick='mbEnter(\\\"" + esc(it.path) + "\\\")'>Open</button>"
-      : "<button onclick='mbPick(\\\"" + esc(it.path) + "\\\")'>Pick</button>";
+      ? `<button onclick='mbEnter(${jsq(it.path)})'>Open</button>`
+      : `<button onclick='mbPick(${jsq(it.path)})'>Pick</button>`;
 
     html += "<div class='item'>"
          + "<div>" + pill + " <span class='mono'>" + esc(it.path) + "</span></div>"
@@ -561,6 +586,54 @@ function mbPickValue() {
   // Keep whatever is typed in the target input
   closeBrowser();
 }
+
+async function mbCreateDir() {
+  try {
+    const el = document.getElementById("mb_newdir");
+    const nameRaw = (el ? el.value : "").trim();
+    if (!nameRaw) return;
+
+    // Create relative to current browse directory
+    const base = String(MB.cwd || "").trim();
+
+    // normalize: strip leading/trailing forward slashes
+    let name = String(nameRaw);
+    while (name.startsWith("/")) name = name.slice(1);
+    while (name.endsWith("/")) name = name.slice(0, -1);
+    name = name.trim();
+    if (!name) return;
+
+    // basic safety: reject traversal or absolute-ish junk
+    if (name.includes("..")) {
+      alert("ERROR: '..' is not allowed");
+      return;
+    }
+
+    let path = name;
+
+    if (base && base !== ".") {
+      let baseClean = String(base);
+      while (baseClean.endsWith("/")) baseClean = baseClean.slice(0, -1);
+
+      // If base came back as ".", treat as root
+      if (baseClean === ".") baseClean = "";
+
+      path = baseClean ? (baseClean + "/" + name) : name;
+    }
+
+    // one more sanity pass: collapse accidental double slashes
+    while (path.includes("//")) path = path.replaceAll("//", "/");
+
+    const r = await api("/api/mkdir", { path });
+
+    // Pick it into the target input and close
+    document.getElementById(MB.targetId).value = (r && r.path) ? r.path : path;
+    closeBrowser();
+  } catch (e) {
+    alert("ERROR: " + e.message);
+  }
+}
+
 
 /* -------- actions -------- */
 
@@ -630,6 +703,7 @@ Object.assign(window, {
   mbEnter,
   mbPick,
   mbPickValue,
+  mbCreateDir,
   mbRefresh
 });
 
@@ -741,6 +815,24 @@ class Handler(BaseHTTPRequestHandler):
             cfg = self.server.cfg  # type: ignore[attr-defined]
         except Exception:
             cfg = {}
+
+        if u.path == "/api/mkdir":
+            try:
+                path = str(payload.get("path", "") or "").strip()
+                if not path:
+                    raise ValueError("path is required")
+
+                rel = _rel_to_root_checked(path)
+                if rel in ("", "."):
+                    raise ValueError("refusing to create project root")
+
+                full = ROOT / rel
+                full.mkdir(parents=True, exist_ok=True)
+
+                self._json(200, {"ok": True, "path": rel})
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+            return
 
         if u.path == "/api/gen":
             try:

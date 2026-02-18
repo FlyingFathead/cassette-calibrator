@@ -16,7 +16,7 @@ tone_dbfs = -18.0
 f1 = 20.0
 f2 = 20000.0
 sweep_s = 30.0
-sweep_dbfs = -24.0
+sweep_dbfs = -20.0
 peak = 0.90
 
 [detect]
