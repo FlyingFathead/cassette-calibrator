@@ -431,6 +431,36 @@ def goertzel_power(x: np.ndarray, sr: int, f: float) -> float:
     power = s1 * s1 + s2 * s2 - coeff * s1 * s2
     return power
 
+def embed_dtmf_ticks_in_sweep(
+    sweep: np.ndarray,
+    sr: int,
+    sweep_s: float,
+    tick_sym: str,
+    tick_interval_s: float,
+    tick_offset_s: float,
+    tick_tone_s: float,
+    tick_amp: float,
+    ramp_ms: float,
+) -> np.ndarray:
+    """
+    Mix short DTMF ticks into the sweep at fixed times (offset + k*interval).
+    This does NOT replace the sweep; it adds to it.
+    """
+    out = np.asarray(sweep, dtype=np.float32).copy()
+    n = len(out)
+
+    # place ticks
+    t = float(tick_offset_s)
+    while t < (float(sweep_s) - float(tick_tone_s)):
+        i0 = int(round(t * sr))
+        tone = dtmf_tone(tick_sym, sr, tick_tone_s, tick_amp, ramp_ms=ramp_ms)
+        i1 = min(n, i0 + len(tone))
+        if 0 <= i0 < n:
+            out[i0:i1] += tone[: i1 - i0]
+        t += float(tick_interval_s)
+
+    return out.astype(np.float32)
+
 @dataclass
 class DTMFEvent:
     t: float      # window-center time (nice for plots/logs)
@@ -848,6 +878,20 @@ def cmd_gen(args: argparse.Namespace) -> None:
     ref_tone = (tone_amp * np.sin(2 * np.pi * args.tone_hz * t)).astype(np.float32)
 
     sweep = ess_sweep(args.f1, args.f2, args.sweep_s, sr, amp=sweep_amp)
+
+    if args.ticks:
+        tick_amp = amp_from_dbfs(args.tick_dbfs)
+        sweep = embed_dtmf_ticks_in_sweep(
+            sweep=sweep,
+            sr=sr,
+            sweep_s=args.sweep_s,
+            tick_sym=args.tick_sym,
+            tick_interval_s=args.tick_interval_s,
+            tick_offset_s=args.tick_offset_s,
+            tick_tone_s=args.tick_tone_s,
+            tick_amp=tick_amp,
+            ramp_ms=args.dtmf_ramp_ms,
+        )
 
     x = np.concatenate([
         pre,
@@ -1413,6 +1457,17 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     g.add_argument("--peak", type=float, default=0.90, help="hard peak limiter for whole file")
     g.set_defaults(func=cmd_gen)
 
+    # // ticks
+    g.add_argument("--ticks", action=argparse.BooleanOptionalAction, default=False,
+                help="embed periodic DTMF ticks during sweep for non-linear drift correction")
+    g.add_argument("--tick-sym", default="A", help="DTMF symbol used as tick (default: A)")
+    g.add_argument("--tick-interval-s", type=float, default=3.0)
+    g.add_argument("--tick-tone-s", type=float, default=0.06)
+    g.add_argument("--tick-dbfs", type=float, default=-18.0)
+    g.add_argument("--tick-offset-s", type=float, default=1.5,
+                help="first tick offset from sweep start (seconds)")
+
+
     # ------- detect -------
     d.add_argument("--channel", choices=["mono", "L", "R"], default="mono",
                    help="which channel to use for DTMF detection")
@@ -1504,6 +1559,19 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
                    help="seconds used from noise window (<= noisewin-s)")
     a.add_argument("--snr-tone-s", type=float, default=3.0,
                    help="seconds used from middle of tone for RMS")
+
+    # // ticks
+    a.add_argument("--ticks", action=argparse.BooleanOptionalAction, default=False,
+                help="use periodic tick-based non-linear warp if available")
+    a.add_argument("--tick-sym", default="A")
+    a.add_argument("--tick-interval-s", type=float, default=3.0)
+    a.add_argument("--tick-tone-s", type=float, default=0.06)
+    a.add_argument("--tick-dbfs", type=float, default=-18.0)   # only used for detection thresholds if you want
+    a.add_argument("--tick-offset-s", type=float, default=1.5)
+    a.add_argument("--tick-match-tol-s", type=float, default=0.35,
+                help="max deviation (seconds) when matching expected ticks to detected ticks")
+    a.add_argument("--tick-min-matches", type=int, default=4,
+                help="minimum matched ticks required to enable piecewise warp")
 
     # Optional improvement: allow --no-save-ir if config sets it true
     a.add_argument(
