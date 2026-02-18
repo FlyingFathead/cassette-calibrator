@@ -59,10 +59,41 @@ try:
 except ModuleNotFoundError:  # py3.10-
     import tomli as tomllib  # type: ignore
 
+# -------------------------
+# Logging setup
+# -------------------------
+
 import logging
 LOG = logging.getLogger("cassette_calibrator")
 
-__version__ = "0.1.1"
+# -------------------------
+# Version numbering; auto
+# -------------------------
+
+def _get_version() -> str:
+    # 1) If installed as a package, prefer the packaged version.
+    try:
+        from importlib.metadata import version as pkg_version  # py3.8+
+        return pkg_version("cassette-calibrator")
+    except Exception:
+        pass
+
+    # 2) If running from a git checkout, use git tags.
+    try:
+        import subprocess
+        v = subprocess.check_output(
+            ["git", "describe", "--tags", "--dirty", "--always"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return v[1:] if v.startswith("v") else v
+    except Exception:
+        pass
+
+    # 3) Last resort.
+    return "0.0.0"
+
+__version__ = _get_version()
 
 # -------------------------
 # Help w/ descriptions
@@ -1711,9 +1742,12 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         metavar="{gen,detect,analyze}",
     )
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
-    common.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
+    # common = argparse.ArgumentParser(add_help=False)
+    # common.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
+    # common.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
+
+    ap.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
+    ap.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
 
     # Create subcommands ONCE
     g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV")
@@ -1887,7 +1921,6 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
 
 def main() -> None:
     argv = sys.argv[1:]
-    ap, cmd_parsers = build_parser()
 
     # Grab config/preset anywhere in argv (before/after subcommand)
     cfg_path = _scan_argv_value(argv, "--config")
