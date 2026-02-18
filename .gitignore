@@ -16,3 +16,4 @@ logs/
 log/
 *.patch
 *.log
+results_loop/
