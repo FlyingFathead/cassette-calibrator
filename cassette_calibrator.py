@@ -199,15 +199,6 @@ def rms(x: np.ndarray, eps: float = 1e-12) -> float:
     x = np.asarray(x, dtype=np.float32)
     return float(np.sqrt(np.mean(x * x) + eps))
 
-def to_float32(y: np.ndarray) -> np.ndarray:
-    y = np.asarray(y)
-    # DO NOT downmix here. Keep channels intact.
-    if y.dtype == np.int16:
-        return (y.astype(np.float32) / 32768.0)
-    if y.dtype == np.int32:
-        return (y.astype(np.float32) / 2147483648.0)
-    return y.astype(np.float32)
-
 def write_wav_int16(path: Path, sr: int, x: np.ndarray) -> None:
     x = np.asarray(x, dtype=np.float32)
     x = np.clip(x, -1.0, 1.0)
@@ -261,6 +252,29 @@ def pick_channel(y: np.ndarray, channel: str) -> np.ndarray:
         return y[:, idx].astype(np.float32)
 
     return y.mean(axis=1).astype(np.float32)
+
+def read_wav(path: Path) -> Tuple[int, np.ndarray]:
+    """
+    Read WAV using scipy.io.wavfile and return (sr, y_float32).
+    y is float32 in [-1, 1] (best effort), shape:
+      - (n,) for mono
+      - (n, ch) for multi-channel
+    """
+    sr, y = wavfile.read(str(path))
+
+    y = np.asarray(y)
+
+    # Convert to float32 full-scale
+    y_f = to_float32(y)
+
+    # If float WAV came in with >1.0 peaks (some DAWs/exporters do this),
+    # scale it down so "dBFS-ish" math stays sane and marker thresholds work.
+    if np.issubdtype(y_f.dtype, np.floating) and y_f.size:
+        maxabs = float(np.max(np.abs(y_f)))
+        if maxabs > 1.0 + 1e-6:
+            y_f = (y_f / maxabs).astype(np.float32)
+
+    return int(sr), y_f.astype(np.float32)
 
 def read_wav_mono(path: Path) -> Tuple[int, np.ndarray]:
     sr, y = read_wav(path)
