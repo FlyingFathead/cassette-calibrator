@@ -30,6 +30,16 @@ from urllib.parse import urlparse, parse_qs
 # Force a headless matplotlib backend BEFORE importing cassette_calibrator
 os.environ.setdefault("MPLBACKEND", "Agg")
 
+# set up logging
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+LOG = logging.getLogger("cassette_calibrator.webui")
+
 import cassette_calibrator as cc  # noqa: E402
 
 
@@ -103,6 +113,27 @@ def _load_cfg(cfg_path: str | None) -> dict:
 def _webui_cfg(cfg: dict) -> dict:
     w = cfg.get("webui", {})
     return w if isinstance(w, dict) else {}
+
+def _run_cc_cmd(fn, *args, **kwargs) -> tuple[bool, str, str | None]:
+    """
+    Run a cassette_calibrator cmd_* function, capturing stdout/stderr.
+    Returns: (ok, log_text, error_message_or_None)
+
+    We treat SystemExit as a normal "user-facing" failure (400),
+    because cassette_calibrator cmd_* functions use SystemExit for CLI.
+    """
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            fn(*args, **kwargs)
+        return True, buf.getvalue(), None
+    except SystemExit as e:
+        # SystemExit.code can be int/None/str; str(e) usually contains your message.
+        msg = str(e).strip()
+        if not msg:
+            code = getattr(e, "code", None)
+            msg = str(code).strip() if code is not None else "command failed"
+        return False, buf.getvalue(), msg
 
 @lru_cache(maxsize=None)
 def _cmd_argparse_defaults(cmd: str) -> dict:
@@ -1394,7 +1425,52 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet by default
         return
 
+    # --- GET and POST with logging ---
+
     def do_GET(self) -> None:
+        t0 = time.monotonic()
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
+        LOG.info("GET %s -- from %s", self.path, peer)
+        try:
+            return self._do_GET()
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            LOG.exception("Unhandled exception in GET %s -- from %s", self.path, peer)
+            try:
+                self._json(500, {
+                    "error": "internal server error (see server log)",
+                    "path": self.path,
+                })
+            except Exception:
+                pass
+        finally:
+            LOG.info("GET %s -- %.1f ms", self.path, (time.monotonic() - t0) * 1000.0)
+
+    def do_POST(self) -> None:
+        t0 = time.monotonic()
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
+        clen = self.headers.get("Content-Length", "-")
+        LOG.info("POST %s -- from %s -- Content-Length=%s", self.path, peer, clen)
+        try:
+            return self._do_POST()
+        except KeyboardInterrupt:
+            raise
+        except BaseException:
+            LOG.exception("Unhandled exception in POST %s -- from %s", self.path, peer)
+            try:
+                self._json(500, {
+                    "error": "internal server error (see server log)",
+                    "path": self.path,
+                })
+            except Exception:
+                pass
+        finally:
+            LOG.info("POST %s -- %.1f ms", self.path, (time.monotonic() - t0) * 1000.0)
+
+    # --- original GET and POST ---
+
+    def _do_GET(self) -> None:
         u = urlparse(self.path)
         if u.path == "/":
             self._text(200, INDEX_HTML, "text/html; charset=utf-8")
@@ -1489,9 +1565,11 @@ class Handler(BaseHTTPRequestHandler):
             obj = {}
         return obj if isinstance(obj, dict) else {}
 
-    def do_POST(self) -> None:
+    def _do_POST(self) -> None:
         u = urlparse(self.path)
         payload = self._read_json_body()
+
+        LOG.info("POST %s -- parsed payload keys=%s", u.path, sorted(payload.keys()))
 
         try:
             cfg = self.server.cfg  # type: ignore[attr-defined]
@@ -1558,18 +1636,18 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/gen":
             try:
                 out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
-                # Ensure parent directory exists for the output wav
                 (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
 
                 args = _make_args("gen", cfg, {"out": out})
 
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    cc.cmd_gen(args)
+                ok, log_txt, err = _run_cc_cmd(cc.cmd_gen, args)
+                if not ok:
+                    self._json(400, {"ok": False, "error": err, "log": log_txt})
+                    return
 
-                self._json(200, {"ok": True, "out": out, "log": buf.getvalue()})
+                self._json(200, {"ok": True, "out": out, "log": log_txt})
             except Exception as e:
-                self._json(400, {"error": str(e)})
+                self._json(400, {"ok": False, "error": str(e)})
             return
 
         if u.path == "/api/detect":
@@ -1577,76 +1655,132 @@ class Handler(BaseHTTPRequestHandler):
                 wav = _rel_to_root_checked(str(payload.get("wav", "")))
                 args = _make_args("detect", cfg, {"wav": wav, "json": True})
 
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    cc.cmd_detect(args)
+                ok, log_txt, err = _run_cc_cmd(cc.cmd_detect, args)
+                if not ok:
+                    # cc.cmd_detect may have printed something; return it to UI
+                    self._json(400, {"ok": False, "error": err, "log": log_txt})
+                    return
 
-                result = json.loads(buf.getvalue().strip() or "{}")
-                self._json(200, {"ok": True, "result": result})
+                # On success, stdout should be JSON (because json=True)
+                s = (log_txt or "").strip()
+                try:
+                    result = json.loads(s or "{}")
+                except Exception:
+                    # Defensive: if detect printed non-JSON despite json=True
+                    self._json(500, {
+                        "ok": False,
+                        "error": "detect did not output valid JSON",
+                        "log": log_txt,
+                    })
+                    return
+
+                self._json(200, {"ok": True, "result": result, "log": log_txt})
             except Exception as e:
-                self._json(400, {"error": str(e)})
+                self._json(400, {"ok": False, "error": str(e)})
             return
 
         if u.path == "/api/analyze":
+            # Always have a buffer-backed log, even when we fail early
             try:
                 ref = _rel_to_root_checked(str(payload.get("ref", "")))
                 rec = _rel_to_root_checked(str(payload.get("rec", "")))
+
                 loopback_in = str(payload.get("loopback", "") or "").strip()
                 loopback = _rel_to_root_checked(loopback_in) if loopback_in else None
+
                 outdir = _ensure_outdir_rel(str(payload.get("outdir", "data/cassette_results")))
 
                 overrides = {"ref": ref, "rec": rec, "outdir": outdir}
 
+                # Fetch defaults ONCE
+                dfl = _cmd_argparse_defaults("analyze")
+
+                # run name
                 run_name = _opt_str(payload.get("run_name"))
                 if run_name:
-                    # match whatever cassette_calibrator's argparse uses
-                    dfl = _cmd_argparse_defaults("analyze")
                     if "run_name" in dfl:
                         overrides["run_name"] = run_name
                     elif "name" in dfl:
                         overrides["name"] = run_name
                     else:
-                        # last-resort: set both
                         overrides["run_name"] = run_name
                         overrides["name"] = run_name
 
-                # Run notes (optional) -- pass to core so it can persist into summary.json
-                run_notes = _opt_str(payload.get("run_notes"))
-                if run_notes:
-                    dfl = _cmd_argparse_defaults("analyze")
-                    if "run_notes" in dfl:
-                        overrides["run_notes"] = run_notes
-                    elif "notes" in dfl:
-                        overrides["notes"] = run_notes
-                    else:
-                        # last-resort: set both
-                        overrides["run_notes"] = run_notes
-                        overrides["notes"] = run_notes
+                # run notes
+                run_notes = payload.get("run_notes", None)
+                if isinstance(run_notes, str):
+                    # preserve content but normalize line endings; ignore if only whitespace
+                    rn = run_notes.replace("\r\n", "\n").replace("\r", "\n")
+                    if rn.strip():
+                        if "run_notes" in dfl:
+                            overrides["run_notes"] = rn
+                        elif "notes" in dfl:
+                            overrides["notes"] = rn
+                        else:
+                            overrides["run_notes"] = rn
+                            overrides["notes"] = rn
 
                 if loopback:
                     overrides["loopback"] = loopback
 
+                # OPTIONAL: let UI pass through marker-finding knobs if you add fields later
+                # (safe: only apply if the argparse dest exists)
+                def _maybe_float(api_key: str, *dest_names: str):
+                    v = payload.get(api_key, None)
+                    if v is None or v == "":
+                        return
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        return
+                    for dn in dest_names:
+                        if dn in dfl:
+                            overrides[dn] = fv
+                            return
+
+                def _maybe_int(api_key: str, *dest_names: str):
+                    v = payload.get(api_key, None)
+                    if v is None or v == "":
+                        return
+                    try:
+                        iv = int(v)
+                    except Exception:
+                        return
+                    for dn in dest_names:
+                        if dn in dfl:
+                            overrides[dn] = iv
+                            return
+
+                # common knobs you referenced in the SystemExit hint:
+                _maybe_float("min_dbfs", "min_dbfs")
+                _maybe_float("thresh", "thresh")
+                # (and if your core uses different names, add aliases here)
+
                 args = _make_args("analyze", cfg, overrides)
 
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    cc.cmd_analyze(args)
+                LOG.info("analyze: ref=%s rec=%s loopback=%s outdir=%s", ref, rec, loopback, outdir)
+
+                ok, log_txt, err = _run_cc_cmd(cc.cmd_analyze, args)
+                if not ok:
+                    # This is where your "Could not find start/end markers..." becomes visible in the UI
+                    self._json(400, {"ok": False, "error": err, "log": log_txt})
+                    return
 
                 base = ROOT / outdir
-                # Find newest summary.json under base outdir (supports run-subdir mode)
                 candidates = list(base.rglob("summary.json")) if base.exists() else []
                 if not candidates:
-                    raise RuntimeError("analyze finished but summary.json was not created")
+                    self._json(500, {"ok": False, "error": "analyze succeeded but summary.json was not created", "log": log_txt})
+                    return
 
                 candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
                 summary_path = candidates[0]
-
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                self._json(200, {"ok": True, "summary": summary, "log": buf.getvalue()})
 
+                self._json(200, {"ok": True, "summary": summary, "log": log_txt})
             except Exception as e:
-                self._json(400, {"error": str(e)})
+                self._json(400, {"ok": False, "error": str(e)})
             return
+
 
         self._json(404, {"error": "not found"})
 
