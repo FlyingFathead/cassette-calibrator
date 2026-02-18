@@ -12,12 +12,14 @@ It generates a cassette-friendly measurement WAV with robust DTMF markers, then 
   - DTMF countdown (default on; mostly for humans, alignment uses start/end markers)
   - 1 kHz reference tone for setting record level
   - ESS log sweep (default 20 Hz -> 20 kHz)
+  - Optional periodic DTMF "ticks" embedded during the sweep (for non-linear drift correction)  
   - DTMF end marker
 
 - Analyzes a recorded capture by:
   - Detecting start/end markers automatically (no manual alignment)
   - Extracting the sweep region based on known layout
   - Applying a linear time-warp based on marker-to-marker drift (transport speed mismatch)
+  - Optional tick-based piecewise time-warp (handles non-linear wow/flutter better than a single linear warp)
   - Optional fine alignment via correlation
   - ESS deconvolution -> impulse response -> magnitude response
   - Exporting plots + CSV + summary JSON
@@ -94,6 +96,30 @@ python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --
 python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --fine-align --json
 ```
 
+### 4b) Optional: ticks mode (non-linear drift correction)
+
+Cassette transports can drift *non-linearly* (wow/flutter). The default method uses a single linear warp based on the start/end markers, which corrects overall speed mismatch but can't fully fix curvature within the sweep.
+
+Ticks mode embeds short periodic DTMF symbols inside the sweep, then uses them to build a piecewise time warp. Use it if you see "wavy" response curves or inconsistent alignment between runs.
+
+Generate with ticks:
+
+```bash
+python3 cassette_calibrator.py gen --out sweepcass.wav --ticks
+```
+
+Analyze with ticks:
+
+```bash
+python3 cassette_calibrator.py analyze --ref sweepcass.wav --rec recorded.wav --outdir results --ticks
+```
+
+If tick matching fails (falls back to linear warp), try:
+
+* raise tick level at generation: `--tick-dbfs -16` (or louder)
+* loosen detection: `--thresh 5.0` or `--min-dbfs -60`
+* widen matching tolerance: `--tick-match-tol-s 0.5`
+
 ### 5) Optional: subtract interface coloration with a loopback capture
 
 Make a loopback capture by patching interface line out -> line in (no cassette), while playing `sweepcass.wav`.
@@ -123,6 +149,7 @@ In `--outdir`:
 
 * HF loss is often mechanical (azimuth, head wear, dirty path, wrong tape-type EQ) before it's "EQ fixing".
 * Cassette transports drift. This tool compensates drift with a linear warp between start/end markers.
+* For non-linear drift (wow/flutter), enable ticks mode (`gen --ticks` + `analyze --ticks`) for piecewise correction.
 * If marker detection fails:
 
   * Generate hotter markers: `--marker-dbfs -10`
