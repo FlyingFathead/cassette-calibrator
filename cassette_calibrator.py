@@ -58,6 +58,9 @@ from matplotlib.ticker import FuncFormatter
 import os
 import sys
 
+# EPS definition
+EPS = 1e-12
+
 try:
     import tomllib  # py3.11+
 except ModuleNotFoundError:  # py3.10-
@@ -208,6 +211,10 @@ def flatten_cmd_defaults(cmd: str, section: dict) -> dict:
     """
     Turn a TOML section into argparse defaults (flat dict of dest->value).
     Handles nested analyze.snr.
+
+    Backwards-compat:
+      - If config has [detect].marker_channel, treat it as [detect].channel
+        (and remove marker_channel so it won't trigger "unknown key" warnings).
     """
     out: dict = {}
     if not isinstance(section, dict):
@@ -224,7 +231,19 @@ def flatten_cmd_defaults(cmd: str, section: dict) -> dict:
 
         out[k] = v
 
-    # Small normalizations so config can be forgiving:
+    # -----------------------------
+    # Backwards-compat aliasing
+    # -----------------------------
+    if cmd == "detect" and "marker_channel" in out:
+        # Only use it if "channel" wasn't explicitly set
+        if "channel" not in out:
+            out["channel"] = out["marker_channel"]
+        # Always remove it so apply_config_to_subparser() won't warn
+        out.pop("marker_channel", None)
+
+    # -----------------------------
+    # Small normalizations so config can be forgiving
+    # -----------------------------
     if cmd in ["detect", "analyze"] and "marker_channel" in out:
         out["marker_channel"] = _normalize_marker_channel(out["marker_channel"])
     if cmd == "detect" and "channel" in out:
@@ -797,9 +816,14 @@ def detect_dtmf_events(
     for i in range(0, len(y) - win + 1, hop):
         seg = y[i:i + win]
 
+        # # // OLD method: quick gate before doing Goertzel
+        # if rms(seg) < (min_amp * 0.2):
+        #     continue
+
         # quick gate before doing Goertzel
-        if rms(seg) < (min_amp * 0.2):
-            continue
+        # NOTE: min_dbfs should mean what it says; don't secretly loosen it.
+        if rms(seg) < min_amp:
+             continue
 
         seg = seg * signal.windows.hann(len(seg), sym=False).astype(np.float32)
 
@@ -815,8 +839,25 @@ def detect_dtmf_events(
         if best / others < thresh_ratio:
             continue
 
+        # --- two-tone sanity checks ---
+        # DTMF should have BOTH a dominant ROW tone and a dominant COL tone.
+        # A sweep tends to energize only one strong tone at a time -> reject that.
+        r_others = (sum(row_p) - r_best) + 1e-12
+        c_others = (sum(col_p) - c_best) + 1e-12
+        if (r_best / r_others) < thresh_ratio:
+            continue
+        if (c_best / c_others) < thresh_ratio:
+            continue
+
+        # Row/col power should be roughly comparable (DTMF is two simultaneous tones).
+        # Allow +/- 8 dB imbalance.
+        bal_db = 10.0 * math.log10((r_best + 1e-12) / (c_best + 1e-12))
+        if abs(bal_db) > 8.0:
+            continue
+
         r_f = ROWS[r_idx]
         c_f = COLS[c_idx]
+
         sym = None
         for k, (a, b) in DTMF.items():
             if a == r_f and b == c_f:
@@ -860,19 +901,34 @@ def auto_dedupe_s(args: argparse.Namespace) -> float:
     raw   = max(base, win_s, 3.0 * hop_s)
     return raw if upper <= 0 else min(raw, upper)
 
-def find_sequence(events: Sequence[DTMFEvent], seq: str, *, which: str = "t0") -> Optional[float]:
+def find_sequence(
+    events: Sequence[DTMFEvent],
+    seq: str,
+    *,
+    which: str = "t0",
+    start_after: Optional[float] = None,
+    last: bool = False,
+) -> Optional[float]:
     syms = [e.sym for e in events]
 
     if which not in ("t", "t0"):
         raise ValueError("which must be 't' or 't0'")
 
-    times = [getattr(e, which) for e in events]
+    times = [float(getattr(e, which)) for e in events]
 
     sub = list(seq)
+    found: Optional[float] = None
+
     for i in range(0, len(syms) - len(sub) + 1):
         if syms[i:i + len(sub)] == sub:
-            return times[i]
-    return None
+            t = float(times[i])
+            if start_after is not None and t < float(start_after):
+                continue
+            found = t
+            if not last:
+                return found
+
+    return found
 
 
 # -------------------------
@@ -959,6 +1015,9 @@ def analyze_chain(
     # Frequency-domain transfer-function estimate:
     # H(f) = R(f) * conj(S(f)) / (|S(f)|^2 + eps)
     # This guarantees: if rec_sweep == ref_sweep, then H == 1 (flat), numerically.
+
+    eps = EPS
+
     ref_sweep = np.asarray(ref_sweep, dtype=np.float32)
     rec_sweep = np.asarray(rec_sweep, dtype=np.float32)
 
@@ -976,8 +1035,9 @@ def analyze_chain(
     S = np.fft.rfft(ref_sweep, n=nfft)
     R = np.fft.rfft(rec_sweep, n=nfft)
 
-    eps = 1e-12
-    H = (R * np.conj(S)) / (np.abs(S) ** 2 + eps)
+    denom = (np.abs(S) ** 2).astype(np.float64)
+    floor = 1e-6 * float(np.max(denom) + 1e-24)  # relative regularization
+    H = (R * np.conj(S)) / (denom + floor)
 
     freq_full = np.fft.rfftfreq(nfft, 1.0 / sr)
     mag_lin_full = np.abs(H).astype(np.float32)
@@ -1371,13 +1431,53 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     # Use anchor timestamps for layout/drift math
     t_ms = find_sequence(events, args.marker_start, which="t0")
-    t_me = find_sequence(events, args.marker_end, which="t0")
-
-    if t_ms is None or t_me is None:
+    if t_ms is None:
         raise SystemExit(
-            "Could not find start/end markers in recorded file. "
+            "Could not find start marker in recorded file. "
             "Try lowering --min-dbfs, reducing --thresh, or increasing marker level."
         )
+
+    # Layout constants needed to sanity-gate the end marker time
+    marker_dur = len(dtmf_sequence(
+        args.marker_start, sr, args.marker_tone_s, args.marker_gap_s, amp_from_dbfs(args.marker_dbfs)
+    )) / sr
+
+    cd_dur = 0.0
+    if args.countdown:
+        tokens = countdown_tokens(args.countdown_from)
+        cd_audio = []
+        for tok in tokens:
+            cd_audio.append(
+                dtmf_sequence(
+                    tok, sr, args.marker_tone_s, args.marker_gap_s,
+                    amp_from_dbfs(args.marker_dbfs) * 0.9
+                )
+            )
+            cd_audio.append(np.zeros(int(sr * 0.12), dtype=np.float32))
+        cd_dur = (sum(len(a) for a in cd_audio) / sr) if cd_audio else 0.0
+
+    expected_between = (
+        marker_dur
+        + args.noisewin_s + args.pad_s
+        + cd_dur + args.pad_s
+        + args.tone_s + args.pad_s
+        + args.sweep_s + args.pad_s
+    )
+
+    # End marker should be near the end of that layout span; avoid false positives in the sweep.
+    min_end = float(t_ms + 0.70 * expected_between)
+
+    t_me = find_sequence(events, args.marker_end, which="t0", start_after=min_end, last=True)
+    if t_me is None:
+        # Fallback: still try "last match anywhere" instead of "first match"
+        t_me = find_sequence(events, args.marker_end, which="t0", last=True)
+
+    if t_me is None:
+        raise SystemExit(
+            "Could not find end marker in recorded file. "
+            "Try lowering --min-dbfs, reducing --thresh, or increasing marker level."
+        )
+
     if t_me <= t_ms:
         raise SystemExit("Marker end occurs before start. Wrong marker strings or bad detection.")
 
@@ -1396,20 +1496,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if t_rs is None:
         t_rs = args.pre_s  # fallback assumption
 
-    # Layout constants
-    marker_dur = len(dtmf_sequence(
-        args.marker_start, sr, args.marker_tone_s, args.marker_gap_s, amp_from_dbfs(args.marker_dbfs)
-    )) / sr
-
-    cd_dur = 0.0
-    if args.countdown:
-        tokens = countdown_tokens(args.countdown_from)
-        cd_audio = []
-        for tok in tokens:
-            cd_audio.append(dtmf_sequence(tok, sr, args.marker_tone_s, args.marker_gap_s, amp_from_dbfs(args.marker_dbfs) * 0.9))
-            cd_audio.append(np.zeros(int(sr * 0.12), dtype=np.float32))
-        cd_dur = (sum(len(a) for a in cd_audio) / sr) if cd_audio else 0.0
-
+    # Layout constants (REUSE earlier marker_dur + cd_dur computed above)
     sweep_start_offset = (
         marker_dur
         + args.noisewin_s + args.pad_s
@@ -1423,13 +1510,6 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     target_len = len(ref_sweep)
 
     # Drift ratio using marker-to-marker distance (timestamps at START of marker sequence)
-    expected_between = (
-        marker_dur
-        + args.noisewin_s + args.pad_s
-        + cd_dur + args.pad_s
-        + args.tone_s + args.pad_s
-        + args.sweep_s + args.pad_s
-    )
     actual_between = (t_me - t_ms)
     drift_ratio = expected_between / max(actual_between, 1e-9)
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import html as pyhtml
 from functools import lru_cache
 import io
 import json
@@ -26,6 +27,116 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs
+
+# --- TOML-backed defaults + preset merging (WebUI "Default" == TOML base) ---
+from typing import Any, Dict, Optional
+
+try:
+    import tomllib  # py3.11+
+except Exception:
+    import tomli as tomllib  # pip install tomli  (py<=3.10)
+
+
+DEFAULT_CONFIG_PATH = Path(
+    os.environ.get(
+        "CASSETTE_CALIBRATOR_CONFIG",
+        str(Path(__file__).with_name("cassette_calibrator.toml")),
+    )
+)
+
+def _load_toml(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+def _deep_get(d: Dict[str, Any], *keys: str) -> Any:
+    cur: Any = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+def _pick(d: Dict[str, Any], keys: tuple[str, ...], default: Any) -> Any:
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+# Current detector semantics:
+# - "thresh" is a RATIO gate (best/others >= thresh), so default is ~6.0, not 0.65.
+FALLBACK_DETECT_DEFAULTS = {
+    "min_dbfs": -55.0,
+    "thresh": 6.0,
+    "marker_channel": "mix",
+}
+
+
+
+def list_detect_presets(cfg: Dict[str, Any]) -> list[str]:
+    presets = cfg.get("presets", {})
+    if not isinstance(presets, dict):
+        return []
+    out: list[str] = []
+    for name, body in presets.items():
+        if not isinstance(body, dict):
+            continue
+        # Typical structure: [presets.<name>.detect]
+        if isinstance(body.get("detect"), dict):
+            out.append(str(name))
+        else:
+            # allow "flat" presets too; we'll treat them as detect keys if used
+            out.append(str(name))
+    return sorted(set(out))
+
+def get_effective_section(cfg: Dict[str, Any], section: str, preset: Optional[str]) -> Dict[str, Any]:
+    base = cfg.get(section, {})
+    if not isinstance(base, dict):
+        base = {}
+
+    if not preset:
+        return dict(base)
+
+    # preferred: [presets.<preset>.<section>]
+    p = _deep_get(cfg, "presets", preset, section)
+
+    # fallback/legacy: [presets.<preset>] flat keys (we treat as detect keys only)
+    if p is None:
+        p = _deep_get(cfg, "presets", preset)
+        if not isinstance(p, dict):
+            p = {}
+        # if it's not nested and section != detect, ignore
+        if section != "detect":
+            p = {}
+
+    if not isinstance(p, dict):
+        p = {}
+
+    merged = dict(base)
+    merged.update(p)
+    return merged
+
+def get_dtmf_params(config_path: Path = DEFAULT_CONFIG_PATH, preset: Optional[str] = None) -> Dict[str, Any]:
+    cfg = _load_toml(config_path)
+    detect = get_effective_section(cfg, "detect", preset)
+
+    min_dbfs = float(_pick(detect, ("min_dbfs", "dtmf_min_dbfs", "marker_min_dbfs"),
+                           FALLBACK_DETECT_DEFAULTS["min_dbfs"]))
+    thresh   = float(_pick(detect, ("thresh", "thresh_ratio", "dtmf_thresh", "dtmf_thresh_ratio"),
+                           FALLBACK_DETECT_DEFAULTS["thresh"]))
+    ch       = str(_pick(detect, ("marker_channel", "dtmf_channel", "channel"),
+                         FALLBACK_DETECT_DEFAULTS["marker_channel"]))
+
+    return {
+        "min_dbfs": min_dbfs,
+        "thresh": thresh,
+        "marker_channel": ch,
+        "config_path": str(config_path),
+        "preset": preset or "",
+    }
+# --- end TOML-backed defaults block ---
 
 # Force a headless matplotlib backend BEFORE importing cassette_calibrator
 os.environ.setdefault("MPLBACKEND", "Agg")
@@ -42,7 +153,6 @@ LOG = logging.getLogger("cassette_calibrator.webui")
 
 import cassette_calibrator as cc  # noqa: E402
 
-
 ROOT = Path(__file__).resolve().parent
 
 IGNORE_DIRS = {
@@ -56,6 +166,184 @@ IGNORE_DIRS = {
     "node_modules",
 }
 MAX_LIST_ITEMS = 4000
+
+# -----------------------
+# DTMF / marker presets (WebUI-side)
+# -----------------------
+
+def _dtmf_from_detect_section(detect: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize a detect section into WebUI DTMF preset fields.
+    Works with current ratio-style thresh (best/others >= thresh).
+    """
+    if not isinstance(detect, dict):
+        detect = {}
+
+    min_dbfs = float(
+        _pick(
+            detect,
+            ("min_dbfs", "dtmf_min_dbfs", "marker_min_dbfs"),
+            FALLBACK_DETECT_DEFAULTS["min_dbfs"],
+        )
+    )
+    thresh = float(
+        _pick(
+            detect,
+            ("thresh", "thresh_ratio", "dtmf_thresh", "dtmf_thresh_ratio"),
+            FALLBACK_DETECT_DEFAULTS["thresh"],
+        )
+    )
+    ch = str(
+        _pick(
+            detect,
+            ("marker_channel", "dtmf_channel", "channel"),
+            FALLBACK_DETECT_DEFAULTS["marker_channel"],
+        )
+    )
+    return {"min_dbfs": min_dbfs, "thresh": thresh, "marker_channel": ch}
+
+
+def _build_dtmf_presets_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build DTMF presets:
+      - "default" from top-level [detect] (plus FALLBACK_DETECT_DEFAULTS)
+      - "noisy_cassette", "line_in", "aggressive" derived from default
+      - plus any [presets.<name>.detect] presets from the TOML
+    """
+    # base/default from config
+    base_detect = get_effective_section(cfg, "detect", preset=None)
+    dflt = _dtmf_from_detect_section(base_detect)
+
+    presets: Dict[str, Dict[str, Any]] = {
+        "default": dict(dflt),
+
+        # derived helpers (ratio thresh: smaller = more permissive)
+        "noisy_cassette": {
+            "min_dbfs": dflt["min_dbfs"] - 5.0,
+            "thresh": max(1.0, dflt["thresh"] - 2.0),
+            "marker_channel": dflt["marker_channel"],
+        },
+        "line_in": {
+            "min_dbfs": dflt["min_dbfs"] + 10.0,
+            "thresh": dflt["thresh"] + 2.0,
+            "marker_channel": dflt["marker_channel"],
+        },
+        "aggressive": {
+            "min_dbfs": dflt["min_dbfs"] - 10.0,
+            "thresh": max(1.0, dflt["thresh"] - 3.0),
+            "marker_channel": dflt["marker_channel"],
+        },
+    }
+
+    # overlay TOML presets: [presets.<name>.detect]
+    for name in list_detect_presets(cfg):
+        det = get_effective_section(cfg, "detect", preset=name)
+        if isinstance(det, dict):
+            presets[str(name)] = _dtmf_from_detect_section(det)
+
+    return presets
+
+# Safe fallback so the module never crashes even if main() changes later.
+DTMF_PRESETS: Dict[str, Dict[str, Any]] = {
+    "default": {
+        "min_dbfs": float(FALLBACK_DETECT_DEFAULTS["min_dbfs"]),
+        "thresh": float(FALLBACK_DETECT_DEFAULTS["thresh"]),
+        "marker_channel": str(FALLBACK_DETECT_DEFAULTS["marker_channel"]),
+    }
+}
+
+# Map our generic keys to possible argparse dest names in cassette_calibrator
+DTMF_ARG_ALIASES = {
+    "min_dbfs": ("min_dbfs",),
+    "thresh": ("thresh",),
+    "marker_channel": ("marker_channel",),
+}
+
+def _coerce_float(v, *, default=None):
+    if v is None or v == "":
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+def _coerce_str(v, *, default=None):
+    s = _opt_str(v)
+    return s if s is not None else default
+
+def _apply_dtmf_cfg(overrides: dict, dfl: dict, cfg: dict) -> None:
+    """
+    Apply cfg entries to overrides, but ONLY if the argparse dest exists.
+    Prevents WebUI from inventing unknown args.
+    """
+    for k, v in (cfg or {}).items():
+        if v is None:
+            continue
+        for dest in DTMF_ARG_ALIASES.get(k, (k,)):
+            if dest in dfl:
+                overrides[dest] = v
+                break
+
+def _is_marker_failure(err: str | None, log_txt: str | None) -> bool:
+    s = ((err or "") + "\n" + (log_txt or "")).lower()
+    # Match your known failure ("Could not find start/end markers...") and nearby phrasing
+    return ("marker" in s) or ("dtmf" in s) or ("start/end" in s) or ("start/end markers" in s)
+
+def _dtmf_candidate_configs(base_cfg: dict, preset_name: str) -> list[tuple[str, dict]]:
+    """
+    Returns a small ladder of candidate configs for auto-tuning.
+    """
+    preset = DTMF_PRESETS.get(preset_name) or DTMF_PRESETS["default"]
+
+    cfg0 = dict(preset)
+    # payload overrides win over preset
+    for k, v in (base_cfg or {}).items():
+        if v is not None:
+            cfg0[k] = v
+
+    cands: list[tuple[str, dict]] = []
+    cands.append(("as_requested", cfg0))
+
+    # relax min_dbfs (more sensitive)
+    for delta in (-5.0, -10.0, -15.0):
+        c = dict(cfg0)
+        if "min_dbfs" in c and isinstance(c["min_dbfs"], (int, float)):
+            c["min_dbfs"] = float(c["min_dbfs"]) + float(delta)
+            cands.append((f"min_dbfs{delta:+.0f}", c))
+
+    # relax thresh (ratio gate): smaller = more permissive
+    for delta in (-1.0, -2.0, -3.0):
+        c = dict(cfg0)
+        if "thresh" in c and isinstance(c["thresh"], (int, float)):
+            c["thresh"] = max(1.0, float(c["thresh"]) + float(delta))
+            cands.append((f"thresh{delta:+.0f}", c))
+
+    # combo step
+    c = dict(cfg0)
+    if isinstance(c.get("min_dbfs"), (int, float)):
+        c["min_dbfs"] = float(c["min_dbfs"]) - 10.0
+    if isinstance(c.get("thresh"), (int, float)):
+        c["thresh"] = max(1.0, float(c["thresh"]) - 2.0)
+    cands.append(("combo_-10dbfs_-0.10thresh", c))
+
+    # last resort: aggressive preset
+    if preset_name != "aggressive":
+        c = dict(DTMF_PRESETS["aggressive"])
+        # keep chosen channel if provided
+        if "marker_channel" in cfg0:
+            c["marker_channel"] = cfg0["marker_channel"]
+        cands.append(("aggressive_preset", c))
+
+    # dedupe
+    seen = set()
+    out = []
+    for label, cfg in cands:
+        key = tuple(sorted(cfg.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((label, cfg))
+    return out
 
 # -----------------------
 # HELPERS
@@ -420,6 +708,9 @@ INDEX_HTML = r"""<!doctype html>
     .card { border: 1px solid #ccc; border-radius: 10px; padding: 14px; min-width: 340px; max-width: 560px; flex: 1; }
     label { display:block; margin-top: 8px; font-size: 13px; color: #333; }
     input { width: 100%; padding: 6px; margin-top: 4px; }
+    select { width: 100%; padding: 6px; margin-top: 4px; }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; }
     button { margin-top: 10px; padding: 8px 12px; cursor: pointer; }
     pre { background: #111; color: #ddd; padding: 10px; border-radius: 8px; overflow:auto; max-height: 260px; }
     img { max-width: 100%; border-radius: 8px; border: 1px solid #222; }
@@ -597,6 +888,56 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="openBrowser('an_rec', {mode:'file', exts:['.wav'], title:'Choose recorded WAV'})">Browse</button>
       </div>
 
+      <div class="block">
+        <h4>Markers (DTMF)</h4>
+
+        <div class="row" style="align-items:flex-end;">
+          <div style="flex:1; min-width:220px;">
+            <label>Preset</label>
+            <select id="dtmf_preset">
+              <option value="default">Default</option>
+              <option value="noisy_cassette">Noisy cassette</option>
+              <option value="line_in">Line-in</option>
+              <option value="aggressive">Aggressive</option>
+            </select>
+          </div>
+
+          <div style="min-width:200px;">
+            <label style="display:flex; gap:10px; align-items:center; margin-top:8px;">
+              <input id="dtmf_autotune" type="checkbox" checked style="width:auto; margin:0;" />
+              Auto-tune on failure
+            </label>
+          </div>
+        </div>
+
+        <details>
+          <summary>Advanced</summary>
+
+          <div class="row" style="margin-top:8px;">
+            <div style="flex:1; min-width:180px;">
+              <label>min_dbfs</label>
+              <input id="dtmf_min_dbfs" type="number" step="0.5" value="-35.0" />
+              <div class="small">More negative = more sensitive.</div>
+            </div>
+
+            <div style="flex:1; min-width:180px;">
+              <label>thresh</label>
+              <input id="dtmf_thresh" type="number" step="0.01" value="0.65" />
+              <div class="small">Lower = more permissive.</div>
+            </div>
+
+            <div style="flex:1; min-width:180px;">
+              <label>marker_channel</label>
+              <select id="dtmf_marker_channel">
+                <option value="mix">mix (L+R)</option>
+                <option value="L">L</option>
+                <option value="R">R</option>
+              </select>
+            </div>
+          </div>
+        </details>
+      </div>
+      
       <label>Loopback WAV (optional)</label>
       <div class="grid2">
         <input id="an_lb" placeholder="(none)" />
@@ -693,6 +1034,25 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
 <script>
+const DTMF_PRESETS = __DTMF_PRESETS_JSON__;
+
+function applyDtmfPreset(name) {
+  const p = (DTMF_PRESETS && DTMF_PRESETS[name]) ? DTMF_PRESETS[name] : (DTMF_PRESETS["default"] || {});
+  if (p.min_dbfs !== undefined) document.getElementById("dtmf_min_dbfs").value = p.min_dbfs;
+  if (p.thresh !== undefined) document.getElementById("dtmf_thresh").value = p.thresh;
+  if (p.marker_channel !== undefined) document.getElementById("dtmf_marker_channel").value = p.marker_channel;
+}
+
+function readDtmfCfg() {
+  return {
+    preset: document.getElementById("dtmf_preset").value,
+    autotune: document.getElementById("dtmf_autotune").checked,
+    min_dbfs: parseFloat(document.getElementById("dtmf_min_dbfs").value),
+    thresh: parseFloat(document.getElementById("dtmf_thresh").value),
+    marker_channel: document.getElementById("dtmf_marker_channel").value
+  };
+}
+
 let MB = {
   open: false,
   targetId: null,
@@ -1283,7 +1643,8 @@ async function doAnalyze() {
 
     const run_notes = (document.getElementById("an_notes").value || "").trim();
 
-    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name, run_notes });
+    const dtmf = readDtmfCfg();
+    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name, run_notes, dtmf });
 
     // Header (includes notes block if summary.run.notes exists)
     document.getElementById("an_header").innerHTML =
@@ -1370,6 +1731,14 @@ async function loadSelectedRun() {
     setLog("runs_log", "ERROR: " + e.message);
   }
 }
+
+// DTMF preset wiring
+document.getElementById("dtmf_preset").addEventListener("change", (e) => {
+  applyDtmfPreset(e.target.value);
+});
+
+// Init defaults on load
+applyDtmfPreset(document.getElementById("dtmf_preset").value);
 
 // Make inline onclick= handlers work no matter what scope rules apply
 Object.assign(window, {
@@ -1473,7 +1842,8 @@ class Handler(BaseHTTPRequestHandler):
     def _do_GET(self) -> None:
         u = urlparse(self.path)
         if u.path == "/":
-            self._text(200, INDEX_HTML, "text/html; charset=utf-8")
+            html = INDEX_HTML.replace("__DTMF_PRESETS_JSON__", json.dumps(DTMF_PRESETS, ensure_ascii=False))
+            self._text(200, html, "text/html; charset=utf-8")
             return
 
         if u.path == "/api/state":
@@ -1695,6 +2065,19 @@ class Handler(BaseHTTPRequestHandler):
                 # Fetch defaults ONCE
                 dfl = _cmd_argparse_defaults("analyze")
 
+                # DTMF / marker tuning from UI (best effort)
+                dtmf_in = payload.get("dtmf", None)
+                dtmf_obj = dtmf_in if isinstance(dtmf_in, dict) else {}
+
+                dtmf_preset = _coerce_str(dtmf_obj.get("preset"), default="default") or "default"
+                dtmf_autotune = bool(dtmf_obj.get("autotune", True))
+
+                base_dtmf_cfg = {
+                    "min_dbfs": _coerce_float(dtmf_obj.get("min_dbfs"), default=None),
+                    "thresh": _coerce_float(dtmf_obj.get("thresh"), default=None),
+                    "marker_channel": _coerce_str(dtmf_obj.get("marker_channel"), default=None),
+                }
+
                 # run name
                 run_name = _opt_str(payload.get("run_name"))
                 if run_name:
@@ -1756,14 +2139,69 @@ class Handler(BaseHTTPRequestHandler):
                 _maybe_float("thresh", "thresh")
                 # (and if your core uses different names, add aliases here)
 
-                args = _make_args("analyze", cfg, overrides)
-
                 LOG.info("analyze: ref=%s rec=%s loopback=%s outdir=%s", ref, rec, loopback, outdir)
 
-                ok, log_txt, err = _run_cc_cmd(cc.cmd_analyze, args)
+                attempts = []
+                used_label = None
+                used_cfg = None
+
+                if dtmf_autotune:
+                    cand_list = _dtmf_candidate_configs(base_dtmf_cfg, dtmf_preset)
+                else:
+                    # single attempt: preset + payload overrides
+                    preset = DTMF_PRESETS.get(dtmf_preset) or DTMF_PRESETS["default"]
+                    cfg0 = dict(preset)
+                    for k, v in base_dtmf_cfg.items():
+                        if v is not None:
+                            cfg0[k] = v
+                    cand_list = [("as_requested", cfg0)]
+
+                ok = False
+                log_txt = ""
+                err = None
+
+                for label, dtmf_cfg in cand_list:
+                    # per-attempt overrides copy
+                    ov = dict(overrides)
+
+                    # apply only args that actually exist in argparse defaults
+                    _apply_dtmf_cfg(ov, dfl, dtmf_cfg)
+
+                    args = _make_args("analyze", cfg, ov)
+
+                    ok, log_txt, err = _run_cc_cmd(cc.cmd_analyze, args)
+
+                    attempts.append({
+                        "label": label,
+                        "dtmf_cfg": dtmf_cfg,
+                        "ok": bool(ok),
+                        "error": err,
+                    })
+
+                    if ok:
+                        used_label = label
+                        used_cfg = dtmf_cfg
+                        break
+
+                    # If not autotuning, stop immediately
+                    if not dtmf_autotune:
+                        break
+
+                    # If it failed for reasons NOT related to markers, don't spin the ladder
+                    if not _is_marker_failure(err, log_txt):
+                        break
+
                 if not ok:
-                    # This is where your "Could not find start/end markers..." becomes visible in the UI
-                    self._json(400, {"ok": False, "error": err, "log": log_txt})
+                    self._json(400, {
+                        "ok": False,
+                        "error": err,
+                        "log": log_txt,
+                        "dtmf": {
+                            "preset": dtmf_preset,
+                            "autotune": dtmf_autotune,
+                            "attempts": attempts,
+                        },
+                    })
                     return
 
                 base = ROOT / outdir
@@ -1776,7 +2214,18 @@ class Handler(BaseHTTPRequestHandler):
                 summary_path = candidates[0]
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
-                self._json(200, {"ok": True, "summary": summary, "log": log_txt})
+                self._json(200, {
+                    "ok": True,
+                    "summary": summary,
+                    "log": log_txt,
+                    "dtmf": {
+                        "preset": dtmf_preset,
+                        "used": used_label,
+                        "cfg": used_cfg,
+                        "attempts": attempts,
+                    },
+                })
+
             except Exception as e:
                 self._json(400, {"ok": False, "error": str(e)})
             return
