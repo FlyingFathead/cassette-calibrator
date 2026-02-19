@@ -941,8 +941,12 @@ def _compare_render_grid(
 ) -> tuple[str, str]:
     """
     Returns (out_png_rel, log_text).
+
     If CSVs exist for the metric, re-plot with shared axes.
     If not, tile PNGs (axes matching not guaranteed) and log a warning.
+
+    Note: If some cells lack CSV but have PNG, we will still show the PNG,
+    but it won't share axes with the plotted cells.
     """
     metric = (metric or "").strip().lower()
     if metric not in _COMPARE_METRICS:
@@ -950,12 +954,12 @@ def _compare_render_grid(
 
     metric_prefix, xlabel, ylabel, logx_default = _COMPARE_METRICS[metric]
 
-    # Collect series and/or image tiles
     log_lines: list[str] = []
-    series = {}  # (ch, run_idx) -> (xs, ys)
-    tiles  = {}  # (ch, run_idx) -> png_rel
+    series: dict[tuple[str, int], tuple[list[float], list[float]]] = {}
+    tiles: dict[tuple[str, int], str] = {}
     have_any_series = False
 
+    # Collect series and/or image tiles
     for j, r in enumerate(runs):
         rel_dir = r["dir"]
         summ = r["summary"]
@@ -963,7 +967,6 @@ def _compare_render_grid(
         for ch in channels:
             csv_rel, png_rel = _find_metric_paths(summ, metric_prefix, ch)
 
-            # prefer CSV (true axis matching)
             if csv_rel:
                 try:
                     xs, ys = _read_xy_csv(csv_rel)
@@ -976,9 +979,10 @@ def _compare_render_grid(
                 except Exception as e:
                     log_lines.append(f"[warn] failed reading CSV for {rel_dir} ch={ch}: {csv_rel} -- {e}")
 
-            # fallback PNG tiling
             if png_rel:
                 tiles[(ch, j)] = png_rel
+                if have_any_series:
+                    log_lines.append(f"[warn] using PNG fallback (no shared axes) for {rel_dir} ch={ch}: {png_rel}")
             else:
                 log_lines.append(f"[warn] missing outputs for {rel_dir} ch={ch} metric={metric_prefix}")
 
@@ -988,14 +992,15 @@ def _compare_render_grid(
     ch_tag = _slug("_".join(channels))
     out_name = f"compare-{metric}-{ch_tag}-{ts}.png"
     out_png_rel = str(Path(outdir_rel) / out_name)
+    out_png_full = ROOT / out_png_rel
 
-    # Figure geometry
     nrows = max(1, len(channels))
     ncols = max(1, len(runs))
+
     fig_w_in = (tile_w * ncols) / max(1, dpi)
     fig_h_in = (tile_h * nrows) / max(1, dpi)
 
-    import matplotlib.pyplot as plt  # uses Agg (already set)
+    import matplotlib.pyplot as plt  # Agg backend already set
     from matplotlib.image import imread as _imread
 
     fig, axes = plt.subplots(
@@ -1007,7 +1012,7 @@ def _compare_render_grid(
         sharey=True if have_any_series else False,
     )
 
-    # Normalize axes to 2D array-ish
+    # Normalize axes to 2D
     if nrows == 1 and ncols == 1:
         axes2 = [[axes]]
     elif nrows == 1:
@@ -1017,7 +1022,135 @@ def _compare_render_grid(
     else:
         axes2 = [list(row) for row in axes]
 
-    # Determine global axis l
+    # Compute global limits from series (only)
+    x_min = x_max = y_min = y_max = None
+    if have_any_series:
+        xs_all: list[float] = []
+        ys_all: list[float] = []
+
+        for (ch, j), (xs, ys) in series.items():
+            for x, y in zip(xs, ys):
+                if logx_default and x <= 0:
+                    continue
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+                xs_all.append(x)
+                ys_all.append(y)
+
+        if xs_all and ys_all:
+            x_min = min(xs_all)
+            x_max = max(xs_all)
+            y_min = min(ys_all)
+            y_max = max(ys_all)
+
+            # avoid degenerate limits
+            if x_min == x_max:
+                x_min *= 0.9
+                x_max *= 1.1
+            if y_min == y_max:
+                y_min -= 1.0
+                y_max += 1.0
+
+    # Helpers: row/col labels
+    def _short_run_label(r: dict) -> str:
+        # try run name; else directory
+        summ = r.get("summary", {})
+        name = None
+        try:
+            run = summ.get("run", {})
+            if isinstance(run, dict):
+                name = _opt_str(run.get("name"))
+        except Exception:
+            name = None
+        return name or r.get("dir", "")
+
+    # Draw each cell
+    for i, ch in enumerate(channels):
+        for j, r in enumerate(runs):
+            ax = axes2[i][j]
+
+            # Column titles (top row)
+            if i == 0:
+                ax.set_title(_short_run_label(r), fontsize=9)
+
+            key = (ch, j)
+
+            if have_any_series and key in series:
+                xs, ys = series[key]
+
+                # filter non-positive x if log
+                if logx_default:
+                    xs2 = []
+                    ys2 = []
+                    for x, y in zip(xs, ys):
+                        if x > 0 and math.isfinite(x) and math.isfinite(y):
+                            xs2.append(x)
+                            ys2.append(y)
+                    xs, ys = xs2, ys2
+
+                if xs and ys:
+                    ax.plot(xs, ys, linewidth=1.1)
+                else:
+                    ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+
+                if logx_default:
+                    ax.set_xscale("log")
+
+                if x_min is not None and x_max is not None:
+                    ax.set_xlim(x_min, x_max)
+                if y_min is not None and y_max is not None:
+                    ax.set_ylim(y_min, y_max)
+
+                ax.grid(True, alpha=0.25)
+                ax.tick_params(labelsize=8)
+
+                # Axis labels only on left/bottom edges
+                if j == 0:
+                    ax.set_ylabel(f"{ch} — {ylabel}", fontsize=8)
+                else:
+                    ax.set_ylabel("")
+                if i == nrows - 1:
+                    ax.set_xlabel(xlabel, fontsize=8)
+                else:
+                    ax.set_xlabel("")
+
+            elif key in tiles:
+                # PNG tile fallback
+                try:
+                    rel_png = _rel_to_root_checked(tiles[key])
+                    img = _imread(str(ROOT / rel_png))
+                    ax.imshow(img)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    # keep some indication of row label on left-most column
+                    if j == 0:
+                        ax.text(
+                            0.01, 0.99, f"{ch}",
+                            transform=ax.transAxes,
+                            ha="left", va="top",
+                            fontsize=10,
+                            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+                        )
+                except Exception as e:
+                    ax.text(0.5, 0.5, f"failed to load png\n{e}", ha="center", va="center", transform=ax.transAxes)
+                    ax.set_axis_off()
+            else:
+                ax.text(0.5, 0.5, "missing", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+
+    # Layout: keep your “tile geometry” mostly intact
+    fig.subplots_adjust(left=0.06, right=0.985, top=0.93, bottom=0.08, wspace=0.18, hspace=0.28)
+
+    out_png_full.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png_full, format="png")
+    plt.close(fig)
+
+    if have_any_series:
+        log_lines.insert(0, "[info] compare: re-plotted from CSV (shared axes where possible)")
+    else:
+        log_lines.insert(0, "[info] compare: tiled PNGs (no shared axes)")
+
+    return out_png_rel, ("\n".join(log_lines).strip() + "\n")
 
 INDEX_HTML = r"""<!doctype html>
 <html>
@@ -1445,6 +1578,43 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 const DTMF_PRESETS = __DTMF_PRESETS_JSON__;
+
+function initDtmfPresetSelect() {
+  const sel = document.getElementById("dtmf_preset");
+  if (!sel) return;
+
+  const keep = ["default", "noisy_cassette", "line_in", "aggressive"];
+  const labels = {
+    default: "Default",
+    noisy_cassette: "Noisy cassette",
+    line_in: "Line-in",
+    aggressive: "Aggressive"
+  };
+
+  // start fresh
+  sel.innerHTML = "";
+
+  // built-ins first
+  for (const k of keep) {
+    if (!DTMF_PRESETS[k]) continue;
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = labels[k] || k;
+    sel.appendChild(o);
+  }
+
+  // then TOML/user presets
+  const extra = Object.keys(DTMF_PRESETS || {})
+    .filter(k => !keep.includes(k))
+    .sort((a,b) => a.localeCompare(b));
+
+  for (const k of extra) {
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = k; // keep raw preset name
+    sel.appendChild(o);
+  }
+}
 
 function applyDtmfPreset(name) {
   const p = (DTMF_PRESETS && DTMF_PRESETS[name]) ? DTMF_PRESETS[name] : (DTMF_PRESETS["default"] || {});
@@ -2277,6 +2447,7 @@ document.getElementById("dtmf_preset").addEventListener("change", (e) => {
 });
 
 // Init defaults on load
+initDtmfPresetSelect();
 applyDtmfPreset(document.getElementById("dtmf_preset").value);
 
 // Make inline onclick= handlers work no matter what scope rules apply
