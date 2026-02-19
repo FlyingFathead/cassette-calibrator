@@ -4,7 +4,7 @@ webui.py
 
 Local-only WebUI for cassette-calibrator.
 - Binds to 127.0.0.1 by default (configurable via [webui] in cassette_calibrator.toml)
-- Zero extra dependencies (stdlib only)
+- Requires cassette-calibrator's deps (e.g., matplotlib). Uses tomllib (py3.11+) or tomli (py<=3.10).
 - Calls the "core program" by importing cassette_calibrator.py and invoking cmd_* funcs
 
 Security posture:
@@ -23,10 +23,15 @@ import json
 import os
 import sys
 import time
+import csv
+import math
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs
+from cassette_calibrator import apply_audio_freq_ticks
+from matplotlib.ticker import NullFormatter
 
 # --- TOML-backed defaults + preset merging (WebUI "Default" == TOML base) ---
 from typing import Any, Dict, Optional
@@ -353,7 +358,7 @@ def _dtmf_candidate_configs(base_cfg: dict, preset_name: str) -> list[tuple[str,
         c["min_dbfs"] = float(c["min_dbfs"]) - 10.0
     if isinstance(c.get("thresh"), (int, float)):
         c["thresh"] = max(1.0, float(c["thresh"]) - 2.0)
-    cands.append(("combo_-10dbfs_-0.10thresh", c))
+    cands.append(("combo_-10dbfs_-2thresh", c))
 
     # last resort: aggressive preset
     if preset_name != "aggressive":
@@ -731,6 +736,430 @@ def _write_json_atomic_preserve_mtime(path: Path, obj: object) -> None:
         except Exception:
             pass
 
+# -----------------------
+# COMPARE (runs -> high-res grid PNG)
+# -----------------------
+
+_COMPARE_METRICS = {
+    # metric -> (per_channel output key prefix, xlabel, ylabel, logx default)
+    "response":   ("response",   "Frequency (Hz)", "dB", True),
+    "difference": ("difference", "Frequency (Hz)", "dB", True),
+    "impulse":    ("impulse",    "Samples",        "Amplitude", False),
+}
+
+def _slug(s: str) -> str:
+    s = (s or "").strip()
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "x"
+
+def _load_summary_for_run_dir(rel_run_dir: str) -> dict:
+    rel_run_dir = _rel_to_root_checked(rel_run_dir)
+    p = (ROOT / rel_run_dir / "summary.json")
+    if not p.exists() or not p.is_file():
+        raise ValueError(f"summary.json not found for run: {rel_run_dir}")
+    obj = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError(f"summary.json is not an object for run: {rel_run_dir}")
+    return obj
+
+def _run_label(rel_run_dir: str, summary: dict) -> str:
+    name = None
+    try:
+        run = summary.get("run", {})
+        if isinstance(run, dict):
+            name = _opt_str(run.get("name"))
+    except Exception:
+        name = None
+    return f"{name} -- {rel_run_dir}" if name else rel_run_dir
+
+def _norm_ch_name(ch: str) -> str:
+    s = (ch or "").strip()
+    if not s:
+        return s
+    u = s.upper()
+    if u in ("LEFT", "L"):
+        return "L"
+    if u in ("RIGHT", "R"):
+        return "R"
+    if u in ("MONO", "MIX", "SUM"):
+        return "mono"
+    return s
+
+def _get_channel_outputs(summary: dict, ch: str) -> dict:
+    per = summary.get("per_channel", {})
+    if not isinstance(per, dict):
+        return {}
+    # try exact, then normalized matching
+    if ch in per and isinstance(per.get(ch), dict):
+        return per[ch].get("outputs", {}) if isinstance(per[ch].get("outputs", {}), dict) else {}
+    # fallback: match normalized names
+    want = _norm_ch_name(ch)
+    for k, v in per.items():
+        if _norm_ch_name(str(k)) == want and isinstance(v, dict):
+            outs = v.get("outputs", {})
+            return outs if isinstance(outs, dict) else {}
+    return {}
+
+def _find_metric_paths(summary: dict, metric_prefix: str, ch: str) -> tuple[str | None, str | None]:
+    """
+    Return (csv_rel, png_rel) for the metric+channel if available in summary.
+    We look for keys like:
+      response_csv / response.png variants / response_png
+    """
+    outs = _get_channel_outputs(summary, ch)
+    if not outs:
+        return (None, None)
+
+    # common naming patterns
+    csv_keys = [
+        f"{metric_prefix}_csv",
+        f"{metric_prefix}.csv",
+        f"{metric_prefix}_out_csv",
+    ]
+    png_keys = [
+        f"{metric_prefix}_png",
+        f"{metric_prefix}.png",
+        f"{metric_prefix}_out_png",
+    ]
+
+    csv_rel = None
+    for k in csv_keys:
+        v = outs.get(k)
+        if isinstance(v, str) and v.strip():
+            csv_rel = v.strip()
+            break
+
+    png_rel = None
+    for k in png_keys:
+        v = outs.get(k)
+        if isinstance(v, str) and v.strip():
+            png_rel = v.strip()
+            break
+
+    return (csv_rel, png_rel)
+
+def _sniff_csv_dialect(sample: str):
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except Exception:
+        return csv.get_dialect("excel")
+
+def _read_xy_csv(rel_path: str) -> tuple[list[float], list[float]]:
+    """
+    Very forgiving CSV reader.
+    - Supports comma/semicolon/tab
+    - Header-aware: tries to find x/y columns by name; else uses first 2 numeric cols
+    """
+    rel_path = _rel_to_root_checked(rel_path)
+    full = (ROOT / rel_path)
+    if not full.exists() or not full.is_file():
+        raise ValueError(f"CSV not found: {rel_path}")
+
+    txt = full.read_text(encoding="utf-8", errors="replace")
+    sample = txt[:4096]
+    dialect = _sniff_csv_dialect(sample)
+    reader = csv.reader(io.StringIO(txt), dialect)
+
+    rows = []
+    for r in reader:
+        if not r:
+            continue
+        # strip whitespace
+        r2 = [c.strip() for c in r]
+        if len(r2) == 0:
+            continue
+        rows.append(r2)
+
+    if not rows:
+        return ([], [])
+
+    # detect header: any non-float in first row -> treat as header
+    def _is_float(s: str) -> bool:
+        try:
+            float(s)
+            return True
+        except Exception:
+            return False
+
+    header = None
+    data_start = 0
+    if any((c and not _is_float(c)) for c in rows[0]):
+        header = [c.strip().lower() for c in rows[0]]
+        data_start = 1
+
+    xi, yi = 0, 1
+
+    if header:
+        # heuristic column selection
+        def find_idx(preds: list[str]) -> int | None:
+            for p in preds:
+                for i, h in enumerate(header or []):
+                    if p in h:
+                        return i
+            return None
+
+        x_try = find_idx(["freq", "hz", "f "])
+        y_try = find_idx(["db", "mag", "amp", "value", "y"])
+        if x_try is not None:
+            xi = x_try
+        if y_try is not None and y_try != xi:
+            yi = y_try
+        else:
+            # if y not found, choose first column != x that looks numeric in data
+            yi = 1 if xi == 0 else 0
+
+    xs: list[float] = []
+    ys: list[float] = []
+
+    for r in rows[data_start:]:
+        if xi >= len(r) or yi >= len(r):
+            continue
+        try:
+            x = float(r[xi])
+            y = float(r[yi])
+        except Exception:
+            continue
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        xs.append(x)
+        ys.append(y)
+
+    return (xs, ys)
+
+def _compare_render_grid(
+    *,
+    runs: list[dict],
+    channels: list[str],
+    metric: str,
+    outdir: str,
+    tile_w: int,
+    tile_h: int,
+    dpi: int,
+) -> tuple[str, str]:
+    """
+    Returns (out_png_rel, log_text).
+
+    If CSVs exist for the metric, re-plot with shared axes.
+    If not, tile PNGs (axes matching not guaranteed) and log a warning.
+
+    Note: If some cells lack CSV but have PNG, we will still show the PNG,
+    but it won't share axes with the plotted cells.
+    """
+    metric = (metric or "").strip().lower()
+    if metric not in _COMPARE_METRICS:
+        raise ValueError(f"unknown metric: {metric}")
+
+    metric_prefix, xlabel, ylabel, logx_default = _COMPARE_METRICS[metric]
+
+    log_lines: list[str] = []
+    series: dict[tuple[str, int], tuple[list[float], list[float]]] = {}
+    tiles: dict[tuple[str, int], str] = {}
+    have_any_series = False
+
+    # Collect series and/or image tiles
+    for j, r in enumerate(runs):
+        rel_dir = r["dir"]
+        summ = r["summary"]
+
+        for ch in channels:
+            csv_rel, png_rel = _find_metric_paths(summ, metric_prefix, ch)
+
+            if csv_rel:
+                try:
+                    xs, ys = _read_xy_csv(csv_rel)
+                    if xs and ys:
+                        series[(ch, j)] = (xs, ys)
+                        have_any_series = True
+                        continue
+                    else:
+                        log_lines.append(f"[warn] empty CSV for {rel_dir} ch={ch}: {csv_rel}")
+                except Exception as e:
+                    log_lines.append(f"[warn] failed reading CSV for {rel_dir} ch={ch}: {csv_rel} -- {e}")
+
+            if png_rel:
+                tiles[(ch, j)] = png_rel
+                if have_any_series:
+                    log_lines.append(f"[warn] using PNG fallback (no shared axes) for {rel_dir} ch={ch}: {png_rel}")
+            else:
+                log_lines.append(f"[warn] missing outputs for {rel_dir} ch={ch} metric={metric_prefix}")
+
+    # Output path
+    outdir_rel = _ensure_outdir_rel(outdir)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ch_tag = _slug("_".join(channels))
+    out_name = f"compare-{metric}-{ch_tag}-{ts}.png"
+    out_png_rel = str(Path(outdir_rel) / out_name)
+    out_png_full = ROOT / out_png_rel
+
+    nrows = max(1, len(channels))
+    ncols = max(1, len(runs))
+
+    fig_w_in = (tile_w * ncols) / max(1, dpi)
+    fig_h_in = (tile_h * nrows) / max(1, dpi)
+
+    import matplotlib.pyplot as plt  # Agg backend already set
+    from matplotlib.image import imread as _imread
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(fig_w_in, fig_h_in),
+        dpi=dpi,
+        sharex=True if have_any_series else False,
+        sharey=True if have_any_series else False,
+    )
+
+    # Normalize axes to 2D
+    if nrows == 1 and ncols == 1:
+        axes2 = [[axes]]
+    elif nrows == 1:
+        axes2 = [list(axes)]
+    elif ncols == 1:
+        axes2 = [[ax] for ax in axes]
+    else:
+        axes2 = [list(row) for row in axes]
+
+    # Compute global limits from series (only)
+    x_min = x_max = y_min = y_max = None
+    if have_any_series:
+        xs_all: list[float] = []
+        ys_all: list[float] = []
+
+        for (ch, j), (xs, ys) in series.items():
+            for x, y in zip(xs, ys):
+                if logx_default and x <= 0:
+                    continue
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    continue
+                xs_all.append(x)
+                ys_all.append(y)
+
+        if xs_all and ys_all:
+            x_min = min(xs_all)
+            x_max = max(xs_all)
+            y_min = min(ys_all)
+            y_max = max(ys_all)
+
+            # avoid degenerate limits
+            if x_min == x_max:
+                x_min *= 0.9
+                x_max *= 1.1
+            if y_min == y_max:
+                y_min -= 1.0
+                y_max += 1.0
+
+    # Helpers: row/col labels
+    def _short_run_label(r: dict) -> str:
+        # try run name; else directory
+        summ = r.get("summary", {})
+        name = None
+        try:
+            run = summ.get("run", {})
+            if isinstance(run, dict):
+                name = _opt_str(run.get("name"))
+        except Exception:
+            name = None
+        return name or r.get("dir", "")
+
+    # Draw each cell
+    for i, ch in enumerate(channels):
+        for j, r in enumerate(runs):
+            ax = axes2[i][j]
+
+            # Column titles (top row)
+            if i == 0:
+                ax.set_title(_short_run_label(r), fontsize=9)
+
+            key = (ch, j)
+
+            if have_any_series and key in series:
+                xs, ys = series[key]
+
+                # filter non-positive x if log
+                if logx_default:
+                    xs2 = []
+                    ys2 = []
+                    for x, y in zip(xs, ys):
+                        if x > 0 and math.isfinite(x) and math.isfinite(y):
+                            xs2.append(x)
+                            ys2.append(y)
+                    xs, ys = xs2, ys2
+
+                if xs and ys:
+                    ax.plot(xs, ys, linewidth=1.1)
+                else:
+                    ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+
+                if logx_default:
+                    ax.set_xscale("log")
+
+                    # Force “audio” freq ticks/labels (20..20k, 1K/2K/5K/10K/20K)
+                    fmin = float(x_min) if x_min is not None else 20.0
+                    fmax = float(x_max) if x_max is not None else 20000.0
+                    apply_audio_freq_ticks(ax, fmin, fmax)
+                    # ax.xaxis.set_minor_formatter(NullFormatter())  # optional: hide minor tick labels
+
+                if x_min is not None and x_max is not None:
+                    ax.set_xlim(x_min, x_max)
+                if y_min is not None and y_max is not None:
+                    ax.set_ylim(y_min, y_max)
+
+                ax.grid(True, alpha=0.25)
+                ax.tick_params(labelsize=8)
+
+                # Axis labels only on left/bottom edges
+                if j == 0:
+                    ax.set_ylabel(f"{ch} — {ylabel}", fontsize=8)
+                else:
+                    ax.set_ylabel("")
+                if i == nrows - 1:
+                    ax.set_xlabel(xlabel, fontsize=8)
+                else:
+                    ax.set_xlabel("")
+
+            elif key in tiles:
+                # PNG tile fallback
+                try:
+                    rel_png = _rel_to_root_checked(tiles[key])
+                    img = _imread(str(ROOT / rel_png))
+                    ax.imshow(img)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    # keep some indication of row label on left-most column
+                    if j == 0:
+                        ax.text(
+                            0.01, 0.99, f"{ch}",
+                            transform=ax.transAxes,
+                            ha="left", va="top",
+                            fontsize=10,
+                            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+                        )
+                except Exception as e:
+                    ax.text(0.5, 0.5, f"failed to load png\n{e}", ha="center", va="center", transform=ax.transAxes)
+                    ax.set_axis_off()
+            else:
+                ax.text(0.5, 0.5, "missing", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+
+    # Layout: keep your “tile geometry” mostly intact
+    fig.subplots_adjust(left=0.06, right=0.985, top=0.93, bottom=0.08, wspace=0.18, hspace=0.28)
+
+    out_png_full.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png_full, format="png")
+    plt.close(fig)
+
+    if have_any_series:
+        log_lines.insert(0, "[info] compare: re-plotted from CSV (shared axes where possible)")
+    else:
+        log_lines.insert(0, "[info] compare: tiled PNGs (no shared axes)")
+
+    return out_png_rel, ("\n".join(log_lines).strip() + "\n")
+
 INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
@@ -1015,6 +1444,76 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="card">
+
+      <h3>compare</h3>
+      <div class="small">Build a compare list of runs, then render a single high-res grid PNG (shared axes when CSV exists).</div>
+
+      <button onclick="refreshCompareRuns()">Refresh runs</button>
+
+      <div class="row" style="margin-top:8px;">
+        <div style="flex:1; min-width:260px;">
+          <label>Available runs</label>
+          <select id="cmp_avail" multiple size="10" style="width:100%; padding:6px; margin-top:4px;"></select>
+          <div style="display:flex; gap:8px; margin-top:8px;">
+            <button onclick="cmpAdd()">Add →</button>
+          </div>
+        </div>
+
+        <div style="flex:1; min-width:260px;">
+          <label>Compare list (order = columns)</label>
+          <select id="cmp_list" multiple size="10" style="width:100%; padding:6px; margin-top:4px;"></select>
+          <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+            <button onclick="cmpUp()">Up</button>
+            <button onclick="cmpDown()">Down</button>
+            <button onclick="cmpRemove()">Remove</button>
+            <button onclick="cmpClear()">Clear</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="align-items:flex-end; margin-top:10px;">
+        <div style="flex:1; min-width:200px;">
+          <label>Metric</label>
+          <select id="cmp_metric">
+            <option value="response">Response</option>
+            <option value="difference">Difference</option>
+            <option value="impulse">Impulse</option>
+          </select>
+        </div>
+
+        <div style="flex:1; min-width:200px;">
+          <label>Channels</label>
+          <select id="cmp_channels">
+            <option value="auto">Auto (union)</option>
+            <option value="L">L</option>
+            <option value="R">R</option>
+            <option value="LR">L+R</option>
+            <option value="mono">mono</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="align-items:flex-end; margin-top:10px;">
+        <div style="flex:1; min-width:160px;">
+          <label>Tile width (px)</label>
+          <input id="cmp_tile_w" type="number" value="1100" />
+        </div>
+        <div style="flex:1; min-width:160px;">
+          <label>Tile height (px)</label>
+          <input id="cmp_tile_h" type="number" value="650" />
+        </div>
+        <div style="flex:1; min-width:160px;">
+          <label>DPI</label>
+          <input id="cmp_dpi" type="number" value="150" />
+        </div>
+      </div>
+
+      <button onclick="doCompare()">Render compare grid</button>
+
+      <pre id="cmp_log"></pre>
+      <div id="cmp_img"></div>
+    </div>
+
     <h3>runs</h3>
     <div class="small">Browse previous analysis runs (reads run name from summary.json).</div>
 
@@ -1088,6 +1587,43 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const DTMF_PRESETS = __DTMF_PRESETS_JSON__;
 
+function initDtmfPresetSelect() {
+  const sel = document.getElementById("dtmf_preset");
+  if (!sel) return;
+
+  const keep = ["default", "noisy_cassette", "line_in", "aggressive"];
+  const labels = {
+    default: "Default",
+    noisy_cassette: "Noisy cassette",
+    line_in: "Line-in",
+    aggressive: "Aggressive"
+  };
+
+  // start fresh
+  sel.innerHTML = "";
+
+  // built-ins first
+  for (const k of keep) {
+    if (!DTMF_PRESETS[k]) continue;
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = labels[k] || k;
+    sel.appendChild(o);
+  }
+
+  // then TOML/user presets
+  const extra = Object.keys(DTMF_PRESETS || {})
+    .filter(k => !keep.includes(k))
+    .sort((a,b) => a.localeCompare(b));
+
+  for (const k of extra) {
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = k; // keep raw preset name
+    sel.appendChild(o);
+  }
+}
+
 function applyDtmfPreset(name) {
   const p = (DTMF_PRESETS && DTMF_PRESETS[name]) ? DTMF_PRESETS[name] : (DTMF_PRESETS["default"] || {});
   if (p.min_dbfs !== undefined) document.getElementById("dtmf_min_dbfs").value = p.min_dbfs;
@@ -1125,6 +1661,121 @@ let IV = {
   fit: true,
   path: ""
 };
+
+let CMP = {
+  runs: [] // array of {dir,label}
+};
+
+function _selValues(selectEl) {
+  return Array.from(selectEl.selectedOptions || []).map(o => o.value);
+}
+
+function _moveOption(selectFrom, selectTo, value, text) {
+  // avoid duplicates
+  for (const o of (selectTo.options || [])) {
+    if (o.value === value) return;
+  }
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = text || value;
+  selectTo.appendChild(opt);
+}
+
+async function refreshCompareRuns() {
+  try {
+    setLog("cmp_log", "loading runs...");
+    const r = await apiGetJson("/api/runs");
+    const avail = document.getElementById("cmp_avail");
+    let html = "";
+    for (const it of (r.runs || [])) {
+      const label = (it.label || it.dir || "");
+      const val = it.dir || "";
+      html += `<option value="${esc(val)}">${esc(label)}</option>`;
+    }
+    avail.innerHTML = html || "<option value=''>no runs found</option>";
+    setLog("cmp_log", JSON.stringify(r, null, 2));
+  } catch (e) {
+    setLog("cmp_log", "ERROR: " + e.message);
+  }
+}
+
+function cmpAdd() {
+  const avail = document.getElementById("cmp_avail");
+  const list = document.getElementById("cmp_list");
+  for (const o of Array.from(avail.selectedOptions || [])) {
+    _moveOption(avail, list, o.value, o.textContent);
+  }
+}
+
+function cmpRemove() {
+  const list = document.getElementById("cmp_list");
+  const gone = Array.from(list.selectedOptions || []);
+  for (const o of gone) o.remove();
+}
+
+function cmpClear() {
+  document.getElementById("cmp_list").innerHTML = "";
+}
+
+function cmpUp() {
+  const list = document.getElementById("cmp_list");
+  const sel = Array.from(list.selectedOptions || []);
+  // move each selected option up one step (preserving order)
+  for (const o of sel) {
+    const prev = o.previousElementSibling;
+    if (prev && !prev.selected) list.insertBefore(o, prev);
+  }
+}
+
+function cmpDown() {
+  const list = document.getElementById("cmp_list");
+  const sel = Array.from(list.selectedOptions || []).reverse();
+  for (const o of sel) {
+    const next = o.nextElementSibling;
+    if (next && !next.selected) list.insertBefore(next, o);
+  }
+}
+
+function _cmpChannels() {
+  const v = document.getElementById("cmp_channels").value;
+  if (v === "LR") return ["L","R"];
+  if (v === "auto") return ["auto"];
+  return [v];
+}
+
+async function doCompare() {
+  try {
+    setLog("cmp_log", "rendering...");
+    document.getElementById("cmp_img").innerHTML = "";
+
+    const list = document.getElementById("cmp_list");
+    const runs = Array.from(list.options || []).map(o => o.value).filter(Boolean);
+
+    if (!runs.length) {
+      setLog("cmp_log", "ERROR: compare list is empty");
+      return;
+    }
+
+    const metric = document.getElementById("cmp_metric").value;
+    const channels = _cmpChannels();
+
+    const tile_w = parseInt(document.getElementById("cmp_tile_w").value || "1100", 10);
+    const tile_h = parseInt(document.getElementById("cmp_tile_h").value || "650", 10);
+    const dpi = parseInt(document.getElementById("cmp_dpi").value || "150", 10);
+
+    const r = await api("/api/compare", { runs, metric, channels, tile_w, tile_h, dpi });
+
+    let head = `ok -- ${r.metric} -- channels=${(r.channels||[]).join(",")} -- dpi=${r.dpi} -- tile=${r.tile_w}x${r.tile_h}\n`;
+    if (r.log) head += "\n" + r.log;
+    setLog("cmp_log", head);
+
+    if (r.out_png) {
+      document.getElementById("cmp_img").innerHTML = imgTag(r.out_png);
+    }
+  } catch (e) {
+    setLog("cmp_log", "ERROR: " + e.message);
+  }
+}
 
 function imgUrl(path) {
   return "/file?path=" + encodeURIComponent(path);
@@ -1804,6 +2455,7 @@ document.getElementById("dtmf_preset").addEventListener("change", (e) => {
 });
 
 // Init defaults on load
+initDtmfPresetSelect();
 applyDtmfPreset(document.getElementById("dtmf_preset").value);
 
 // Make inline onclick= handlers work no matter what scope rules apply
@@ -1827,7 +2479,14 @@ Object.assign(window, {
   runsCancelNotes,
   openImgViewer,
   closeImgViewer,
-  ivToggleFit  
+  ivToggleFit,
+  refreshCompareRuns,
+  cmpAdd,
+  cmpRemove,
+  cmpClear,
+  cmpUp,
+  cmpDown,
+  doCompare
 });
 
 console.log("webui script loaded; handlers exported to window");
@@ -2069,6 +2728,83 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
+        if u.path == "/api/compare":
+            try:
+                runs_in = payload.get("runs", None)
+                if not isinstance(runs_in, list) or not runs_in:
+                    raise ValueError("runs must be a non-empty list of run dirs")
+
+                metric = str(payload.get("metric", "response") or "response").strip().lower()
+                outdir = str(payload.get("outdir", "data/compare") or "data/compare").strip()
+
+                # UI controls for resolution
+                tile_w = int(payload.get("tile_w", 1100) or 1100)
+                tile_h = int(payload.get("tile_h", 650) or 650)
+                dpi = int(payload.get("dpi", 150) or 150)
+
+                # channels selection
+                ch_in = payload.get("channels", None)
+                channels: list[str] = []
+                if isinstance(ch_in, list) and ch_in:
+                    channels = [_norm_ch_name(str(x)) for x in ch_in if str(x).strip()]
+                else:
+                    # default: union of channels found in first run summary
+                    channels = ["L", "R"]
+
+                # load summaries
+                runs: list[dict] = []
+                for rd in runs_in:
+                    rd_s = str(rd or "").strip()
+                    if not rd_s:
+                        continue
+                    rd_rel = _rel_to_root_checked(rd_s)
+                    summ = _load_summary_for_run_dir(rd_rel)
+                    runs.append({
+                        "dir": rd_rel,
+                        "summary": summ,
+                        "label": _run_label(rd_rel, summ),
+                    })
+
+                if not runs:
+                    raise ValueError("no valid runs were provided")
+
+                # if channels == ["auto"], use union across runs
+                if len(channels) == 1 and channels[0].lower() == "auto":
+                    seen = []
+                    for r in runs:
+                        per = r["summary"].get("per_channel", {})
+                        if isinstance(per, dict):
+                            for k in per.keys():
+                                nk = _norm_ch_name(str(k))
+                                if nk and nk not in seen:
+                                    seen.append(nk)
+                    channels = seen or ["L", "R"]
+
+                out_png_rel, log_txt = _compare_render_grid(
+                    runs=runs,
+                    channels=channels,
+                    metric=metric,
+                    outdir=outdir,
+                    tile_w=tile_w,
+                    tile_h=tile_h,
+                    dpi=dpi,
+                )
+
+                self._json(200, {
+                    "ok": True,
+                    "out_png": out_png_rel,
+                    "metric": metric,
+                    "channels": channels,
+                    "runs": [{"dir": r["dir"], "label": r["label"]} for r in runs],
+                    "tile_w": tile_w,
+                    "tile_h": tile_h,
+                    "dpi": dpi,
+                    "log": log_txt,
+                })
+            except Exception as e:
+                self._json(400, {"ok": False, "error": str(e)})
+            return
+
         if u.path == "/api/gen":
             try:
                 out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
@@ -2304,7 +3040,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Local WebUI for cassette-calibrator (stdlib only).")
+    ap = argparse.ArgumentParser(description="Local WebUI for cassette-calibrator (stdlib http.server; no web framework).")
     ap.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
     ap.add_argument("--host", default=None, help="override bind host (default: from TOML or 127.0.0.1)")
     ap.add_argument("--port", type=int, default=None, help="override bind port (default: from TOML or 8765)")

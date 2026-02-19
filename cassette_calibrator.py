@@ -131,6 +131,10 @@ Commands:
     Auto-align using markers, drift-correct (linear + optional tick warp),
     deconvolve sweep -> impulse -> magnitude response, export plots + CSV + summary.json
 
+  compare
+    Compare multiple analyze run directories (shared axes by default).
+    Reads each run's summary.json + response*.csv and plots on the same dB scale.
+    
 Run: cassette_calibrator.py <command> --help  for full options.
 """
 
@@ -2059,6 +2063,884 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             print("  response_lr_overlay.png")
         print("  summary.json")
 
+# -------------------------
+# Compare (multi-run plots)
+# -------------------------
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _read_response_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Reads response*.csv produced by analyze:
+      freq_hz, mag_db, mag_db_s, [diff_db_s]
+    Returns (freq, mag_db_s, diff_db_s_or_None)
+    """
+    freq: List[float] = []
+    mag_s: List[float] = []
+    diff_s: List[float] = []
+
+    with path.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        has_diff = ("diff_db_s" in (r.fieldnames or []))
+        for row in r:
+            try:
+                freq.append(float(row["freq_hz"]))
+                mag_s.append(float(row["mag_db_s"]))
+                if has_diff:
+                    diff_s.append(float(row["diff_db_s"]))
+            except Exception:
+                continue
+
+    f_arr = np.asarray(freq, dtype=np.float32)
+    y_arr = np.asarray(mag_s, dtype=np.float32)
+    d_arr = np.asarray(diff_s, dtype=np.float32) if diff_s else None
+    return f_arr, y_arr, d_arr
+
+def _pick_run_label(run_dir: Path, meta: Optional[dict], *, max_len: int = 90) -> str:
+    """
+    Prefer summary.json run.name; fallback to directory name.
+    """
+    label = None
+    if isinstance(meta, dict):
+        run = meta.get("run")
+        if isinstance(run, dict):
+            label = run.get("name") or run.get("id")
+    if not label:
+        label = run_dir.name
+    label = str(label).strip()
+    if len(label) > max_len:
+        label = label[: max_len - 3].rstrip() + "..."
+    return label
+
+def _apply_norm_db(freq: np.ndarray, y_db: np.ndarray, norm: str, band: Tuple[float, float]) -> np.ndarray:
+    """
+    norm:
+      - "none": do nothing
+      - "1k": subtract median within 900..1100 Hz
+      - "midband": subtract median within band (e.g. 200..2000)
+    """
+    norm = (norm or "none").strip().lower()
+    y = np.asarray(y_db, dtype=np.float32)
+
+    if norm == "none":
+        return y
+
+    if norm == "1k":
+        lo, hi = 900.0, 1100.0
+    else:  # midband
+        lo, hi = float(band[0]), float(band[1])
+
+    m = (freq >= lo) & (freq <= hi)
+    if not np.any(m):
+        return y
+
+    off = float(np.median(y[m]))
+    return (y - off).astype(np.float32)
+
+def _load_run_series(run_dir: Path, mode: str) -> dict:
+    """
+    mode:
+      - "lr-overlay": returns {"L": (f,y), "R": (f,y)} if available else falls back
+      - "mono": {"mono": (f,y)}
+      - "l": {"L": (f,y)}
+      - "r": {"R": (f,y)}
+      - "lr-diff": {"LR": (f, yL-yR)} (computed)
+      - "diff": {"diff": (f, diff_db_s)} if present in csv, else error
+    """
+    mode = (mode or "lr-overlay").strip().lower()
+
+    def p(name: str) -> Path:
+        return run_dir / name
+
+    out = {}
+
+    # mono
+    if mode == "mono":
+        csvp = p("response.csv")
+        if not csvp.exists():
+            # fallback: if only L exists, use L as mono-ish
+            csvp = p("response_l.csv") if p("response_l.csv").exists() else csvp
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["mono"] = (f, y)
+        return out
+
+    # L-only
+    if mode == "l":
+        csvp = p("response_l.csv")
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response_l.csv in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["L"] = (f, y)
+        return out
+
+    # R-only
+    if mode == "r":
+        csvp = p("response_r.csv")
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response_r.csv in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["R"] = (f, y)
+        return out
+
+    # L/R overlay
+    if mode == "lr-overlay":
+        has_l = p("response_l.csv").exists()
+        has_r = p("response_r.csv").exists()
+        if has_l and has_r:
+            fL, yL, _ = _read_response_csv(p("response_l.csv"))
+            fR, yR, _ = _read_response_csv(p("response_r.csv"))
+            out["L"] = (fL, yL)
+            out["R"] = (fR, yR)
+            return out
+        # fallback to mono response
+        return _load_run_series(run_dir, "mono")
+
+    # L-R diff (computed)
+    if mode == "lr-diff":
+        has_l = p("response_l.csv").exists()
+        has_r = p("response_r.csv").exists()
+        if not (has_l and has_r):
+            raise FileNotFoundError(f"Need response_l.csv + response_r.csv for lr-diff in {run_dir}")
+        fL, yL, _ = _read_response_csv(p("response_l.csv"))
+        fR, yR, _ = _read_response_csv(p("response_r.csv"))
+        if len(fR) != len(fL) or not np.allclose(fR, fL):
+            yR_i = np.interp(fL, fR, yR).astype(np.float32)
+        else:
+            yR_i = yR
+        out["LR"] = (fL, (yL - yR_i).astype(np.float32))
+        return out
+
+    # Loopback-subtracted diff from csv if present
+    if mode == "diff":
+        # diff_db_s exists only if analyze used loopback
+        # prefer mono, else L
+        cand = [p("response.csv"), p("response_l.csv"), p("response_r.csv")]
+        csvp = next((c for c in cand if c.exists()), None)
+        if csvp is None:
+            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
+        f, _y, d = _read_response_csv(csvp)
+        if d is None:
+            raise FileNotFoundError(f"No diff_db_s column found (did you analyze with --loopback?) in {run_dir}")
+        out["diff"] = (f, d.astype(np.float32))
+        return out
+
+    raise ValueError(f"Unknown compare mode: {mode}")
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    runs = [Path(r).expanduser() for r in args.runs]
+    if args.max_runs and len(runs) > int(args.max_runs):
+        runs = runs[: int(args.max_runs)]
+
+    # Validate + load meta early
+    metas: List[Optional[dict]] = []
+    for rd in runs:
+        if not rd.exists() or not rd.is_dir():
+            raise SystemExit(f"Run directory not found: {rd}")
+        metas.append(_read_json(rd / "summary.json"))
+
+    # Load series
+    series_by_run = []
+    labels = []
+    for rd, meta in zip(runs, metas):
+        s = _load_run_series(rd, args.channels)
+        labels.append(_pick_run_label(rd, meta))
+        series_by_run.append(s)
+
+    # Optional normalization (applied per run, per trace)
+    norm = str(args.norm).strip().lower()
+    band = (float(args.norm_band[0]), float(args.norm_band[1]))
+
+    series_by_run_n = []
+    for s in series_by_run:
+        s2 = {}
+        for k, (f, y) in s.items():
+            y2 = _apply_norm_db(f, y, norm, band)
+            s2[k] = (f, y2)
+        series_by_run_n.append(s2)
+
+    # Shared axis limits (by default)
+    x0, x1 = float(args.xlim[0]), float(args.xlim[1])
+    y0, y1 = float(args.ylim[0]), float(args.ylim[1])
+
+    out_path = Path(args.out).expanduser()
+    ensure_dir(out_path.parent if out_path.parent != Path(".") else Path("."))
+
+    layout = str(args.layout).strip().lower()
+    shared = bool(getattr(args, "shared_axes", True))
+
+    if layout == "overlay":
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.grid(True, which="both")
+        ax.set_xscale("log")
+
+        for label, s in zip(labels, series_by_run_n):
+            # Plot each trace with a label prefix
+            for k, (f, y) in s.items():
+                ax.semilogx(f, y, label=f"{label} -- {k}")
+
+        apply_audio_freq_ticks(ax, x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+        ax.set_title(args.title or "Cassette chain comparison")
+        if bool(getattr(args, "legend", True)):
+            ax.legend(loc="best", frameon=False)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=int(args.dpi))
+        plt.close(fig)
+        print(f"Wrote: {out_path}")
+        return
+
+    # grid layout (default): 2x2 for up to 4, otherwise roughly square
+    n = len(runs)
+    if n <= 4:
+        cols = 2
+    else:
+        cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+
+    fig, axs = plt.subplots(
+        rows, cols,
+        figsize=(cols * 7, rows * 4.6),
+        sharex=shared,
+        sharey=shared,
+    )
+    axs = np.asarray(axs).reshape(-1)
+
+    for i, ax in enumerate(axs):
+        if i >= n:
+            ax.axis("off")
+            continue
+
+        ax.grid(True, which="both")
+        ax.set_xscale("log")
+        apply_audio_freq_ticks(ax, x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+
+        ax.set_title(labels[i])
+
+        s = series_by_run_n[i]
+
+        # Plot traces
+        if args.channels == "lr-overlay":
+            # Prefer consistent L/R ordering
+            if "L" in s:
+                f, y = s["L"]
+                ax.semilogx(f, y, label="Left (L)")
+            if "R" in s:
+                f, y = s["R"]
+                ax.semilogx(f, y, label="Right (R)")
+            if "mono" in s and ("L" not in s and "R" not in s):
+                f, y = s["mono"]
+                ax.semilogx(f, y, label="Mono")
+        else:
+            # single trace plot
+            for k, (f, y) in s.items():
+                ax.semilogx(f, y, label=k)
+
+        if bool(getattr(args, "legend", True)):
+            ax.legend(loc="best", frameon=False)
+
+    if args.title:
+        fig.suptitle(str(args.title), y=0.995)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=int(args.dpi))
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
+
+# -------------------------
+# Compare (multi-run plots)
+# -------------------------
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _read_response_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Reads response*.csv produced by analyze:
+      freq_hz, mag_db, mag_db_s, [diff_db_s]
+    Returns (freq, mag_db_s, diff_db_s_or_None)
+    """
+    freq: List[float] = []
+    mag_s: List[float] = []
+    diff_s: List[float] = []
+
+    with path.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        has_diff = ("diff_db_s" in (r.fieldnames or []))
+        for row in r:
+            try:
+                freq.append(float(row["freq_hz"]))
+                mag_s.append(float(row["mag_db_s"]))
+                if has_diff:
+                    diff_s.append(float(row["diff_db_s"]))
+            except Exception:
+                continue
+
+    f_arr = np.asarray(freq, dtype=np.float32)
+    y_arr = np.asarray(mag_s, dtype=np.float32)
+    d_arr = np.asarray(diff_s, dtype=np.float32) if diff_s else None
+    return f_arr, y_arr, d_arr
+
+def _pick_run_label(run_dir: Path, meta: Optional[dict], *, max_len: int = 90) -> str:
+    """
+    Prefer summary.json run.name; fallback to directory name.
+    """
+    label = None
+    if isinstance(meta, dict):
+        run = meta.get("run")
+        if isinstance(run, dict):
+            label = run.get("name") or run.get("id")
+    if not label:
+        label = run_dir.name
+    label = str(label).strip()
+    if len(label) > max_len:
+        label = label[: max_len - 3].rstrip() + "..."
+    return label
+
+def _apply_norm_db(freq: np.ndarray, y_db: np.ndarray, norm: str, band: Tuple[float, float]) -> np.ndarray:
+    """
+    norm:
+      - "none": do nothing
+      - "1k": subtract median within 900..1100 Hz
+      - "midband": subtract median within band (e.g. 200..2000)
+    """
+    norm = (norm or "none").strip().lower()
+    y = np.asarray(y_db, dtype=np.float32)
+
+    if norm == "none":
+        return y
+
+    if norm == "1k":
+        lo, hi = 900.0, 1100.0
+    else:  # midband
+        lo, hi = float(band[0]), float(band[1])
+
+    m = (freq >= lo) & (freq <= hi)
+    if not np.any(m):
+        return y
+
+    off = float(np.median(y[m]))
+    return (y - off).astype(np.float32)
+
+def _load_run_series(run_dir: Path, mode: str) -> dict:
+    """
+    mode:
+      - "lr-overlay": returns {"L": (f,y), "R": (f,y)} if available else falls back
+      - "mono": {"mono": (f,y)}
+      - "l": {"L": (f,y)}
+      - "r": {"R": (f,y)}
+      - "lr-diff": {"LR": (f, yL-yR)} (computed)
+      - "diff": {"diff": (f, diff_db_s)} if present in csv, else error
+    """
+    mode = (mode or "lr-overlay").strip().lower()
+
+    def p(name: str) -> Path:
+        return run_dir / name
+
+    out = {}
+
+    # mono
+    if mode == "mono":
+        csvp = p("response.csv")
+        if not csvp.exists():
+            # fallback: if only L exists, use L as mono-ish
+            csvp = p("response_l.csv") if p("response_l.csv").exists() else csvp
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["mono"] = (f, y)
+        return out
+
+    # L-only
+    if mode == "l":
+        csvp = p("response_l.csv")
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response_l.csv in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["L"] = (f, y)
+        return out
+
+    # R-only
+    if mode == "r":
+        csvp = p("response_r.csv")
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response_r.csv in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["R"] = (f, y)
+        return out
+
+    # L/R overlay
+    if mode == "lr-overlay":
+        has_l = p("response_l.csv").exists()
+        has_r = p("response_r.csv").exists()
+        if has_l and has_r:
+            fL, yL, _ = _read_response_csv(p("response_l.csv"))
+            fR, yR, _ = _read_response_csv(p("response_r.csv"))
+            out["L"] = (fL, yL)
+            out["R"] = (fR, yR)
+            return out
+        # fallback to mono response
+        return _load_run_series(run_dir, "mono")
+
+    # L-R diff (computed)
+    if mode == "lr-diff":
+        has_l = p("response_l.csv").exists()
+        has_r = p("response_r.csv").exists()
+        if not (has_l and has_r):
+            raise FileNotFoundError(f"Need response_l.csv + response_r.csv for lr-diff in {run_dir}")
+        fL, yL, _ = _read_response_csv(p("response_l.csv"))
+        fR, yR, _ = _read_response_csv(p("response_r.csv"))
+        if len(fR) != len(fL) or not np.allclose(fR, fL):
+            yR_i = np.interp(fL, fR, yR).astype(np.float32)
+        else:
+            yR_i = yR
+        out["LR"] = (fL, (yL - yR_i).astype(np.float32))
+        return out
+
+    # Loopback-subtracted diff from csv if present
+    if mode == "diff":
+        # diff_db_s exists only if analyze used loopback
+        # prefer mono, else L
+        cand = [p("response.csv"), p("response_l.csv"), p("response_r.csv")]
+        csvp = next((c for c in cand if c.exists()), None)
+        if csvp is None:
+            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
+        f, _y, d = _read_response_csv(csvp)
+        if d is None:
+            raise FileNotFoundError(f"No diff_db_s column found (did you analyze with --loopback?) in {run_dir}")
+        out["diff"] = (f, d.astype(np.float32))
+        return out
+
+    raise ValueError(f"Unknown compare mode: {mode}")
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    runs = [Path(r).expanduser() for r in args.runs]
+    if args.max_runs and len(runs) > int(args.max_runs):
+        runs = runs[: int(args.max_runs)]
+
+    # Validate + load meta early
+    metas: List[Optional[dict]] = []
+    for rd in runs:
+        if not rd.exists() or not rd.is_dir():
+            raise SystemExit(f"Run directory not found: {rd}")
+        metas.append(_read_json(rd / "summary.json"))
+
+    # Load series
+    series_by_run = []
+    labels = []
+    for rd, meta in zip(runs, metas):
+        s = _load_run_series(rd, args.channels)
+        labels.append(_pick_run_label(rd, meta))
+        series_by_run.append(s)
+
+    # Optional normalization (applied per run, per trace)
+    norm = str(args.norm).strip().lower()
+    band = (float(args.norm_band[0]), float(args.norm_band[1]))
+
+    series_by_run_n = []
+    for s in series_by_run:
+        s2 = {}
+        for k, (f, y) in s.items():
+            y2 = _apply_norm_db(f, y, norm, band)
+            s2[k] = (f, y2)
+        series_by_run_n.append(s2)
+
+    # Shared axis limits (by default)
+    x0, x1 = float(args.xlim[0]), float(args.xlim[1])
+    y0, y1 = float(args.ylim[0]), float(args.ylim[1])
+
+    out_path = Path(args.out).expanduser()
+    ensure_dir(out_path.parent if out_path.parent != Path(".") else Path("."))
+
+    layout = str(args.layout).strip().lower()
+    shared = bool(getattr(args, "shared_axes", True))
+
+    if layout == "overlay":
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.grid(True, which="both")
+        ax.set_xscale("log")
+
+        for label, s in zip(labels, series_by_run_n):
+            # Plot each trace with a label prefix
+            for k, (f, y) in s.items():
+                ax.semilogx(f, y, label=f"{label} -- {k}")
+
+        apply_audio_freq_ticks(ax, x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+        ax.set_title(args.title or "Cassette chain comparison")
+        if bool(getattr(args, "legend", True)):
+            ax.legend(loc="best", frameon=False)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=int(args.dpi))
+        plt.close(fig)
+        print(f"Wrote: {out_path}")
+        return
+
+    # grid layout (default): 2x2 for up to 4, otherwise roughly square
+    n = len(runs)
+    if n <= 4:
+        cols = 2
+    else:
+        cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+
+    fig, axs = plt.subplots(
+        rows, cols,
+        figsize=(cols * 7, rows * 4.6),
+        sharex=shared,
+        sharey=shared,
+    )
+    axs = np.asarray(axs).reshape(-1)
+
+    for i, ax in enumerate(axs):
+        if i >= n:
+            ax.axis("off")
+            continue
+
+        ax.grid(True, which="both")
+        ax.set_xscale("log")
+        apply_audio_freq_ticks(ax, x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+
+        ax.set_title(labels[i])
+
+        s = series_by_run_n[i]
+
+        # Plot traces
+        if args.channels == "lr-overlay":
+            # Prefer consistent L/R ordering
+            if "L" in s:
+                f, y = s["L"]
+                ax.semilogx(f, y, label="Left (L)")
+            if "R" in s:
+                f, y = s["R"]
+                ax.semilogx(f, y, label="Right (R)")
+            if "mono" in s and ("L" not in s and "R" not in s):
+                f, y = s["mono"]
+                ax.semilogx(f, y, label="Mono")
+        else:
+            # single trace plot
+            for k, (f, y) in s.items():
+                ax.semilogx(f, y, label=k)
+
+        if bool(getattr(args, "legend", True)):
+            ax.legend(loc="best", frameon=False)
+
+    if args.title:
+        fig.suptitle(str(args.title), y=0.995)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=int(args.dpi))
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
+
+# -------------------------
+# Compare (multi-run plots)
+# -------------------------
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _read_response_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Reads response*.csv produced by analyze:
+      freq_hz, mag_db, mag_db_s, [diff_db_s]
+    Returns (freq, mag_db_s, diff_db_s_or_None)
+    """
+    freq: List[float] = []
+    mag_s: List[float] = []
+    diff_s: List[float] = []
+
+    with path.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        has_diff = ("diff_db_s" in (r.fieldnames or []))
+        for row in r:
+            try:
+                freq.append(float(row["freq_hz"]))
+                mag_s.append(float(row["mag_db_s"]))
+                if has_diff:
+                    diff_s.append(float(row["diff_db_s"]))
+            except Exception:
+                continue
+
+    f_arr = np.asarray(freq, dtype=np.float32)
+    y_arr = np.asarray(mag_s, dtype=np.float32)
+    d_arr = np.asarray(diff_s, dtype=np.float32) if diff_s else None
+    return f_arr, y_arr, d_arr
+
+def _pick_run_label(run_dir: Path, meta: Optional[dict], *, max_len: int = 90) -> str:
+    """
+    Prefer summary.json run.name; fallback to directory name.
+    """
+    label = None
+    if isinstance(meta, dict):
+        run = meta.get("run")
+        if isinstance(run, dict):
+            label = run.get("name") or run.get("id")
+    if not label:
+        label = run_dir.name
+    label = str(label).strip()
+    if len(label) > max_len:
+        label = label[: max_len - 3].rstrip() + "..."
+    return label
+
+def _apply_norm_db(freq: np.ndarray, y_db: np.ndarray, norm: str, band: Tuple[float, float]) -> np.ndarray:
+    """
+    norm:
+      - "none": do nothing
+      - "1k": subtract median within 900..1100 Hz
+      - "midband": subtract median within band (e.g. 200..2000)
+    """
+    norm = (norm or "none").strip().lower()
+    y = np.asarray(y_db, dtype=np.float32)
+
+    if norm == "none":
+        return y
+
+    if norm == "1k":
+        lo, hi = 900.0, 1100.0
+    else:  # midband
+        lo, hi = float(band[0]), float(band[1])
+
+    m = (freq >= lo) & (freq <= hi)
+    if not np.any(m):
+        return y
+
+    off = float(np.median(y[m]))
+    return (y - off).astype(np.float32)
+
+def _load_run_series(run_dir: Path, mode: str) -> dict:
+    """
+    mode:
+      - "lr-overlay": returns {"L": (f,y), "R": (f,y)} if available else falls back
+      - "mono": {"mono": (f,y)}
+      - "l": {"L": (f,y)}
+      - "r": {"R": (f,y)}
+      - "lr-diff": {"LR": (f, yL-yR)} (computed)
+      - "diff": {"diff": (f, diff_db_s)} if present in csv, else error
+    """
+    mode = (mode or "lr-overlay").strip().lower()
+
+    def p(name: str) -> Path:
+        return run_dir / name
+
+    out = {}
+
+    # mono
+    if mode == "mono":
+        csvp = p("response.csv")
+        if not csvp.exists():
+            # fallback: if only L exists, use L as mono-ish
+            csvp = p("response_l.csv") if p("response_l.csv").exists() else csvp
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["mono"] = (f, y)
+        return out
+
+    # L-only
+    if mode == "l":
+        csvp = p("response_l.csv")
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response_l.csv in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["L"] = (f, y)
+        return out
+
+    # R-only
+    if mode == "r":
+        csvp = p("response_r.csv")
+        if not csvp.exists():
+            raise FileNotFoundError(f"Missing response_r.csv in {run_dir}")
+        f, y, _ = _read_response_csv(csvp)
+        out["R"] = (f, y)
+        return out
+
+    # L/R overlay
+    if mode == "lr-overlay":
+        has_l = p("response_l.csv").exists()
+        has_r = p("response_r.csv").exists()
+        if has_l and has_r:
+            fL, yL, _ = _read_response_csv(p("response_l.csv"))
+            fR, yR, _ = _read_response_csv(p("response_r.csv"))
+            out["L"] = (fL, yL)
+            out["R"] = (fR, yR)
+            return out
+        # fallback to mono response
+        return _load_run_series(run_dir, "mono")
+
+    # L-R diff (computed)
+    if mode == "lr-diff":
+        has_l = p("response_l.csv").exists()
+        has_r = p("response_r.csv").exists()
+        if not (has_l and has_r):
+            raise FileNotFoundError(f"Need response_l.csv + response_r.csv for lr-diff in {run_dir}")
+        fL, yL, _ = _read_response_csv(p("response_l.csv"))
+        fR, yR, _ = _read_response_csv(p("response_r.csv"))
+        if len(fR) != len(fL) or not np.allclose(fR, fL):
+            yR_i = np.interp(fL, fR, yR).astype(np.float32)
+        else:
+            yR_i = yR
+        out["LR"] = (fL, (yL - yR_i).astype(np.float32))
+        return out
+
+    # Loopback-subtracted diff from csv if present
+    if mode == "diff":
+        # diff_db_s exists only if analyze used loopback
+        # prefer mono, else L
+        cand = [p("response.csv"), p("response_l.csv"), p("response_r.csv")]
+        csvp = next((c for c in cand if c.exists()), None)
+        if csvp is None:
+            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
+        f, _y, d = _read_response_csv(csvp)
+        if d is None:
+            raise FileNotFoundError(f"No diff_db_s column found (did you analyze with --loopback?) in {run_dir}")
+        out["diff"] = (f, d.astype(np.float32))
+        return out
+
+    raise ValueError(f"Unknown compare mode: {mode}")
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    runs = [Path(r).expanduser() for r in args.runs]
+    if args.max_runs and len(runs) > int(args.max_runs):
+        runs = runs[: int(args.max_runs)]
+
+    # Validate + load meta early
+    metas: List[Optional[dict]] = []
+    for rd in runs:
+        if not rd.exists() or not rd.is_dir():
+            raise SystemExit(f"Run directory not found: {rd}")
+        metas.append(_read_json(rd / "summary.json"))
+
+    # Load series
+    series_by_run = []
+    labels = []
+    for rd, meta in zip(runs, metas):
+        s = _load_run_series(rd, args.channels)
+        labels.append(_pick_run_label(rd, meta))
+        series_by_run.append(s)
+
+    # Optional normalization (applied per run, per trace)
+    norm = str(args.norm).strip().lower()
+    band = (float(args.norm_band[0]), float(args.norm_band[1]))
+
+    series_by_run_n = []
+    for s in series_by_run:
+        s2 = {}
+        for k, (f, y) in s.items():
+            y2 = _apply_norm_db(f, y, norm, band)
+            s2[k] = (f, y2)
+        series_by_run_n.append(s2)
+
+    # Shared axis limits (by default)
+    x0, x1 = float(args.xlim[0]), float(args.xlim[1])
+    y0, y1 = float(args.ylim[0]), float(args.ylim[1])
+
+    out_path = Path(args.out).expanduser()
+    ensure_dir(out_path.parent if out_path.parent != Path(".") else Path("."))
+
+    layout = str(args.layout).strip().lower()
+    shared = bool(getattr(args, "shared_axes", True))
+
+    if layout == "overlay":
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.grid(True, which="both")
+        ax.set_xscale("log")
+
+        for label, s in zip(labels, series_by_run_n):
+            # Plot each trace with a label prefix
+            for k, (f, y) in s.items():
+                ax.semilogx(f, y, label=f"{label} -- {k}")
+
+        apply_audio_freq_ticks(ax, x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+        ax.set_title(args.title or "Cassette chain comparison")
+        if bool(getattr(args, "legend", True)):
+            ax.legend(loc="best", frameon=False)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=int(args.dpi))
+        plt.close(fig)
+        print(f"Wrote: {out_path}")
+        return
+
+    # grid layout (default): 2x2 for up to 4, otherwise roughly square
+    n = len(runs)
+    if n <= 4:
+        cols = 2
+    else:
+        cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+
+    fig, axs = plt.subplots(
+        rows, cols,
+        figsize=(cols * 7, rows * 4.6),
+        sharex=shared,
+        sharey=shared,
+    )
+    axs = np.asarray(axs).reshape(-1)
+
+    for i, ax in enumerate(axs):
+        if i >= n:
+            ax.axis("off")
+            continue
+
+        ax.grid(True, which="both")
+        ax.set_xscale("log")
+        apply_audio_freq_ticks(ax, x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_ylabel("Magnitude (dB, smoothed)")
+
+        ax.set_title(labels[i])
+
+        s = series_by_run_n[i]
+
+        # Plot traces
+        if args.channels == "lr-overlay":
+            # Prefer consistent L/R ordering
+            if "L" in s:
+                f, y = s["L"]
+                ax.semilogx(f, y, label="Left (L)")
+            if "R" in s:
+                f, y = s["R"]
+                ax.semilogx(f, y, label="Right (R)")
+            if "mono" in s and ("L" not in s and "R" not in s):
+                f, y = s["mono"]
+                ax.semilogx(f, y, label="Mono")
+        else:
+            # single trace plot
+            for k, (f, y) in s.items():
+                ax.semilogx(f, y, label=k)
+
+        if bool(getattr(args, "legend", True)):
+            ax.legend(loc="best", frameon=False)
+
+    if args.title:
+        fig.suptitle(str(args.title), y=0.995)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=int(args.dpi))
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
 
 # -------------------------
 # CLI
@@ -2079,7 +2961,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         dest="cmd",
         required=True,
         title="commands",
-        metavar="{gen,detect,analyze}",
+        metavar="{gen,detect,analyze,compare}",
     )
 
     # common = argparse.ArgumentParser(add_help=False)
@@ -2093,6 +2975,39 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     g = sub.add_parser("gen", help="Generate marker+noisewin+tone+sweep WAV")
     d = sub.add_parser("detect", help="Detect start/end markers in a recorded file")
     a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
+    c = sub.add_parser("compare", help="Compare multiple analyze run directories (shared axes by default)")
+
+    # -------- compare --------
+    c.add_argument("runs", nargs="+", help="Analyze run directories (each containing summary.json + response*.csv)")
+    c.add_argument("--channels",
+                   choices=["lr-overlay", "mono", "l", "r", "lr-diff", "diff"],
+                   default="lr-overlay",
+                   help="what to plot from each run directory")
+    c.add_argument("--layout", choices=["grid", "overlay"], default="grid",
+                   help="grid = one subplot per run; overlay = all runs in one plot")
+    c.add_argument("--shared-axes", action=argparse.BooleanOptionalAction, default=True,
+                   help="share x/y axes across subplots (default: on)")
+
+    c.add_argument("--norm", choices=["none", "1k", "midband"], default="none",
+                   help="optional re-normalization during compare (analyze already does ~1k)")
+    c.add_argument("--norm-band", nargs=2, type=float, default=[200.0, 2000.0],
+                   metavar=("F_LO", "F_HI"),
+                   help="midband normalization range (Hz) when --norm midband")
+
+    c.add_argument("--xlim", nargs=2, type=float, default=[20.0, 20000.0],
+                   metavar=("FMIN", "FMAX"))
+    c.add_argument("--ylim", nargs=2, type=float, default=[-25.0, 3.0],
+                   metavar=("YMIN", "YMAX"),
+                   help="shared dB axis range (default keeps comparisons readable)")
+    c.add_argument("--title", default=None, help="optional figure title")
+    c.add_argument("--legend", action=argparse.BooleanOptionalAction, default=True)
+
+    c.add_argument("--out", default="compare.png", help="output image path")
+    c.add_argument("--dpi", type=int, default=150)
+    c.add_argument("--max-runs", type=int, default=0,
+                   help="limit number of run dirs plotted (0 = no limit)")
+
+    c.set_defaults(func=cmd_compare)
 
     # -------- gen --------
     g.add_argument("--dtmf-ramp-ms", type=float, default=5.0,

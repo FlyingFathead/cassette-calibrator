@@ -263,6 +263,13 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.1.9 - WebUI: compare grids + TOML-driven DTMF presets; better plot ticks
+  * Added **Compare** workflow in WebUI: pick multiple runs, reorder columns, choose metric + channels, and render a **single high-res grid PNG** (shared axes when CSV data exists).
+  * Compare plots now use **audio-friendly frequency ticks/labels** (no more scientific-notation x-axis like 2e4 / 1e3).
+  * WebUI DTMF/marker presets are now **built from `cassette_calibrator.toml`** (`[detect]` + `[presets.<name>.detect]`) and exposed in the UI.
+  * Added **auto-tune ladder** for marker detection on analyze failure (relaxes `min_dbfs` / `thresh` progressively).
+  * Misc WebUI polish: safer browsing/dir creation + small endpoint additions used by UI features.
+
 * 0.1.8 - WebUI enhancements
   * Enhanced logging, errors/status
   * Matplotlib output plots are now named with a title set as the run name
