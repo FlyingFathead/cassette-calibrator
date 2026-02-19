@@ -27,6 +27,7 @@ win_ms = 40.0
 hop_ms = 10.0
 thresh = 6.0
 min_dbfs = -55.0
+marker_channel = "mono"
 
 [analyze]
 outdir = "data/runs"
@@ -55,6 +56,21 @@ lr_overlay_color_r = "tab:orange"
 [analyze.snr]
 noise_s = 1.0
 tone_s = 3.0
+
+[presets.noisy_cassette.detect]
+min_dbfs = -45.0
+thresh = 5.0
+marker_channel = "mix"
+
+[presets.line_in.detect]
+min_dbfs = -28.0
+thresh = 7.0
+marker_channel = "mix"
+
+[presets.aggressive.detect]
+min_dbfs = -55.0
+thresh = 4.0
+marker_channel = "mix"
 
 [presets.walkman.gen]
 marker_dbfs = -10.0

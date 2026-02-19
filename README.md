@@ -263,6 +263,11 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.1.8 - WebUI enhancements
+  * Enhanced logging, errors/status
+  * Matplotlib output plots are now named with a title set as the run name
+  * Plenty of bugfixes
+
 * 0.1.7 - WebUI: clickable images + fullscreen viewer
 
   * Thumbnails are now clickable: opens a fullscreen overlay viewer for easier inspection/zooming.
