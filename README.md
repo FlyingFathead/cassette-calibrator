@@ -1,6 +1,6 @@
 # cassette-calibrator
 
-A CLI tool for measuring and calibrating a compact cassette recording/playback chain using an audio test program and automated alignment. Also comes with an optional local WebUI for ease of use.
+A CLI tool with a separate easy-to-use webUI for measuring and calibrating a compact cassette recording/playback chain using an audio test program and automated alignment. Also comes with an optional local WebUI for ease of use.
 
 It generates a cassette-friendly measurement WAV with user-configurable DTMF markers, then analyzes a recorded playback capture to estimate the chain's magnitude response (and optional loopback-subtracted response), plus an SNR estimate.
 
