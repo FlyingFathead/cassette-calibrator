@@ -70,10 +70,20 @@ def _pick(d: Dict[str, Any], keys: tuple[str, ...], default: Any) -> Any:
 FALLBACK_DETECT_DEFAULTS = {
     "min_dbfs": -55.0,
     "thresh": 6.0,
-    "marker_channel": "mix",
+    "marker_channel": "mono",
 }
 
-
+def _normalize_marker_channel(v: str) -> str:
+    s = str(v).strip().lower()
+    if s in ["mix", "sum", "avg", "mean"]:
+        return "mono"
+    if s in ["mono"]:
+        return "mono"
+    if s in ["l", "left"]:
+        return "L"
+    if s in ["r", "right"]:
+        return "R"
+    return "mono"
 
 def list_detect_presets(cfg: Dict[str, Any]) -> list[str]:
     presets = cfg.get("presets", {})
@@ -193,15 +203,17 @@ def _dtmf_from_detect_section(detect: Dict[str, Any]) -> Dict[str, Any]:
             FALLBACK_DETECT_DEFAULTS["thresh"],
         )
     )
-    ch = str(
+
+    ch_raw = str(
         _pick(
             detect,
             ("marker_channel", "dtmf_channel", "channel"),
             FALLBACK_DETECT_DEFAULTS["marker_channel"],
         )
     )
-    return {"min_dbfs": min_dbfs, "thresh": thresh, "marker_channel": ch}
+    ch = _normalize_marker_channel(ch_raw)  # returns "mono"/"L"/"R"
 
+    return {"min_dbfs": min_dbfs, "thresh": thresh, "marker_channel": ch}
 
 def _build_dtmf_presets_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """
@@ -244,13 +256,30 @@ def _build_dtmf_presets_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any
     return presets
 
 # Safe fallback so the module never crashes even if main() changes later.
-DTMF_PRESETS: Dict[str, Dict[str, Any]] = {
+DTMF_PRESETS_FALLBACK: Dict[str, Dict[str, Any]] = {
     "default": {
         "min_dbfs": float(FALLBACK_DETECT_DEFAULTS["min_dbfs"]),
         "thresh": float(FALLBACK_DETECT_DEFAULTS["thresh"]),
         "marker_channel": str(FALLBACK_DETECT_DEFAULTS["marker_channel"]),
-    }
+    },
+    "noisy_cassette": {
+        "min_dbfs": float(FALLBACK_DETECT_DEFAULTS["min_dbfs"]) - 5.0,
+        "thresh": max(1.0, float(FALLBACK_DETECT_DEFAULTS["thresh"]) - 2.0),
+        "marker_channel": str(FALLBACK_DETECT_DEFAULTS["marker_channel"]),
+    },
+    "line_in": {
+        "min_dbfs": float(FALLBACK_DETECT_DEFAULTS["min_dbfs"]) + 10.0,
+        "thresh": float(FALLBACK_DETECT_DEFAULTS["thresh"]) + 2.0,
+        "marker_channel": str(FALLBACK_DETECT_DEFAULTS["marker_channel"]),
+    },
+    "aggressive": {
+        "min_dbfs": float(FALLBACK_DETECT_DEFAULTS["min_dbfs"]) - 10.0,
+        "thresh": max(1.0, float(FALLBACK_DETECT_DEFAULTS["thresh"]) - 3.0),
+        "marker_channel": str(FALLBACK_DETECT_DEFAULTS["marker_channel"]),
+    },
 }
+
+DTMF_PRESETS: Dict[str, Dict[str, Any]] = dict(DTMF_PRESETS_FALLBACK)
 
 # Map our generic keys to possible argparse dest names in cassette_calibrator
 DTMF_ARG_ALIASES = {
@@ -328,7 +357,8 @@ def _dtmf_candidate_configs(base_cfg: dict, preset_name: str) -> list[tuple[str,
 
     # last resort: aggressive preset
     if preset_name != "aggressive":
-        c = dict(DTMF_PRESETS["aggressive"])
+        aggr = DTMF_PRESETS.get("aggressive") or DTMF_PRESETS.get("default") or {}
+        c = dict(aggr)
         # keep chosen channel if provided
         if "marker_channel" in cfg0:
             c["marker_channel"] = cfg0["marker_channel"]
@@ -396,6 +426,11 @@ def _ensure_outdir_rel(p: str) -> str:
     return p
 
 def _load_cfg(cfg_path: str | None) -> dict:
+    # cc.load_toml_config(None) searches relative to *cwd*.
+    # WebUI should default to the TOML next to this file, so launching from
+    # elsewhere (systemd/launcher/etc) still uses the same config as CLI.
+    if not cfg_path:
+        cfg_path = str(DEFAULT_CONFIG_PATH)
     return cc.load_toml_config(cfg_path)
 
 def _webui_cfg(cfg: dict) -> dict:
@@ -712,7 +747,24 @@ INDEX_HTML = r"""<!doctype html>
     details { margin-top: 8px; }
     summary { cursor: pointer; }
     button { margin-top: 10px; padding: 8px 12px; cursor: pointer; }
-    pre { background: #111; color: #ddd; padding: 10px; border-radius: 8px; overflow:auto; max-height: 260px; }
+    pre {
+      background: #111;
+      color: #ddd;
+      padding: 10px;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 260px;
+
+      /* make long errors readable */
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+
+      /* let the user expand the log box */
+      resize: vertical;
+      min-height: 80px;
+    }
+
     img { max-width: 100%; border-radius: 8px; border: 1px solid #222; }
     .small { font-size: 12px; color: #666; }
     .grid2 { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
@@ -916,23 +968,23 @@ INDEX_HTML = r"""<!doctype html>
           <div class="row" style="margin-top:8px;">
             <div style="flex:1; min-width:180px;">
               <label>min_dbfs</label>
-              <input id="dtmf_min_dbfs" type="number" step="0.5" value="-35.0" />
+              <input id="dtmf_min_dbfs" type="number" step="0.5" value="-55.0" />
               <div class="small">More negative = more sensitive.</div>
             </div>
 
             <div style="flex:1; min-width:180px;">
               <label>thresh</label>
-              <input id="dtmf_thresh" type="number" step="0.01" value="0.65" />
+              <input id="dtmf_thresh" type="number" step="0.01" value="6.0" />
               <div class="small">Lower = more permissive.</div>
             </div>
 
             <div style="flex:1; min-width:180px;">
               <label>marker_channel</label>
-              <select id="dtmf_marker_channel">
-                <option value="mix">mix (L+R)</option>
-                <option value="L">L</option>
-                <option value="R">R</option>
-              </select>
+                <select id="dtmf_marker_channel">
+                  <option value="mono">mix (L+R)</option>
+                  <option value="L">L</option>
+                  <option value="R">R</option>
+                </select>
             </div>
           </div>
         </details>
@@ -1225,13 +1277,21 @@ async function api(path, payload) {
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(payload || {})
   });
+
   const t = await r.text();
   let j = null;
   try { j = JSON.parse(t); } catch (e) {}
+
   if (!r.ok) {
-    const msg = (j && j.error) ? j.error : t;
-    throw new Error(msg);
+    const msg = (j && j.error) ? String(j.error) : String(t || "request failed");
+    const log = (j && j.log) ? String(j.log) : "";
+    const extra = (j && j.path) ? ("\n\npath: " + String(j.path)) : "";
+
+    // If backend returned log text, append it under the error headline.
+    const full = log ? (msg + extra + "\n\n--- log ---\n" + log) : (msg + extra);
+    throw new Error(full);
   }
+
   return j;
 }
 
@@ -1240,10 +1300,16 @@ async function apiGetJson(url) {
   const t = await r.text();
   let j = null;
   try { j = JSON.parse(t); } catch (e) {}
+
   if (!r.ok) {
-    const msg = (j && j.error) ? j.error : t;
-    throw new Error(msg);
+    const msg = (j && j.error) ? String(j.error) : String(t || "request failed");
+    const log = (j && j.log) ? String(j.log) : "";
+    const extra = (j && j.path) ? ("\n\npath: " + String(j.path)) : "";
+
+    const full = log ? (msg + extra + "\n\n--- log ---\n" + log) : (msg + extra);
+    throw new Error(full);
   }
+
   return j;
 }
 
@@ -2078,6 +2144,9 @@ class Handler(BaseHTTPRequestHandler):
                     "marker_channel": _coerce_str(dtmf_obj.get("marker_channel"), default=None),
                 }
 
+                if base_dtmf_cfg.get("marker_channel") is not None:
+                    base_dtmf_cfg["marker_channel"] = _normalize_marker_channel(base_dtmf_cfg["marker_channel"])
+
                 # run name
                 run_name = _opt_str(payload.get("run_name"))
                 if run_name:
@@ -2245,6 +2314,14 @@ def main() -> int:
     os.chdir(ROOT)
 
     cfg = _load_cfg(args.config)
+
+    global DTMF_PRESETS
+    try:
+        DTMF_PRESETS = _build_dtmf_presets_from_cfg(cfg)
+    except Exception as e:
+        LOG.warning("DTMF preset build failed: %s -- using fallback presets", e)
+        DTMF_PRESETS = dict(DTMF_PRESETS_FALLBACK)
+
     w = _webui_cfg(cfg)
 
     host = str(args.host or w.get("host", "127.0.0.1"))

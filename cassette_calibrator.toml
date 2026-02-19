@@ -27,7 +27,7 @@ win_ms = 40.0
 hop_ms = 10.0
 thresh = 6.0
 min_dbfs = -55.0
-marker_channel = "mix"
+marker_channel = "mono"
 
 [analyze]
 outdir = "data/runs"
@@ -42,7 +42,7 @@ sweep_s      = 30.0
 marker_tone_s = 0.22
 marker_gap_s  = 0.04
 channels = "stereo"
-marker_channel = "mix"
+marker_channel = "mono"
 drift_warn = 0.002
 fine_align = true
 ir_win_s = 0.25

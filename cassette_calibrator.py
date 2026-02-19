@@ -1356,6 +1356,14 @@ def cmd_detect(args: argparse.Namespace) -> None:
     print(f"marker_start '{args.marker_start}': {t_start if t_start is not None else 'NOT FOUND'}")
     print(f"marker_end   '{args.marker_end}': {t_end if t_end is not None else 'NOT FOUND'}")
 
+    if (t_start is None) and (t_end is not None):
+        print(
+            "[hint] End marker was found but start marker is missing. "
+            "This usually means your recording started too late (missed pre-roll/start marker), "
+            "or marker settings don't match what was generated.",
+            file=sys.stderr,
+        )
+
     if args.dump_events:
         for e in events:
             print(f"{e.t0:8.3f}s  (anchor)  {e.t:8.3f}s  (center)  {e.sym}")
@@ -1432,8 +1440,22 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     # Use anchor timestamps for layout/drift math
     t_ms = find_sequence(events, args.marker_start, which="t0")
     if t_ms is None:
+        # Extra context: if we can still see an end marker, tell the user explicitly.
+        t_me_hint = find_sequence(events, args.marker_end, which="t0", last=True)
+        if t_me_hint is not None:
+            raise SystemExit(
+                f"Start marker \"{args.marker_start}\" NOT found, but end marker \"{args.marker_end}\" "
+                f"WAS found at ~{t_me_hint:.3f}s (anchor time, marker_channel={args.marker_channel}, "
+                f"events={len(events)}). "
+                "This usually means the recording started too late and missed the start marker/pre-roll, "
+                "or your marker settings (marker string / marker_channel) don't match what was generated. "
+                "Re-capture including the full pre-silence + start marker, or run "
+                "\"python3 cassette_calibrator.py detect --wav <file> --dump-events\" to inspect."
+            )
+
         raise SystemExit(
-            "Could not find start marker in recorded file. "
+            f"Could not find start marker \"{args.marker_start}\" in recorded file "
+            f"(marker_channel={args.marker_channel}, events={len(events)}). "
             "Try lowering --min-dbfs, reducing --thresh, or increasing marker level."
         )
 
