@@ -4,7 +4,8 @@ webui.py
 
 Local-only WebUI for cassette-calibrator.
 - Binds to 127.0.0.1 by default (configurable via [webui] in cassette_calibrator.toml)
-- Zero extra dependencies (stdlib only)
+- No web framework (uses stdlib http.server)
+- Requires cassette-calibrator's deps (e.g., matplotlib). Uses tomllib (py3.11+) or tomli (py<=3.10).
 - Calls the "core program" by importing cassette_calibrator.py and invoking cmd_* funcs
 
 Security posture:
@@ -356,7 +357,7 @@ def _dtmf_candidate_configs(base_cfg: dict, preset_name: str) -> list[tuple[str,
         c["min_dbfs"] = float(c["min_dbfs"]) - 10.0
     if isinstance(c.get("thresh"), (int, float)):
         c["thresh"] = max(1.0, float(c["thresh"]) - 2.0)
-    cands.append(("combo_-10dbfs_-0.10thresh", c))
+    cands.append(("combo_-10dbfs_-2thresh", c))
 
     # last resort: aggressive preset
     if preset_name != "aggressive":
@@ -3032,7 +3033,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Local WebUI for cassette-calibrator (stdlib only).")
+    ap = argparse.ArgumentParser(description="Local WebUI for cassette-calibrator (stdlib http.server; no web framework).")
     ap.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
     ap.add_argument("--host", default=None, help="override bind host (default: from TOML or 127.0.0.1)")
     ap.add_argument("--port", type=int, default=None, help="override bind port (default: from TOML or 8765)")
