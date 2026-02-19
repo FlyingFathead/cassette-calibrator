@@ -4,7 +4,6 @@ webui.py
 
 Local-only WebUI for cassette-calibrator.
 - Binds to 127.0.0.1 by default (configurable via [webui] in cassette_calibrator.toml)
-- No web framework (uses stdlib http.server)
 - Requires cassette-calibrator's deps (e.g., matplotlib). Uses tomllib (py3.11+) or tomli (py<=3.10).
 - Calls the "core program" by importing cassette_calibrator.py and invoking cmd_* funcs
 
@@ -31,6 +30,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs
+from cassette_calibrator import apply_audio_freq_ticks
+from matplotlib.ticker import NullFormatter
 
 # --- TOML-backed defaults + preset merging (WebUI "Default" == TOML base) ---
 from typing import Any, Dict, Optional
@@ -1096,6 +1097,12 @@ def _compare_render_grid(
 
                 if logx_default:
                     ax.set_xscale("log")
+
+                    # Force “audio” freq ticks/labels (20..20k, 1K/2K/5K/10K/20K)
+                    fmin = float(x_min) if x_min is not None else 20.0
+                    fmax = float(x_max) if x_max is not None else 20000.0
+                    apply_audio_freq_ticks(ax, fmin, fmax)
+                    # ax.xaxis.set_minor_formatter(NullFormatter())  # optional: hide minor tick labels
 
                 if x_min is not None and x_max is not None:
                     ax.set_xlim(x_min, x_max)
