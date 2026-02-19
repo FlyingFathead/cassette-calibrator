@@ -1094,6 +1094,27 @@ def apply_audio_freq_ticks(ax, fmin: float, fmax: float) -> None:
     ax.xaxis.set_major_formatter(FuncFormatter(fmt))
     ax.set_xlabel("Hertz/Kilohertz")
 
+def plot_title_prefix(run_meta: Optional[dict], *, max_len: int = 80) -> str:
+    """
+    Returns '<run name>\\n' (or '' if no run name).
+    Used to put the run title on its own line above subplot titles.
+    """
+    if not isinstance(run_meta, dict):
+        return ""
+
+    name = run_meta.get("name")
+    if name is None:
+        return ""
+
+    s = str(name).strip()
+    if not s:
+        return ""
+
+    if len(s) > max_len:
+        s = s[: max_len - 3].rstrip() + "..."
+
+    return f"{s}\n"
+
 def save_csv(path: Path, freq: np.ndarray, mag_db_arr: np.ndarray, mag_db_s_arr: np.ndarray, diff_db_s: Optional[np.ndarray]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1377,7 +1398,8 @@ def cmd_detect(args: argparse.Namespace) -> None:
         ax.grid(True)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Event index")
-        ax.set_title(f"DTMF detections over time (channel={args.channel})")
+        wav_label = Path(str(args.wav)).name
+        ax.set_title(f"{wav_label} -- DTMF detections over time (channel={args.channel})")
 
         if t_start is not None:
             ax.axvline(t_start, linestyle="--")
@@ -1389,6 +1411,7 @@ def cmd_detect(args: argparse.Namespace) -> None:
 
 def cmd_analyze(args: argparse.Namespace) -> None:
     outdir, run_meta = resolve_analyze_outdir(args)
+    title_prefix = plot_title_prefix(run_meta)
 
     run_notes = str(getattr(args, "run_notes", "") or "").strip()
     run_meta["notes"] = run_notes or None
@@ -1841,7 +1864,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
         ax.set_ylabel("Magnitude (dB, smoothed)")
-        ax.set_title(f"Cassette chain magnitude response ({ch})")
+        ax.set_title(f"{title_prefix}Cassette chain magnitude response ({ch})")
         fig.tight_layout()
         fig.savefig(outdir / f"response{out_suffix(ch)}.png", dpi=150)
         plt.close(fig)
@@ -1855,7 +1878,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
             ax.set_ylabel("Difference (dB, smoothed)")
-            ax.set_title(f"Cassette chain minus loopback ({ch})")
+            ax.set_title(f"{title_prefix}Cassette chain minus loopback ({ch})")
             fig.tight_layout()
             fig.savefig(outdir / f"difference{out_suffix(ch)}.png", dpi=150)
             plt.close(fig)
@@ -1868,7 +1891,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             ax.grid(True)
             ax.set_xlabel("Time (s)")
             ax.set_ylabel("Amplitude")
-            ax.set_title(f"Windowed impulse response segment ({ch})")
+            ax.set_title(f"{title_prefix}Windowed impulse response segment ({ch})")
             fig.tight_layout()
             fig.savefig(outdir / f"impulse{out_suffix(ch)}.png", dpi=150)
             plt.close(fig)
@@ -1922,7 +1945,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
             ax.set_ylabel("Magnitude (dB, smoothed)")
-            ax.set_title("Cassette chain magnitude response (L/R overlay)")
+            ax.set_title(f"{title_prefix}Cassette chain magnitude response (L/R overlay)")
 
             # Legend under the plot
             ax.legend(
@@ -1953,7 +1976,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
         ax.set_ylabel("L - R (dB, smoothed)")
-        ax.set_title("Channel mismatch: L - R")
+        ax.set_title(f"{title_prefix}Channel mismatch: L - R")
         fig.tight_layout()
         fig.savefig(outdir / "lr_diff.png", dpi=150)
         plt.close(fig)
