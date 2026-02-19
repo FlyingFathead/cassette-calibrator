@@ -23,6 +23,9 @@ import json
 import os
 import sys
 import time
+import csv
+import math
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -731,6 +734,291 @@ def _write_json_atomic_preserve_mtime(path: Path, obj: object) -> None:
         except Exception:
             pass
 
+# -----------------------
+# COMPARE (runs -> high-res grid PNG)
+# -----------------------
+
+_COMPARE_METRICS = {
+    # metric -> (per_channel output key prefix, xlabel, ylabel, logx default)
+    "response":   ("response",   "Frequency (Hz)", "dB", True),
+    "difference": ("difference", "Frequency (Hz)", "dB", True),
+    "impulse":    ("impulse",    "Samples",        "Amplitude", False),
+}
+
+def _slug(s: str) -> str:
+    s = (s or "").strip()
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_"):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out).strip("_") or "x"
+
+def _load_summary_for_run_dir(rel_run_dir: str) -> dict:
+    rel_run_dir = _rel_to_root_checked(rel_run_dir)
+    p = (ROOT / rel_run_dir / "summary.json")
+    if not p.exists() or not p.is_file():
+        raise ValueError(f"summary.json not found for run: {rel_run_dir}")
+    obj = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(obj, dict):
+        raise ValueError(f"summary.json is not an object for run: {rel_run_dir}")
+    return obj
+
+def _run_label(rel_run_dir: str, summary: dict) -> str:
+    name = None
+    try:
+        run = summary.get("run", {})
+        if isinstance(run, dict):
+            name = _opt_str(run.get("name"))
+    except Exception:
+        name = None
+    return f"{name} -- {rel_run_dir}" if name else rel_run_dir
+
+def _norm_ch_name(ch: str) -> str:
+    s = (ch or "").strip()
+    if not s:
+        return s
+    u = s.upper()
+    if u in ("LEFT", "L"):
+        return "L"
+    if u in ("RIGHT", "R"):
+        return "R"
+    if u in ("MONO", "MIX", "SUM"):
+        return "mono"
+    return s
+
+def _get_channel_outputs(summary: dict, ch: str) -> dict:
+    per = summary.get("per_channel", {})
+    if not isinstance(per, dict):
+        return {}
+    # try exact, then normalized matching
+    if ch in per and isinstance(per.get(ch), dict):
+        return per[ch].get("outputs", {}) if isinstance(per[ch].get("outputs", {}), dict) else {}
+    # fallback: match normalized names
+    want = _norm_ch_name(ch)
+    for k, v in per.items():
+        if _norm_ch_name(str(k)) == want and isinstance(v, dict):
+            outs = v.get("outputs", {})
+            return outs if isinstance(outs, dict) else {}
+    return {}
+
+def _find_metric_paths(summary: dict, metric_prefix: str, ch: str) -> tuple[str | None, str | None]:
+    """
+    Return (csv_rel, png_rel) for the metric+channel if available in summary.
+    We look for keys like:
+      response_csv / response.png variants / response_png
+    """
+    outs = _get_channel_outputs(summary, ch)
+    if not outs:
+        return (None, None)
+
+    # common naming patterns
+    csv_keys = [
+        f"{metric_prefix}_csv",
+        f"{metric_prefix}.csv",
+        f"{metric_prefix}_out_csv",
+    ]
+    png_keys = [
+        f"{metric_prefix}_png",
+        f"{metric_prefix}.png",
+        f"{metric_prefix}_out_png",
+    ]
+
+    csv_rel = None
+    for k in csv_keys:
+        v = outs.get(k)
+        if isinstance(v, str) and v.strip():
+            csv_rel = v.strip()
+            break
+
+    png_rel = None
+    for k in png_keys:
+        v = outs.get(k)
+        if isinstance(v, str) and v.strip():
+            png_rel = v.strip()
+            break
+
+    return (csv_rel, png_rel)
+
+def _sniff_csv_dialect(sample: str):
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except Exception:
+        return csv.get_dialect("excel")
+
+def _read_xy_csv(rel_path: str) -> tuple[list[float], list[float]]:
+    """
+    Very forgiving CSV reader.
+    - Supports comma/semicolon/tab
+    - Header-aware: tries to find x/y columns by name; else uses first 2 numeric cols
+    """
+    rel_path = _rel_to_root_checked(rel_path)
+    full = (ROOT / rel_path)
+    if not full.exists() or not full.is_file():
+        raise ValueError(f"CSV not found: {rel_path}")
+
+    txt = full.read_text(encoding="utf-8", errors="replace")
+    sample = txt[:4096]
+    dialect = _sniff_csv_dialect(sample)
+    reader = csv.reader(io.StringIO(txt), dialect)
+
+    rows = []
+    for r in reader:
+        if not r:
+            continue
+        # strip whitespace
+        r2 = [c.strip() for c in r]
+        if len(r2) == 0:
+            continue
+        rows.append(r2)
+
+    if not rows:
+        return ([], [])
+
+    # detect header: any non-float in first row -> treat as header
+    def _is_float(s: str) -> bool:
+        try:
+            float(s)
+            return True
+        except Exception:
+            return False
+
+    header = None
+    data_start = 0
+    if any((c and not _is_float(c)) for c in rows[0]):
+        header = [c.strip().lower() for c in rows[0]]
+        data_start = 1
+
+    xi, yi = 0, 1
+
+    if header:
+        # heuristic column selection
+        def find_idx(preds: list[str]) -> int | None:
+            for p in preds:
+                for i, h in enumerate(header or []):
+                    if p in h:
+                        return i
+            return None
+
+        x_try = find_idx(["freq", "hz", "f "])
+        y_try = find_idx(["db", "mag", "amp", "value", "y"])
+        if x_try is not None:
+            xi = x_try
+        if y_try is not None and y_try != xi:
+            yi = y_try
+        else:
+            # if y not found, choose first column != x that looks numeric in data
+            yi = 1 if xi == 0 else 0
+
+    xs: list[float] = []
+    ys: list[float] = []
+
+    for r in rows[data_start:]:
+        if xi >= len(r) or yi >= len(r):
+            continue
+        try:
+            x = float(r[xi])
+            y = float(r[yi])
+        except Exception:
+            continue
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        xs.append(x)
+        ys.append(y)
+
+    return (xs, ys)
+
+def _compare_render_grid(
+    *,
+    runs: list[dict],
+    channels: list[str],
+    metric: str,
+    outdir: str,
+    tile_w: int,
+    tile_h: int,
+    dpi: int,
+) -> tuple[str, str]:
+    """
+    Returns (out_png_rel, log_text).
+    If CSVs exist for the metric, re-plot with shared axes.
+    If not, tile PNGs (axes matching not guaranteed) and log a warning.
+    """
+    metric = (metric or "").strip().lower()
+    if metric not in _COMPARE_METRICS:
+        raise ValueError(f"unknown metric: {metric}")
+
+    metric_prefix, xlabel, ylabel, logx_default = _COMPARE_METRICS[metric]
+
+    # Collect series and/or image tiles
+    log_lines: list[str] = []
+    series = {}  # (ch, run_idx) -> (xs, ys)
+    tiles  = {}  # (ch, run_idx) -> png_rel
+    have_any_series = False
+
+    for j, r in enumerate(runs):
+        rel_dir = r["dir"]
+        summ = r["summary"]
+
+        for ch in channels:
+            csv_rel, png_rel = _find_metric_paths(summ, metric_prefix, ch)
+
+            # prefer CSV (true axis matching)
+            if csv_rel:
+                try:
+                    xs, ys = _read_xy_csv(csv_rel)
+                    if xs and ys:
+                        series[(ch, j)] = (xs, ys)
+                        have_any_series = True
+                        continue
+                    else:
+                        log_lines.append(f"[warn] empty CSV for {rel_dir} ch={ch}: {csv_rel}")
+                except Exception as e:
+                    log_lines.append(f"[warn] failed reading CSV for {rel_dir} ch={ch}: {csv_rel} -- {e}")
+
+            # fallback PNG tiling
+            if png_rel:
+                tiles[(ch, j)] = png_rel
+            else:
+                log_lines.append(f"[warn] missing outputs for {rel_dir} ch={ch} metric={metric_prefix}")
+
+    # Output path
+    outdir_rel = _ensure_outdir_rel(outdir)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ch_tag = _slug("_".join(channels))
+    out_name = f"compare-{metric}-{ch_tag}-{ts}.png"
+    out_png_rel = str(Path(outdir_rel) / out_name)
+
+    # Figure geometry
+    nrows = max(1, len(channels))
+    ncols = max(1, len(runs))
+    fig_w_in = (tile_w * ncols) / max(1, dpi)
+    fig_h_in = (tile_h * nrows) / max(1, dpi)
+
+    import matplotlib.pyplot as plt  # uses Agg (already set)
+    from matplotlib.image import imread as _imread
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(fig_w_in, fig_h_in),
+        dpi=dpi,
+        sharex=True if have_any_series else False,
+        sharey=True if have_any_series else False,
+    )
+
+    # Normalize axes to 2D array-ish
+    if nrows == 1 and ncols == 1:
+        axes2 = [[axes]]
+    elif nrows == 1:
+        axes2 = [list(axes)]
+    elif ncols == 1:
+        axes2 = [[ax] for ax in axes]
+    else:
+        axes2 = [list(row) for row in axes]
+
+    # Determine global axis l
+
 INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
@@ -1015,6 +1303,76 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="card">
+
+      <h3>compare</h3>
+      <div class="small">Build a compare list of runs, then render a single high-res grid PNG (shared axes when CSV exists).</div>
+
+      <button onclick="refreshCompareRuns()">Refresh runs</button>
+
+      <div class="row" style="margin-top:8px;">
+        <div style="flex:1; min-width:260px;">
+          <label>Available runs</label>
+          <select id="cmp_avail" multiple size="10" style="width:100%; padding:6px; margin-top:4px;"></select>
+          <div style="display:flex; gap:8px; margin-top:8px;">
+            <button onclick="cmpAdd()">Add →</button>
+          </div>
+        </div>
+
+        <div style="flex:1; min-width:260px;">
+          <label>Compare list (order = columns)</label>
+          <select id="cmp_list" multiple size="10" style="width:100%; padding:6px; margin-top:4px;"></select>
+          <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+            <button onclick="cmpUp()">Up</button>
+            <button onclick="cmpDown()">Down</button>
+            <button onclick="cmpRemove()">Remove</button>
+            <button onclick="cmpClear()">Clear</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="align-items:flex-end; margin-top:10px;">
+        <div style="flex:1; min-width:200px;">
+          <label>Metric</label>
+          <select id="cmp_metric">
+            <option value="response">Response</option>
+            <option value="difference">Difference</option>
+            <option value="impulse">Impulse</option>
+          </select>
+        </div>
+
+        <div style="flex:1; min-width:200px;">
+          <label>Channels</label>
+          <select id="cmp_channels">
+            <option value="auto">Auto (union)</option>
+            <option value="L">L</option>
+            <option value="R">R</option>
+            <option value="LR">L+R</option>
+            <option value="mono">mono</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="align-items:flex-end; margin-top:10px;">
+        <div style="flex:1; min-width:160px;">
+          <label>Tile width (px)</label>
+          <input id="cmp_tile_w" type="number" value="1100" />
+        </div>
+        <div style="flex:1; min-width:160px;">
+          <label>Tile height (px)</label>
+          <input id="cmp_tile_h" type="number" value="650" />
+        </div>
+        <div style="flex:1; min-width:160px;">
+          <label>DPI</label>
+          <input id="cmp_dpi" type="number" value="150" />
+        </div>
+      </div>
+
+      <button onclick="doCompare()">Render compare grid</button>
+
+      <pre id="cmp_log"></pre>
+      <div id="cmp_img"></div>
+    </div>
+
     <h3>runs</h3>
     <div class="small">Browse previous analysis runs (reads run name from summary.json).</div>
 
@@ -1125,6 +1483,121 @@ let IV = {
   fit: true,
   path: ""
 };
+
+let CMP = {
+  runs: [] // array of {dir,label}
+};
+
+function _selValues(selectEl) {
+  return Array.from(selectEl.selectedOptions || []).map(o => o.value);
+}
+
+function _moveOption(selectFrom, selectTo, value, text) {
+  // avoid duplicates
+  for (const o of (selectTo.options || [])) {
+    if (o.value === value) return;
+  }
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = text || value;
+  selectTo.appendChild(opt);
+}
+
+async function refreshCompareRuns() {
+  try {
+    setLog("cmp_log", "loading runs...");
+    const r = await apiGetJson("/api/runs");
+    const avail = document.getElementById("cmp_avail");
+    let html = "";
+    for (const it of (r.runs || [])) {
+      const label = (it.label || it.dir || "");
+      const val = it.dir || "";
+      html += `<option value="${esc(val)}">${esc(label)}</option>`;
+    }
+    avail.innerHTML = html || "<option value=''>no runs found</option>";
+    setLog("cmp_log", JSON.stringify(r, null, 2));
+  } catch (e) {
+    setLog("cmp_log", "ERROR: " + e.message);
+  }
+}
+
+function cmpAdd() {
+  const avail = document.getElementById("cmp_avail");
+  const list = document.getElementById("cmp_list");
+  for (const o of Array.from(avail.selectedOptions || [])) {
+    _moveOption(avail, list, o.value, o.textContent);
+  }
+}
+
+function cmpRemove() {
+  const list = document.getElementById("cmp_list");
+  const gone = Array.from(list.selectedOptions || []);
+  for (const o of gone) o.remove();
+}
+
+function cmpClear() {
+  document.getElementById("cmp_list").innerHTML = "";
+}
+
+function cmpUp() {
+  const list = document.getElementById("cmp_list");
+  const sel = Array.from(list.selectedOptions || []);
+  // move each selected option up one step (preserving order)
+  for (const o of sel) {
+    const prev = o.previousElementSibling;
+    if (prev && !prev.selected) list.insertBefore(o, prev);
+  }
+}
+
+function cmpDown() {
+  const list = document.getElementById("cmp_list");
+  const sel = Array.from(list.selectedOptions || []).reverse();
+  for (const o of sel) {
+    const next = o.nextElementSibling;
+    if (next && !next.selected) list.insertBefore(next, o);
+  }
+}
+
+function _cmpChannels() {
+  const v = document.getElementById("cmp_channels").value;
+  if (v === "LR") return ["L","R"];
+  if (v === "auto") return ["auto"];
+  return [v];
+}
+
+async function doCompare() {
+  try {
+    setLog("cmp_log", "rendering...");
+    document.getElementById("cmp_img").innerHTML = "";
+
+    const list = document.getElementById("cmp_list");
+    const runs = Array.from(list.options || []).map(o => o.value).filter(Boolean);
+
+    if (!runs.length) {
+      setLog("cmp_log", "ERROR: compare list is empty");
+      return;
+    }
+
+    const metric = document.getElementById("cmp_metric").value;
+    const channels = _cmpChannels();
+
+    const tile_w = parseInt(document.getElementById("cmp_tile_w").value || "1100", 10);
+    const tile_h = parseInt(document.getElementById("cmp_tile_h").value || "650", 10);
+    const dpi = parseInt(document.getElementById("cmp_dpi").value || "150", 10);
+
+    const r = await api("/api/compare", { runs, metric, channels, tile_w, tile_h, dpi });
+
+    let head = `ok -- ${r.metric} -- channels=${(r.channels||[]).join(",")} -- dpi=${r.dpi} -- tile=${r.tile_w}x${r.tile_h}\n`;
+    if (r.log) head += "\n" + r.log;
+    setLog("cmp_log", head);
+
+    if (r.out_png) {
+      document.getElementById("cmp_img").innerHTML = imgTag(r.out_png);
+    }
+  } catch (e) {
+    setLog("cmp_log", "ERROR: " + e.message);
+  }
+}
 
 function imgUrl(path) {
   return "/file?path=" + encodeURIComponent(path);
@@ -1827,7 +2300,14 @@ Object.assign(window, {
   runsCancelNotes,
   openImgViewer,
   closeImgViewer,
-  ivToggleFit  
+  ivToggleFit,
+  refreshCompareRuns,
+  cmpAdd,
+  cmpRemove,
+  cmpClear,
+  cmpUp,
+  cmpDown,
+  doCompare
 });
 
 console.log("webui script loaded; handlers exported to window");
@@ -2067,6 +2547,83 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "summary": obj})
             except Exception as e:
                 self._json(400, {"error": str(e)})
+            return
+
+        if u.path == "/api/compare":
+            try:
+                runs_in = payload.get("runs", None)
+                if not isinstance(runs_in, list) or not runs_in:
+                    raise ValueError("runs must be a non-empty list of run dirs")
+
+                metric = str(payload.get("metric", "response") or "response").strip().lower()
+                outdir = str(payload.get("outdir", "data/compare") or "data/compare").strip()
+
+                # UI controls for resolution
+                tile_w = int(payload.get("tile_w", 1100) or 1100)
+                tile_h = int(payload.get("tile_h", 650) or 650)
+                dpi = int(payload.get("dpi", 150) or 150)
+
+                # channels selection
+                ch_in = payload.get("channels", None)
+                channels: list[str] = []
+                if isinstance(ch_in, list) and ch_in:
+                    channels = [_norm_ch_name(str(x)) for x in ch_in if str(x).strip()]
+                else:
+                    # default: union of channels found in first run summary
+                    channels = ["L", "R"]
+
+                # load summaries
+                runs: list[dict] = []
+                for rd in runs_in:
+                    rd_s = str(rd or "").strip()
+                    if not rd_s:
+                        continue
+                    rd_rel = _rel_to_root_checked(rd_s)
+                    summ = _load_summary_for_run_dir(rd_rel)
+                    runs.append({
+                        "dir": rd_rel,
+                        "summary": summ,
+                        "label": _run_label(rd_rel, summ),
+                    })
+
+                if not runs:
+                    raise ValueError("no valid runs were provided")
+
+                # if channels == ["auto"], use union across runs
+                if len(channels) == 1 and channels[0].lower() == "auto":
+                    seen = []
+                    for r in runs:
+                        per = r["summary"].get("per_channel", {})
+                        if isinstance(per, dict):
+                            for k in per.keys():
+                                nk = _norm_ch_name(str(k))
+                                if nk and nk not in seen:
+                                    seen.append(nk)
+                    channels = seen or ["L", "R"]
+
+                out_png_rel, log_txt = _compare_render_grid(
+                    runs=runs,
+                    channels=channels,
+                    metric=metric,
+                    outdir=outdir,
+                    tile_w=tile_w,
+                    tile_h=tile_h,
+                    dpi=dpi,
+                )
+
+                self._json(200, {
+                    "ok": True,
+                    "out_png": out_png_rel,
+                    "metric": metric,
+                    "channels": channels,
+                    "runs": [{"dir": r["dir"], "label": r["label"]} for r in runs],
+                    "tile_w": tile_w,
+                    "tile_h": tile_h,
+                    "dpi": dpi,
+                    "log": log_txt,
+                })
+            except Exception as e:
+                self._json(400, {"ok": False, "error": str(e)})
             return
 
         if u.path == "/api/gen":
