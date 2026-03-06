@@ -1,3 +1,5 @@
+![cassette-calibrator logo](assets/logo.png)
+
 # cassette-calibrator
 
 A CLI-first cassette measurement/calibration tool with an optional local WebUI. It is designed for testing a compact cassette recording/playback chain with generated reference audio, automated marker detection, drift compensation, and response analysis.
