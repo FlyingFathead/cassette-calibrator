@@ -267,6 +267,19 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.1 - README logo + cleaner WebUI startup bind errors
+
+  * Added project logo image to the README for cleaner repo presentation.
+  * Improved WebUI startup error handling when the bind fails.
+  * Common startup cases like "address already in use" now exit cleanly with actionable guidance instead of dumping a full traceback.
+  * Clarified likely causes for bind failures:
+    * another `cassette-calibrator` WebUI instance is already running
+    * another program is already using the configured port
+  * Added clearer recovery guidance:
+    * stop the conflicting process
+    * start the WebUI on another port with `--port`
+    * or change `[webui].port` in `cassette_calibrator.toml`
+
 * 0.2.0 - Core cleanup, WebUI file transfer support, analysis fixes, and broader WebUI polish
 
   * Cleaned up duplicate/overlapping logic in `cassette_calibrator.py` so the core analysis/detection path is less brittle and easier to maintain.

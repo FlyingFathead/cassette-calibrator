@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import html as pyhtml
 from functools import lru_cache
 import io
@@ -3856,6 +3857,41 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(404, {"error": "not found"})
 
+def _format_bind_error(host: str, port: int, exc: OSError) -> str:
+    url = f"http://{host}:{port}/"
+
+    if exc.errno == errno.EADDRINUSE:
+        return "\n".join([
+            f"ERROR: could not start cassette-calibrator WebUI on {url}",
+            "",
+            f"Address already in use: {host}:{port}",
+            "",
+            "Common causes:",
+            "  - another cassette-calibrator WebUI instance is already running",
+            "  - another program is already using that port",
+            "",
+            "What to do:",
+            "  - stop the other process using that port",
+            f"  - start this WebUI on another port, e.g. ./webui.py --port {port + 1}",
+            f"  - or change [webui].port in cassette_calibrator.toml",
+        ])
+
+    if exc.errno == errno.EACCES:
+        return "\n".join([
+            f"ERROR: could not start cassette-calibrator WebUI on {url}",
+            "",
+            f"Permission denied while binding to {host}:{port}",
+            "",
+            "What to do:",
+            "  - use a port number above 1024",
+            "  - or run with a host/port that your user can bind to",
+        ])
+
+    return "\n".join([
+        f"ERROR: could not start cassette-calibrator WebUI on {url}",
+        "",
+        f"Bind failed: {exc}",
+    ])
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Local WebUI for cassette-calibrator (stdlib http.server; no web framework).")
@@ -3885,7 +3921,14 @@ def main() -> int:
     if host not in ("127.0.0.1", "localhost"):
         print(f"[warn] Binding to '{host}' -- this WebUI is intended for local use.", file=sys.stderr)
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    try:
+        httpd = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        msg = _format_bind_error(host, port, e)
+        LOG.error(msg.replace("\n", " | "))
+        print(msg, file=sys.stderr)
+        return 2
+
     httpd.cfg = cfg  # type: ignore[attr-defined]
 
     url = f"http://{host}:{port}/"
