@@ -25,11 +25,15 @@ import sys
 import time
 import csv
 import math
+import re
+import unicodedata
 from datetime import datetime
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from cassette_calibrator import apply_audio_freq_ticks
 from matplotlib.ticker import NullFormatter
 
@@ -180,7 +184,141 @@ IGNORE_DIRS = {
     ".ruff_cache",
     "node_modules",
 }
+
 MAX_LIST_ITEMS = 4000
+# MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GiB
+MAX_UPLOAD_BYTES = 256 * 1024 * 1024  # 256 MiB
+UPLOAD_EXTS = {".wav"}
+
+def _ascii_download_fallback(name: str) -> str:
+    s = unicodedata.normalize("NFKD", str(name or "download"))
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r'[^A-Za-z0-9._ -]+', "_", s)
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s or "download"
+
+def _content_disposition_attachment(name: str) -> str:
+    name = str(name or "download")
+    fallback = _ascii_download_fallback(name).replace("\\", "_").replace('"', "_")
+    quoted = quote(name, safe="")
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quoted}'
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+def _safe_upload_filename(name: str, *, allowed_exts: set[str]) -> str:
+    raw = str(name or "")
+    raw = raw.replace("\\", "/")
+    base = Path(raw).name
+    base = unicodedata.normalize("NFC", base)
+
+    # Keep Unicode/apostrophes/spaces, but kill path, control and Windows-hostile chars
+    base = base.replace("/", "_").replace("\\", "_")
+    base = re.sub(r'[\x00-\x1f\x7f]+', "_", base)
+    base = re.sub(r'[:*?"<>|]+', "_", base)
+    base = re.sub(r"\s+", " ", base).strip().rstrip(". ")
+
+    if not base or base in {".", ".."}:
+        raise ValueError("invalid upload filename")
+
+    stem_upper = Path(base).stem.upper()
+    if stem_upper in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(f"reserved filename: {Path(base).stem}")
+
+    ext = Path(base).suffix.lower()
+    if ext not in allowed_exts:
+        raise ValueError(f"unsupported file type: {ext or '(no extension)'}")
+
+    return base
+
+def _unique_file_path(dir_path: Path, filename: str) -> Path:
+    out = dir_path / filename
+    if not out.exists():
+        return out
+
+    stem = out.stem
+    suf = out.suffix
+    for i in range(2, 10000):
+        cand = dir_path / f"{stem}-{i:02d}{suf}"
+        if not cand.exists():
+            return cand
+
+    raise RuntimeError("could not allocate unique filename")
+
+def _guess_ctype(path: Path) -> str:
+    suf = path.suffix.lower()
+    if suf == ".png":
+        return "image/png"
+    if suf == ".csv":
+        return "text/csv; charset=utf-8"
+    if suf == ".json":
+        return "application/json; charset=utf-8"
+    if suf == ".wav":
+        return "audio/wav"
+    return "application/octet-stream"
+
+def _parse_multipart_form(content_type: str, raw: bytes) -> dict:
+    if "multipart/form-data" not in (content_type or ""):
+        raise ValueError("expected multipart/form-data")
+
+    msg = BytesParser(policy=email_policy).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw
+    )
+
+    if not msg.is_multipart():
+        raise ValueError("invalid multipart body")
+
+    out = {"fields": {}, "files": {}}
+
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="Content-Disposition")
+        if not name:
+            continue
+
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+
+        if filename is None:
+            charset = part.get_content_charset() or "utf-8"
+            out["fields"][name] = payload.decode(charset, errors="replace")
+        else:
+            out["files"][name] = {
+                "filename": filename,
+                "content_type": part.get_content_type(),
+                "data": payload,
+            }
+
+    return out
+
+def _validate_uploaded_wav(path: Path) -> dict:
+    try:
+        sr, y = cc.read_wav(path)
+    except Exception as e:
+        raise ValueError(f"invalid WAV file: {e}") from e
+
+    if int(sr) <= 0:
+        raise ValueError("invalid WAV file: bad sample rate")
+
+    if not hasattr(y, "size") or int(y.size) <= 0:
+        raise ValueError("invalid WAV file: no audio samples")
+
+    frames = int(y.shape[0]) if hasattr(y, "shape") and len(y.shape) >= 1 else 0
+    channels = 1 if getattr(y, "ndim", 1) == 1 else int(y.shape[1])
+
+    if frames <= 0:
+        raise ValueError("invalid WAV file: empty audio")
+
+    dur_s = frames / float(sr)
+
+    return {
+        "sample_rate": int(sr),
+        "frames": frames,
+        "channels": channels,
+        "duration_s": dur_s,
+    }
 
 # -----------------------
 # DTMF / marker presets (WebUI-side)
@@ -507,10 +645,10 @@ def _make_args(cmd: str, cfg: dict, overrides: dict | None) -> SimpleNamespace:
         args["channels"] = cc.parse_channels(str(args["channels"]))
 
     if cmd == "detect" and "channel" in args:
-        args["channel"] = cc._normalize_marker_channel(str(args["channel"]))
+        args["channel"] = _normalize_marker_channel(str(args["channel"]))
 
     if cmd == "analyze" and "marker_channel" in args:
-        args["marker_channel"] = cc._normalize_marker_channel(str(args["marker_channel"]))
+        args["marker_channel"] = _normalize_marker_channel(str(args["marker_channel"]))
 
     return SimpleNamespace(**args)
 
@@ -1164,182 +1302,604 @@ INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>cassette-calibrator -- local WebUI</title>
+  <title>cassette-calibrator 🖭 WebUI</title>
   <style>
 
-    body { font-family: system-ui, sans-serif; margin: 20px; }
-    .row { display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; }
-    .card { border: 1px solid #ccc; border-radius: 10px; padding: 14px; min-width: 340px; max-width: 560px; flex: 1; }
-    label { display:block; margin-top: 8px; font-size: 13px; color: #333; }
-    input { width: 100%; padding: 6px; margin-top: 4px; }
-    select { width: 100%; padding: 6px; margin-top: 4px; }
-    details { margin-top: 8px; }
-    summary { cursor: pointer; }
-    button { margin-top: 10px; padding: 8px 12px; cursor: pointer; }
-    pre {
-      background: #111;
-      color: #ddd;
-      padding: 10px;
-      border-radius: 8px;
-      overflow: auto;
-      max-height: 260px;
+  :root {
+    --bg-top: #cfd8e3;
+    --bg-bottom: #e4ebf2;
+    --page-text: #1b2430;
 
-      /* make long errors readable */
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      word-break: break-word;
+    --card-bg: #f7fafc;
+    --card-border: #b7c3cf;
+    --card-shadow: 0 10px 28px rgba(24, 35, 52, 0.10);
 
-      /* let the user expand the log box */
-      resize: vertical;
-      min-height: 80px;
+    --panel-bg: #eef3f8;
+    --panel-border: #c7d2dd;
+
+    --input-bg: #ffffff;
+    --input-border: #aebccc;
+    --input-focus: #4b6f93;
+
+    --muted: #5f6c79;
+    --muted-2: #738191;
+
+    --accent: #44698d;
+    --accent-hover: #355571;
+    --accent-soft: #dce7f2;
+
+    --log-bg: #0f141b;
+    --log-fg: #d7dde5;
+    --log-border: #273240;
+
+    --img-border: #2a3440;
+
+    --modal-bg: #f7fafc;
+    --modal-border: #b7c3cf;
+
+    --viewer-bg: #f5f8fb;
+    --viewer-border: #b7c3cf;
+  }
+
+  html {
+    min-height: 100%;
+    background:
+      linear-gradient(180deg, var(--bg-top) 0%, var(--bg-bottom) 100%);
+  }
+
+  body {
+    font-family: system-ui, sans-serif;
+    margin: 20px;
+    min-height: calc(100vh - 40px);
+    color: var(--page-text);
+    background: transparent;
+  }
+
+  h2, h3, h4 {
+    color: var(--page-text);
+  }
+
+  code {
+    background: rgba(255,255,255,0.35);
+    padding: 1px 5px;
+    border-radius: 6px;
+  }
+
+  hr {
+    border: 0;
+    border-top: 1px solid var(--panel-border);
+    margin: 16px 0;
+  }
+
+  .row {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 14px;
+    min-width: 340px;
+    max-width: 560px;
+    flex: 1;
+    box-shadow: var(--card-shadow);
+    backdrop-filter: blur(2px);
+  }
+
+  label {
+    display: block;
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--page-text);
+  }
+
+  input,
+  select,
+  textarea {
+    width: 100%;
+    padding: 8px 10px;
+    margin-top: 4px;
+    box-sizing: border-box;
+    border: 1px solid var(--input-border);
+    border-radius: 9px;
+    background: var(--input-bg);
+    color: var(--page-text);
+  }
+
+  input:focus,
+  select:focus,
+  textarea:focus {
+    outline: none;
+    border-color: var(--input-focus);
+    box-shadow: 0 0 0 3px rgba(75, 111, 147, 0.16);
+  }
+
+  details {
+    margin-top: 8px;
+  }
+
+  summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  button {
+    margin-top: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    border: 1px solid #96a8ba;
+    border-radius: 9px;
+    background: var(--accent-soft);
+    color: var(--page-text);
+    font-weight: 600;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.06s ease;
+  }
+
+  button:hover {
+    background: #cfddec;
+    border-color: var(--accent);
+  }
+
+  button:active {
+    transform: translateY(1px);
+  }
+
+  pre {
+    background: var(--log-bg);
+    color: var(--log-fg);
+    padding: 10px;
+    border-radius: 10px;
+    overflow: auto;
+    max-height: 260px;
+    border: 1px solid var(--log-border);
+
+    /* make long errors readable */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+
+    /* let the user expand the log box */
+    resize: vertical;
+    min-height: 80px;
+  }
+
+  img {
+    max-width: 100%;
+    border-radius: 8px;
+    border: 1px solid var(--img-border);
+  }
+
+    .small {
+    font-size: 12px;
+    color: #000;
     }
 
-    img { max-width: 100%; border-radius: 8px; border: 1px solid #222; }
-    .small { font-size: 12px; color: #666; }
-    .grid2 { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: end;
+  }
 
-    /* Modal file browser */
-    .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; z-index: 9999; }
-    .modal { position: fixed; inset: 40px; background: #fff; border-radius: 12px; padding: 12px; display: none; z-index: 10000;
-             box-shadow: 0 10px 40px rgba(0,0,0,0.35); }
-    .modal-header { display: flex; gap: 10px; align-items: center; }
-    .modal-header .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: #444; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .modal-body { margin-top: 10px; display: grid; grid-template-columns: 1fr; gap: 8px; height: calc(100% - 52px); }
-    .modal-controls { display: flex; gap: 8px; align-items: center; }
-    .modal-controls input { margin-top: 0; }
-    .modal-list { border: 1px solid #ddd; border-radius: 10px; overflow: auto; padding: 8px; height: 100%; }
-    .item { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; padding: 6px 8px; border-radius: 8px; }
-    .item:hover { background: #f3f3f3; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-    .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid #ccc; color: #333; }
-    .muted { color: #777; font-size: 12px; }
-    .runhdr { margin-top: 10px; margin-bottom: 6px; }
-    .runhdr .title { font-size: 22px; font-weight: 700; margin: 0 0 4px 0; }
-    .runhdr .meta { font-size: 12px; color: #666; line-height: 1.35; }
-    .runhdr .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }    
-    
-    textarea { width: 100%; padding: 6px; margin-top: 4px; resize: vertical; }  
+  /* Modal file browser */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(8, 12, 18, 0.55);
+    display: none;
+    z-index: 9999;
+  }
 
-    .toc { margin-top: 6px; font-size: 12px; color: #666; }
-    .toc a { color: inherit; text-decoration: none; border-bottom: 1px dotted #999; }
-    .toc a:hover { border-bottom-style: solid; }
+  .modal {
+    position: fixed;
+    inset: 40px;
+    background: var(--modal-bg);
+    border: 1px solid var(--modal-border);
+    border-radius: 14px;
+    padding: 12px;
+    display: none;
+    z-index: 10000;
+    box-shadow: 0 14px 48px rgba(0,0,0,0.30);
+  }
 
-    .block { border: 1px solid #ddd; border-radius: 10px; padding: 10px; margin-top: 10px; }
-    .block h4 { margin: 0 0 8px 0; }
+  .modal-header {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
 
-    .notes {
-      white-space: pre-wrap;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-      background: #f6f6f6;
-      padding: 10px;
-      border-radius: 8px;
-      border: 1px solid #ddd;
+  .modal-header .path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .modal-body {
+    margin-top: 10px;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+    height: calc(100% - 52px);
+  }
+
+  .modal-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .modal-controls input {
+    margin-top: 0;
+  }
+
+  .modal-list {
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    overflow: auto;
+    padding: 8px;
+    height: 100%;
+    background: #fbfdff;
+  }
+
+  .item {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 10px;
+    padding: 6px 8px;
+    border-radius: 8px;
+  }
+
+  .item:hover {
+    background: #eaf1f8;
+  }
+
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+
+  .pill {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--panel-border);
+    color: var(--page-text);
+    background: #f1f5f9;
+  }
+
+  .muted {
+    color: var(--muted-2);
+    font-size: 12px;
+  }
+
+  .runhdr {
+    margin-top: 10px;
+    margin-bottom: 6px;
+  }
+
+  .runhdr .title {
+    font-size: 22px;
+    font-weight: 700;
+    margin: 0 0 4px 0;
+  }
+
+  .runhdr .meta {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.35;
+  }
+
+  .runhdr .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  textarea {
+    width: 100%;
+    padding: 8px 10px;
+    margin-top: 4px;
+    resize: vertical;
+  }
+
+  .toc {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .toc a {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px dotted #89a0b7;
+  }
+
+  .toc a:hover {
+    border-bottom-style: solid;
+  }
+
+  .block {
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 10px;
+    margin-top: 10px;
+    background: var(--panel-bg);
+  }
+
+  .block h4 {
+    margin: 0 0 8px 0;
+  }
+
+  .notes {
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    background: #f6f9fc;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid var(--panel-border);
+  }
+
+  .imgsec {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px dashed #b9c6d3;
+  }
+
+  .imgsec h4 {
+    margin: 0 0 8px 0;
+  }
+
+  /* ---- Image viewer / clickable images ---- */
+
+  .imgwrap {
+    margin-top: 10px;
+  }
+
+  .imgmeta {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .imglinks {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .imglink {
+    font-size: 12px;
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px dotted #89a0b7;
+  }
+
+  .imglink:hover {
+    border-bottom-style: solid;
+  }
+
+  .imgbtn {
+    padding: 4px 8px;
+    font-size: 12px;
+    margin-top: 0;
+  }
+
+  .imgthumb {
+    cursor: zoom-in;
+  }
+
+  /* Fullscreen-ish image viewer */
+  .iv-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.75);
+    display: none;
+    z-index: 20000;
+  }
+
+  .iv {
+    position: fixed;
+    inset: 26px;
+    background: var(--viewer-bg);
+    border: 1px solid var(--viewer-border);
+    border-radius: 12px;
+    padding: 10px;
+    display: none;
+    z-index: 20001;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+  }
+
+  .iv-head {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .iv-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  .iv-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .iv-meta {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .iv-body {
+    margin-top: 10px;
+    height: calc(100% - 56px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+    background: #111;
+    border-radius: 10px;
+    padding: 10px;
+  }
+
+  .iv-body img {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 8px;
+    border: 1px solid #333;
+    cursor: zoom-in;
+  }
+
+  /* “Actual” (1:1) mode: image can be larger than viewport; you pan via scrolling */
+  .iv-body img.iv-actual {
+    max-width: none;
+    max-height: none;
+    cursor: grab;
+  }
+
+  .hero {
+  margin: 0 0 18px 0;
+  padding: 16px 18px 14px 18px;
+  border: 1px solid rgba(255,255,255,0.45);
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.30) 0%, rgba(255,255,255,0.12) 100%),
+    linear-gradient(135deg, rgba(78, 120, 164, 0.20) 0%, rgba(255,255,255,0.10) 100%);
+  box-shadow:
+    0 10px 30px rgba(24, 35, 52, 0.14),
+    inset 0 1px 0 rgba(255,255,255,0.45);
+  backdrop-filter: blur(4px);
     }
 
-    .imgsec { margin-top: 14px; padding-top: 10px; border-top: 1px dashed #ccc; }
-    .imgsec h4 { margin: 0 0 8px 0; }
-
-    /* ---- Image viewer / clickable images ---- */
-
-    .imgwrap { margin-top: 10px; }
-    .imgmeta {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      align-items: center;
-    }
-    .imglinks { display: flex; gap: 10px; align-items: center; }
-    .imglink {
-      font-size: 12px;
-      color: #444;
-      text-decoration: none;
-      border-bottom: 1px dotted #999;
-    }
-    .imglink:hover { border-bottom-style: solid; }
-    .imgbtn { padding: 4px 8px; font-size: 12px; margin-top: 0; }
-
-    .imgthumb { cursor: zoom-in; }
-
-    /* Fullscreen-ish image viewer */
-    .iv-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.75);
-      display: none;
-      z-index: 20000;
-    }
-    .iv {
-      position: fixed;
-      inset: 26px;
-      background: #fff;
-      border-radius: 12px;
-      padding: 10px;
-      display: none;
-      z-index: 20001;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-    }
-    .iv-head { display: flex; gap: 10px; align-items: center; }
-    .iv-title {
-      flex: 1;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-weight: 600;
-      font-size: 13px;
-    }
-    .iv-actions { display: flex; gap: 8px; align-items: center; }
-    .iv-meta { margin-top: 6px; font-size: 12px; color: #666; }
-
-    .iv-body {
-      margin-top: 10px;
-      height: calc(100% - 56px);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      overflow: auto;
-      background: #111;
-      border-radius: 10px;
-      padding: 10px;
-    }
-    .iv-body img {
-      max-width: 100%;
-      max-height: 100%;
-      border-radius: 8px;
-      border: 1px solid #333;
-      cursor: zoom-in;
+    .hero-title {
+    margin: 0;
+    font-size: clamp(30px, 4vw, 44px);
+    line-height: 1.06;
+    font-weight: 900;
+    letter-spacing: -0.03em;
+    color: #f8fbff;
+    text-shadow:
+        0 1px 0 rgba(255,255,255,0.55),
+        0 0 10px rgba(122, 170, 220, 0.30),
+        0 0 22px rgba(122, 170, 220, 0.18),
+        0 3px 10px rgba(28, 44, 66, 0.35);
     }
 
-    /* “Actual” (1:1) mode: image can be larger than viewport; you pan via scrolling */
-    .iv-body img.iv-actual {
-      max-width: none;
-      max-height: none;
-      cursor: grab;
+    .hero-title .brand-main {
+    color: #ffffff;
+    }
+
+    .hero-title .brand-accent {
+    color: #355571;
+    text-shadow:
+        0 1px 0 rgba(255,255,255,0.40),
+        0 0 12px rgba(110, 170, 235, 0.22),
+        0 2px 8px rgba(28, 44, 66, 0.28);
+    }
+
+    .hero-badge {
+    display: inline-block;
+    margin-left: 10px;
+    padding: 4px 10px 5px 10px;
+    vertical-align: middle;
+    font-size: 0.38em;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #24415c;
+    background: linear-gradient(180deg, #f7fbff 0%, #dfeaf6 100%);
+    border: 1px solid rgba(86, 113, 141, 0.35);
+    border-radius: 999px;
+    box-shadow:
+        0 1px 0 rgba(255,255,255,0.8),
+        0 4px 12px rgba(40, 60, 84, 0.16);
+    }
+
+    .hero-sub {
+    margin-top: 8px;
+    font-size: 13px;
+    color: #3f5368;
+    }
+
+    .hero-sub code {
+    background: rgba(255,255,255,0.55);
     }
 
   </style>
 </head>
 <body>
-  <h2>cassette-calibrator -- local WebUI</h2>
-  <div class="small">
-    Runs locally only. Uses your existing <code>cassette_calibrator.toml</code> defaults.
-  </div>
+
+    <div class="hero">
+    <h1 class="hero-title">
+        <span class="brand-main">cassette</span><span class="brand-accent">-calibrator 🖭</span>
+        <span class="hero-badge">WebUI</span>
+    </h1>
+    <div class="hero-sub">
+    <i>Find out how tapehead-brained your signal path really is.</i>
+    </div>
+    </div>
+
+    <div class="small">
+    <p>This frontend uses <code>cassette_calibrator.toml</code> configuration defaults.</p>
+    </div>
 
   <div class="row">
-    <div class="card">
-      <h3>gen</h3>
-      <label>Output WAV (relative path)</label>
+       <div class="card">
+        <h3>1. Generate test audio</h3>
+        <div class="small">
+            <p>Creates the reference calibration WAV: DTMF markers, silence window, reference tone and ESS sweep.</p>
+            <p><b>ℹ️ Use this functionality as your first step to generate the reference audio file that you will then i.e. record to your cassette/run through your signal chain and record it back from the other end.</b></p>
+            <p>The test audio file only needs to be generated once, unless you need to change your audio test pattern itself. Changing the type is currently not supported via this webUI and is only available in the CLI version of this program.</p>
+            <p>If you're running the same test repeatedly for A/B comparison (and esp. if you need to compare runs), ALWAYS use the same WAV that is generated here.</p>
+            <p>After generating the audio, save it to your computer and use it i.e. with a separate DAW program, audio player, etc to pass it through your signal chain and record it back for analysis.</b></p>
+        </div>
+
+        <p></p>
+        
+        <div class="small">
+        <p>The generated test audio file can be downloaded via the webUI after it has been generated. 
+        Change the path/filename only if needed (i.e. if you're doing different comparison types).</p>
+        
+        <p><b>⚠️ NOTE: generated test audio files stay in the webUI's data folder, so in most cases you only need to run this step once.</b></p>
+        </div>       
+
+        <p></p>
+
+        <label>Generated test WAV location if local (relative path)</label>
+            
       <div class="grid2">
         <input id="gen_out" value="data/sweepcass.wav" />
         <button onclick="openBrowser('gen_out', {mode:'file', exts:['.wav'], title:'Choose output WAV', allowNew:true})">Browse</button>
       </div>
-      <button onclick="doGen()">Generate</button>
-      <pre id="gen_log"></pre>
+        <button onclick="doGen()">Generate</button>
+        <div id="gen_file"></div>
+        <pre id="gen_log"></pre>
     </div>
 
     <div class="card">
-      <h3>detect</h3>
-      <label>WAV (relative path)</label>
+        <h3>2. Detect start/stop marker sequences from audio</h3>
+        <div class="small">
+            <p>Scans a WAV audio file for start/end DTMF marker positions.</p>
+            <p><b>ℹ️ This step is primarily intended as a fail-safe on your recorded audio file(s) to verify that they contain both the required start and stop DTMF marker sequences for synchronization.</b></p>
+            <p><b>⚠️ NOTE: if the required start and stop markers are NOT found during the marker detection phase, you (likely) cannot proceed with the analysis and should re-check your recorded audio file.</b></p>
+            <p>Running this step before the main analysis (3.) is highly recommended.</p>            
+        </div>
+        <label>Input WAV (click "Browse" to select file)</label>      
       <div class="grid2">
         <input id="detect_wav" placeholder="data/recorded.wav" />
         <button onclick="openBrowser('detect_wav', {mode:'file', exts:['.wav'], title:'Choose WAV'})">Browse</button>
@@ -1349,28 +1909,46 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <div class="card">
-      <h3>analyze</h3>
+    <h3>3. Analyze the audio; A/B comparison</h3>
+    
+    <div class="small">
+    <p>Compares the generated reference WAV against recorded playback and writes plots, CSVs and <code>summary.json</code>.</p>
 
-      <label>Run name (optional)</label>
+    <p><b>ℹ️ This is the main analysis step.</b> You are comparing the original reference test WAV from step 1 against the recorded WAV that came back through your signal path.</p>
+    <p><b>Important:</b> this software does <i>not</i> measure "just the cassette" in isolation unless your whole setup is designed for that on purpose. In normal use, it measures the <b>entire signal chain</b>: your playback device/interface, D/A conversion, cables, connectors, deck input stage, record level, tape path, playback stage, output stage, return cabling, A/D conversion, and any noise or level problems added along the way.</p>
+    <p>In other words: <b>what goes in vs. what comes back out</b>. The result is the sum of the whole path, not just one part of it.</p>
+    <p>Typical example: the reference WAV leaves your audio interface at a certain output level, gets converted from digital to analog, travels through your cabling into the deck, gets recorded at some chosen record level, and is then captured back to the computer either directly from the deck electronics or from actual tape playback. Every one of those stages can change the result.</p>
+    <p>⚠️ <b><i>Tip:</i> write down your output levels, record levels, deck settings, tape type, NR/Dolby state, and anything else relevant in the run notes for every test. If you change settings and do not document them, you are basically sabotaging your own comparison data.</b></p>
+    <p>With analog gear, the game is not "can degradation be avoided completely?" -- it usually can't. The real question is <b>how much</b> the signal changes, <b>where</b> it changes, and <b>which part of the chain is doing the damage</b>.</p>
+    <p>That means looking at things like frequency response changes, noise floor / SNR, channel imbalance, stereo mismatch, phase behaviour, distortion, and any loss of high-frequency content. Some loss may come from the tape and deck itself, but bad cables, bad grounding, poor gain staging, cheap converters, extra adapters, and unnecessary signal steps can also make things worse.</p>
+    <p>So start simple: use the cleanest possible setup, the best practical cabling, sensible levels, and as few extra stages as possible. Then test changes one at a time. If your setup is already a spaghetti nightmare, your measurements will faithfully report that nightmare back to you.</p>
+    <p>⛓️ A signal chain is only as good as its weakest link... and all the other crap right next to it.</p>
+    <p><b>Note:</b> playback of the test WAV and recording of the return signal are handled outside this WebUI. You can use a DAW, or any other reliable audio playback/recording software. However, <b>make sure</b> that the said setup does <b>not</b> resample, add effects, apply "enhancements", or mix in system sounds.</p>
+    </div>
+      
+      <label>🎢 <b>Run name</b> (optional)</label>
       <input id="an_name" placeholder="e.g.: this cassette => that deck" />
 
-      <label>Run notes (optional)</label>
+      <label>🗒 <b>Run notes</b> (optional)</label>
       <textarea id="an_notes" rows="7" placeholder="Long notes: deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
       
-      <label>Ref WAV</label>
+      <label>🅰️ <b>Reference WAV</b> (= original test reference audio)</label>
       <div class="grid2">
         <input id="an_ref" placeholder="data/sweepcass.wav" />
-        <button onclick="openBrowser('an_ref', {mode:'file', exts:['.wav'], title:'Choose ref WAV'})">Browse</button>
+        <button onclick="openBrowser('an_ref', {mode:'file', exts:['.wav'], title:'Choose reference WAV'})">Browse</button>
       </div>
 
-      <label>Recorded WAV</label>
+      <label>🅱️ <b>Recorded WAV</b> (= your recording of the original test reference audio)</label>
       <div class="grid2">
         <input id="an_rec" placeholder="data/recorded.wav" />
-        <button onclick="openBrowser('an_rec', {mode:'file', exts:['.wav'], title:'Choose recorded WAV'})">Browse</button>
+        <button onclick="openBrowser('an_rec', {mode:'file', exts:['.wav'], title:'Choose recorded WAV to use in comparison against the reference'})">Browse</button>
       </div>
 
-      <div class="block">
-        <h4>Markers (DTMF)</h4>
+        <div class="block">
+        <h4>Marker detection tuning (DTMF)</h4>
+        <div class="small">
+            Controls how aggressively the start/end marker finder listens for DTMF in noisy recordings.
+        </div>        
 
         <div class="row" style="align-items:flex-end;">
           <div style="flex:1; min-width:220px;">
@@ -1419,19 +1997,27 @@ INDEX_HTML = r"""<!doctype html>
         </details>
       </div>
       
-      <label>Loopback WAV (optional)</label>
+      <label>Loopback WAV (optional; not used in most cases; leave empty by default)</label>
       <div class="grid2">
         <input id="an_lb" placeholder="(none)" />
         <button onclick="openBrowser('an_lb', {mode:'file', exts:['.wav'], title:'Choose loopback WAV'})">Browse</button>
       </div>
 
-      <label>Outdir (relative path)</label>
+      <label>Output directory (relative path; don't change unless for some specific purpose)</label>
       <div class="grid2">
         <input id="an_outdir" value="data/cassette_results" />
         <button onclick="openBrowser('an_outdir', {mode:'dir', title:'Choose or create output directory', allowNew:true})">Browse</button>
       </div>
 
+      <hr></hr>
+      
+      <div class="small">
+      <p>Click on the "Analyze" button below when you are ready to start.</p>
+      <p>Note that the analysis may take some time.</p>
+      </div>      
+
       <button onclick="doAnalyze()">Analyze</button>
+
       <div id="an_header"></div>
 
       <div id="an_json">
@@ -1443,10 +2029,48 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
-  <div class="card">
+    <div class="card">
+    <h3>4. View previously saved analysis runs</h3>
+    <div class="small">
+        Browse previous analysis outputs, inspect notes, images and summary.json, and edit stored notes.
+    </div>
 
-      <h3>compare</h3>
-      <div class="small">Build a compare list of runs, then render a single high-res grid PNG (shared axes when CSV exists).</div>
+    <button onclick="refreshRuns()">Refresh list</button>
+    <label>Pick a run</label>
+    <select id="runs_sel" style="width:100%; padding:6px; margin-top:4px;">
+    <option value="">-- pick a run --</option>
+    </select>
+
+    <button onclick="loadSelectedRun()">Load run</button>
+    <div id="runs_header"></div>
+
+    <div style="margin-top:8px;">
+        <button id="runs_notes_edit_btn" onclick="runsEditNotes()" style="display:none">Edit notes</button>
+    </div>
+
+    <div id="runs_notes_ctl" class="block" style="display:none">
+        <h4>Edit notes</h4>
+        <textarea id="runs_notes_text" rows="7"
+        placeholder="Deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+        <button onclick="runsSaveNotes()">Save</button>
+        <button onclick="runsCancelNotes()">Cancel</button>
+        </div>
+        <div id="runs_notes_status" class="small"></div>
+    </div>
+
+    <div id="runs_json">
+        <pre id="runs_log"></pre>
+    </div>
+
+    <div id="runs_imgs"></div>
+    </div>
+
+  <div class="card">
+  <h3>5. Compare between previous analysis runs</h3>
+  <div class="small">
+    Builds one comparison figure from multiple saved runs. Uses CSV data when available so axes stay aligned.
+  </div>
 
       <button onclick="refreshCompareRuns()">Refresh runs</button>
 
@@ -1514,38 +2138,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="cmp_img"></div>
     </div>
 
-    <h3>runs</h3>
-    <div class="small">Browse previous analysis runs (reads run name from summary.json).</div>
-
-    <button onclick="refreshRuns()">Refresh list</button>
-    <label>Pick a run</label>
-    <select id="runs_sel" style="width:100%; padding:6px; margin-top:4px;"></select>
-
-    <button onclick="loadSelectedRun()">Load run</button>
-    <div id="runs_header"></div>
-
-    <div style="margin-top:8px;">
-      <button id="runs_notes_edit_btn" onclick="runsEditNotes()" style="display:none">Edit notes</button>
-    </div>
-
-    <div id="runs_notes_ctl" class="block" style="display:none">
-      <h4>Edit notes</h4>
-      <textarea id="runs_notes_text" rows="7"
-        placeholder="Deck, tape, settings, azimuth tweaks, Dolby/NR, weirdness..."></textarea>
-      <div style="display:flex; gap:8px; margin-top:8px;">
-        <button onclick="runsSaveNotes()">Save</button>
-        <button onclick="runsCancelNotes()">Cancel</button>
-      </div>
-      <div id="runs_notes_status" class="small"></div>
-    </div>
-    
-    <div id="runs_json">
-      <pre id="runs_log"></pre>
-    </div>
-
-    <div id="runs_imgs"></div>
-
-  </div>      
+  <!-- </div> -->
 
   <!-- Image viewer (fullscreen-ish) -->
   <div id="iv_backdrop" class="iv-backdrop" onclick="closeImgViewer()"></div>
@@ -1574,13 +2167,26 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <div class="modal-body">
-      <div class="modal-controls">
+
+        <div class="modal-controls">
         <button onclick="mbUp()">Up</button>
         <button onclick="mbHome()">Home</button>
         <input id="mb_q" placeholder="filter..." oninput="mbRefresh()" />
         <span id="mb_hint" class="muted"></span>
-      </div>
-      <div id="mb_list" class="modal-list"></div>
+        </div>
+
+        <div id="mb_upload_row" class="block" style="display:none; margin-top:8px;">
+        <h4 style="margin:0 0 8px 0;">Upload WAV</h4>
+        <div class="small">Upload a WAV from your browser into the currently open directory.</div>
+        <input id="mb_upload_file" type="file" accept=".wav,audio/wav" />
+        <div style="display:flex; gap:8px; margin-top:8px;">
+            <button onclick="mbUploadWav()">Upload</button>
+        </div>
+        <div id="mb_upload_status" class="small" style="margin-top:8px;"></div>
+        </div>
+
+        <div id="mb_list" class="modal-list"></div>
+
     </div>
   </div>
 
@@ -1681,11 +2287,18 @@ function _moveOption(selectFrom, selectTo, value, text) {
   selectTo.appendChild(opt);
 }
 
-async function refreshCompareRuns() {
+async function refreshCompareRuns(preselectDir) {
   try {
+    const avail = document.getElementById("cmp_avail");
+
+    // preserve old selections
+    const prevSelected = new Set(
+      Array.from(avail.selectedOptions || []).map(o => o.value)
+    );
+
     setLog("cmp_log", "loading runs...");
     const r = await apiGetJson("/api/runs");
-    const avail = document.getElementById("cmp_avail");
+
     let html = "";
     for (const it of (r.runs || [])) {
       const label = (it.label || it.dir || "");
@@ -1693,6 +2306,22 @@ async function refreshCompareRuns() {
       html += `<option value="${esc(val)}">${esc(label)}</option>`;
     }
     avail.innerHTML = html || "<option value=''>no runs found</option>";
+
+    // restore old selection if possible
+    for (const o of Array.from(avail.options || [])) {
+      if (prevSelected.has(o.value)) o.selected = true;
+    }
+
+    // optional explicit preselect
+    if (preselectDir) {
+      for (const o of Array.from(avail.options || [])) {
+        if (o.value === preselectDir) {
+          o.selected = true;
+          break;
+        }
+      }
+    }
+
     setLog("cmp_log", JSON.stringify(r, null, 2));
   } catch (e) {
     setLog("cmp_log", "ERROR: " + e.message);
@@ -1777,8 +2406,30 @@ async function doCompare() {
   }
 }
 
-function imgUrl(path) {
+function fileUrl(path) {
   return "/file?path=" + encodeURIComponent(path);
+}
+
+function downloadUrl(path) {
+  return "/download?path=" + encodeURIComponent(path);
+}
+
+function imgUrl(path) {
+  return fileUrl(path);
+}
+
+function fileActionTag(path) {
+  const openUrl = fileUrl(path);
+  const dlUrl = downloadUrl(path);
+  return `
+    <div class="block">
+      <div class="small"><span class="mono">${esc(path)}</span></div>
+      <div class="imglinks" style="margin-top:8px;">
+        <a class="imglink" href="${openUrl}" target="_blank" rel="noopener">Open ↗</a>
+        <a class="imglink" href="${dlUrl}">Download ⬇</a>
+      </div>
+    </div>
+  `;
 }
 
 function ivSetFit(fit) {
@@ -2059,11 +2710,11 @@ function openBrowser(targetId, opts) {
   MB.title = (opts && opts.title) ? opts.title : "Browse";
   MB.allowNew = !!(opts && opts.allowNew);
 
-  // Start in data/ if it exists server-side; server defaults to data anyway when dir=""
   MB.cwd = "";
 
   document.getElementById("mb_title").textContent = MB.title;
   document.getElementById("mb_q").value = "";
+  document.getElementById("mb_upload_status").textContent = "";
   document.getElementById("mb_hint").textContent =
     (MB.mode === "dir")
       ? "Pick a directory"
@@ -2082,6 +2733,7 @@ function closeBrowser() {
 
 async function mbRefresh() {
   if (!MB.open) return;
+
   const q = document.getElementById("mb_q").value || "";
   const params = new URLSearchParams();
   if (MB.cwd) params.set("dir", MB.cwd);
@@ -2093,21 +2745,15 @@ async function mbRefresh() {
   MB.cwd = st.cwd;
   document.getElementById("mb_path").textContent = st.cwd;
 
+  const canUploadWav =
+    MB.mode === "file" &&
+    (MB.exts.includes(".wav") || MB.exts.includes("wav"));
+
+  document.getElementById("mb_upload_row").style.display = canUploadWav ? "block" : "none";
+
   const list = document.getElementById("mb_list");
   let html = "";
 
-  // helper: join paths without making absolute
-  function joinPath(base, leaf) {
-    base = String(base || "");
-    leaf = String(leaf || "");
-    while (base.endsWith("/")) base = base.slice(0, -1);
-    while (leaf.startsWith("/")) leaf = leaf.slice(1);
-    if (!base || base === ".") return leaf;
-    if (!leaf) return base;
-    return base + "/" + leaf;
-  }
-
-  // Create-directory row (only when browsing dirs and allowNew=true)
   if (MB.allowNew && MB.mode === "dir") {
     html += "<div class='item'>"
          + "<div><span class='pill'>new</span> "
@@ -2117,7 +2763,6 @@ async function mbRefresh() {
          + "</div>";
   }
 
-  // Optional "use typed value" for allowNew outputs (gen out file)
   if (MB.allowNew && MB.mode === "file") {
     const current = document.getElementById(MB.targetId).value || "";
     html += "<div class='item'><div><span class='pill'>new</span> <span class='mono'>" + esc(current) + "</span></div>"
@@ -2128,14 +2773,20 @@ async function mbRefresh() {
   for (const it of st.entries) {
     const pill = it.is_dir ? "<span class='pill'>dir</span>" : "<span class='pill'>file</span>";
     const meta = it.is_dir ? "" : ("<span class='muted'>" + (it.size || 0) + " bytes</span>");
-    const btn = it.is_dir
-      ? `<button onclick='mbEnter(${jsq(it.path)})'>Open</button>`
-      : `<button onclick='mbPick(${jsq(it.path)})'>Pick</button>`;
+
+    let btns = "";
+    if (it.is_dir) {
+      btns = `<button onclick='mbEnter(${jsq(it.path)})'>Open</button>`;
+    } else {
+      btns =
+        `<button onclick='mbPick(${jsq(it.path)})'>Pick</button> ` +
+        `<a class="imglink" href="${downloadUrl(it.path)}">Download</a>`;
+    }
 
     html += "<div class='item'>"
          + "<div>" + pill + " <span class='mono'>" + esc(it.path) + "</span></div>"
          + "<div>" + meta + "</div>"
-         + "<div>" + btn + "</div>"
+         + "<div>" + btns + "</div>"
          + "</div>";
   }
 
@@ -2185,17 +2836,14 @@ async function mbCreateDir() {
     const nameRaw = (el ? el.value : "").trim();
     if (!nameRaw) return;
 
-    // Create relative to current browse directory
     const base = String(MB.cwd || "").trim();
 
-    // normalize: strip leading/trailing forward slashes
     let name = String(nameRaw);
     while (name.startsWith("/")) name = name.slice(1);
     while (name.endsWith("/")) name = name.slice(0, -1);
     name = name.trim();
     if (!name) return;
 
-    // basic safety: reject traversal or absolute-ish junk
     if (name.includes("..")) {
       alert("ERROR: '..' is not allowed");
       return;
@@ -2206,19 +2854,14 @@ async function mbCreateDir() {
     if (base && base !== ".") {
       let baseClean = String(base);
       while (baseClean.endsWith("/")) baseClean = baseClean.slice(0, -1);
-
-      // If base came back as ".", treat as root
       if (baseClean === ".") baseClean = "";
-
       path = baseClean ? (baseClean + "/" + name) : name;
     }
 
-    // one more sanity pass: collapse accidental double slashes
     while (path.includes("//")) path = path.replaceAll("//", "/");
 
     const r = await api("/api/mkdir", { path });
 
-    // Pick it into the target input and close
     document.getElementById(MB.targetId).value = (r && r.path) ? r.path : path;
     closeBrowser();
   } catch (e) {
@@ -2226,15 +2869,61 @@ async function mbCreateDir() {
   }
 }
 
+async function mbUploadWav() {
+  try {
+    const input = document.getElementById("mb_upload_file");
+    const status = document.getElementById("mb_upload_status");
+    if (!input || !input.files || !input.files.length) {
+      status.textContent = "Pick a WAV file first.";
+      return;
+    }
+
+    const file = input.files[0];
+    status.textContent = "uploading...";
+
+    const dir = (MB.cwd && MB.cwd !== ".") ? MB.cwd : "data";
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+
+    const r = await fetch("/api/upload_wav?dir=" + encodeURIComponent(dir), {
+      method: "POST",
+      body: fd
+    });
+
+    const t = await r.text();
+    let j = null;
+    try { j = JSON.parse(t); } catch (e) {}
+
+    if (!r.ok) {
+      const msg = (j && j.error) ? String(j.error) : String(t || "upload failed");
+      throw new Error(msg);
+    }
+
+    status.textContent =
+      `ok -- ${j.path} -- ${j.wav_info.sample_rate} Hz -- ${j.wav_info.channels} ch -- ${j.wav_info.duration_s.toFixed(2)} s`;
+
+    document.getElementById(MB.targetId).value = j.path;
+    await mbRefresh();
+  } catch (e) {
+    document.getElementById("mb_upload_status").textContent = "ERROR: " + e.message;
+  }
+}
 
 /* -------- actions -------- */
 
 async function doGen() {
   try {
     setLog("gen_log", "running...");
+    document.getElementById("gen_file").innerHTML = "";
+
     const out = document.getElementById("gen_out").value;
     const r = await api("/api/gen", { out });
+
     setLog("gen_log", r.log || JSON.stringify(r, null, 2));
+
+    if (r.out) {
+      document.getElementById("gen_file").innerHTML = fileActionTag(r.out);
+    }
   } catch (e) {
     setLog("gen_log", "ERROR: " + e.message);
   }
@@ -2374,37 +3063,82 @@ async function doAnalyze() {
     document.getElementById("an_imgs").innerHTML =
       renderImagesWithAnchors(r.summary, "an");
 
+    const newRunDir =
+      (((r || {}).summary || {}).run || {}).outdir || "";
+
+    await refreshRuns({
+      preselectDir: newRunDir,
+      autoload: true,
+      preserveSelection: false
+    });
+
+    await refreshCompareRuns(newRunDir);
+
   } catch (e) {
     setLog("an_log", "ERROR: " + e.message);
   }
 }
 
-async function refreshRuns() {
+async function refreshRuns(opts) {
   try {
-    // reset context + editor UI
+    const cfg = opts || {};
+    const preselectDir = cfg.preselectDir || "";
+    const autoload = !!cfg.autoload;
+    const preserveSelection = (cfg.preserveSelection !== false);
+    const placeholder = !!cfg.placeholder;
+
+    const sel = document.getElementById("runs_sel");
+    const prevValue = preserveSelection ? (sel.value || "") : "";
+
+    // reset editor UI
     RUNS_CTX.dir = "";
     RUNS_CTX.summary = null;
     document.getElementById("runs_notes_ctl").style.display = "none";
     document.getElementById("runs_notes_status").textContent = "";
     document.getElementById("runs_notes_edit_btn").style.display = "none";
 
-    // clear stale displayed run (header + images) right away
+    // clear stale displayed run right away
     document.getElementById("runs_header").innerHTML = "";
     document.getElementById("runs_imgs").innerHTML = "";
     setLog("runs_log", "loading...");
 
     const r = await apiGetJson("/api/runs");
-    const sel = document.getElementById("runs_sel");
 
     let html = "";
-    for (const it of (r.runs || [])) {
-      const label = (it.label || it.dir || "");
-      const val = it.dir || "";
-      html += `<option value="${esc(val)}">${esc(label)}</option>`;
+
+    if (placeholder) {
+    html += `<option value="">-- pick a run --</option>`;
     }
+
+    for (const it of (r.runs || [])) {
+    const label = (it.label || it.dir || "");
+    const val = it.dir || "";
+    html += `<option value="${esc(val)}">${esc(label)}</option>`;
+    }
+
     sel.innerHTML = html || "<option value=''>no runs found</option>";
 
+    // choose best selection
+    const values = Array.from(sel.options || []).map(o => o.value);
+    let chosen = "";
+
+    if (preselectDir && values.includes(preselectDir)) {
+    chosen = preselectDir;
+    } else if (prevValue && values.includes(prevValue)) {
+    chosen = prevValue;
+    } else if (autoload && values.length && values[0]) {
+    chosen = values[0];
+    }
+
+    if (chosen) {
+      sel.value = chosen;
+    }
+
     setLog("runs_log", JSON.stringify(r, null, 2));
+
+    if (autoload && chosen) {
+      await loadSelectedRun();
+    }
   } catch (e) {
     setLog("runs_log", "ERROR: " + e.message);
   }
@@ -2454,9 +3188,25 @@ document.getElementById("dtmf_preset").addEventListener("change", (e) => {
   applyDtmfPreset(e.target.value);
 });
 
-// Init defaults on load
-initDtmfPresetSelect();
-applyDtmfPreset(document.getElementById("dtmf_preset").value);
+// init page function
+async function initPage() {
+  try {
+    await refreshCompareRuns();
+    await refreshRuns({
+      autoload: false,
+      preserveSelection: false,
+      placeholder: true
+    });
+  } catch (e) {
+    console.log("initPage error:", e);
+  }
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  initDtmfPresetSelect();
+  applyDtmfPreset(document.getElementById("dtmf_preset").value);
+  initPage();
+});
 
 // Make inline onclick= handlers work no matter what scope rules apply
 Object.assign(window, {
@@ -2473,6 +3223,7 @@ Object.assign(window, {
   mbPick,
   mbPickValue,
   mbCreateDir,
+  mbUploadWav,
   mbRefresh,
   runsEditNotes,
   runsSaveNotes,
@@ -2499,13 +3250,17 @@ console.log("webui script loaded; handlers exported to window");
 class Handler(BaseHTTPRequestHandler):
     server_version = "cassette-calibrator-webui/0.2"
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
         self.send_response(code)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+
+        for k, v in (headers or {}).items():
+            self.send_header(str(k), str(v))
+
         self.end_headers()
         self.wfile.write(body)
 
@@ -2633,17 +3388,30 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(404, {"error": "file not found"})
                     return
 
-                suf = full.suffix.lower()
-                if suf == ".png":
-                    self._send(200, full.read_bytes(), "image/png")
-                elif suf == ".csv":
-                    self._send(200, full.read_bytes(), "text/csv; charset=utf-8")
-                elif suf == ".json":
-                    self._send(200, full.read_bytes(), "application/json; charset=utf-8")
-                elif suf == ".wav":
-                    self._send(200, full.read_bytes(), "audio/wav")
-                else:
-                    self._send(200, full.read_bytes(), "application/octet-stream")
+                self._send(200, full.read_bytes(), _guess_ctype(full))
+                return
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+                return
+
+        if u.path == "/download":
+            qs = parse_qs(u.query)
+            p = (qs.get("path", [""])[0] or "").strip()
+            try:
+                rel = _rel_to_root_checked(p)
+                full = (ROOT / rel)
+                if not full.exists() or not full.is_file():
+                    self._json(404, {"error": "file not found"})
+                    return
+
+                self._send(
+                    200,
+                    full.read_bytes(),
+                    _guess_ctype(full),
+                    headers={
+                        "Content-Disposition": _content_disposition_attachment(full.name),
+                    },
+                )
                 return
             except Exception as e:
                 self._json(400, {"error": str(e)})
@@ -2651,9 +3419,16 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(404, {"error": "not found"})
 
-    def _read_json_body(self) -> dict:
+    def _read_body_bytes(self) -> bytes:
         n = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(n) if n > 0 else b"{}"
+        if n < 0:
+            raise ValueError("invalid Content-Length")
+        if n > MAX_UPLOAD_BYTES:
+            raise ValueError(f"upload too large (max {MAX_UPLOAD_BYTES} bytes)")
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _read_json_body(self) -> dict:
+        raw = self._read_body_bytes() or b"{}"
         try:
             obj = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -2662,14 +3437,57 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_POST(self) -> None:
         u = urlparse(self.path)
-        payload = self._read_json_body()
-
-        LOG.info("POST %s -- parsed payload keys=%s", u.path, sorted(payload.keys()))
 
         try:
             cfg = self.server.cfg  # type: ignore[attr-defined]
         except Exception:
             cfg = {}
+
+        # multipart upload route must read raw bytes before JSON parsing
+        if u.path == "/api/upload_wav":
+            try:
+                qs = parse_qs(u.query)
+                dir_in = (qs.get("dir", ["data"])[0] or "data").strip()
+                rel_dir = _ensure_outdir_rel(dir_in)
+                target_dir = ROOT / rel_dir
+
+                content_type = self.headers.get("Content-Type", "")
+                raw = self._read_body_bytes()
+                form = _parse_multipart_form(content_type, raw)
+
+                file_obj = form.get("files", {}).get("file")
+                if not isinstance(file_obj, dict):
+                    raise ValueError("missing upload field 'file'")
+
+                orig_name = str(file_obj.get("filename", "") or "").strip()
+                safe_name = _safe_upload_filename(orig_name, allowed_exts=UPLOAD_EXTS)
+
+                tmp_path = target_dir / f".upload-{time.time_ns()}.tmp"
+                tmp_path.write_bytes(file_obj.get("data", b""))
+
+                try:
+                    wav_info = _validate_uploaded_wav(tmp_path)
+                    final_path = _unique_file_path(target_dir, safe_name)
+                    tmp_path.replace(final_path)
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        tmp_path.unlink()
+                    raise
+
+                rel_final = str(final_path.relative_to(ROOT))
+                self._json(200, {
+                    "ok": True,
+                    "path": rel_final,
+                    "name": final_path.name,
+                    "wav_info": wav_info,
+                })
+                return
+            except Exception as e:
+                self._json(400, {"ok": False, "error": str(e)})
+                return
+
+        payload = self._read_json_body()
+        LOG.info("POST %s -- parsed payload keys=%s", u.path, sorted(payload.keys()))
 
         if u.path == "/api/mkdir":
             try:

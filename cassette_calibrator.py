@@ -142,17 +142,17 @@ Run: cassette_calibrator.py <command> --help  for full options.
 # Config loaders & helpers
 # -------------------------
 
-def _scan_argv_value(argv: List[str], opt: str) -> Optional[str]:
-    """
-    Find --opt VALUE or --opt=VALUE anywhere in argv.
-    """
-    for i, a in enumerate(argv):
-        if a == opt and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith(opt + "="):
-            return a.split("=", 1)[1]
-    return None
-
+# ## / unused in current config loading
+# def _scan_argv_value(argv: List[str], opt: str) -> Optional[str]:
+#     """
+#     Find --opt VALUE or --opt=VALUE anywhere in argv.
+#     """
+#     for i, a in enumerate(argv):
+#         if a == opt and i + 1 < len(argv):
+#             return argv[i + 1]
+#         if a.startswith(opt + "="):
+#             return a.split("=", 1)[1]
+#     return None
 
 def deep_merge_dict(a: dict, b: dict) -> dict:
     """
@@ -200,17 +200,64 @@ def load_toml_config(path: Optional[str]) -> dict:
         raise SystemExit(f"Failed to read TOML config '{cfg_path}': {e}")
 
 
-def _normalize_marker_channel(v: str) -> str:
+def _normalize_marker_channel(v: str, *, cmd: str, key: str) -> str:
     s = str(v).strip().lower()
-    if s in ["mono"]:
+
+    if s == "mono":
         return "mono"
-    if s in ["l", "left"]:
+    if s in {"l", "left"}:
         return "L"
-    if s in ["r", "right"]:
+    if s in {"r", "right"}:
         return "R"
-    return str(v)
+
+    raise SystemExit(
+        f"Invalid config value for [{cmd}].{key}: {v!r} "
+        f"(allowed: mono, L/left, R/right)"
+    )
+
+def _normalize_choice(value, allowed: set[str], *, cmd: str, key: str) -> str:
+    s = str(value).strip().lower()
+    if s not in allowed:
+        allowed_s = ", ".join(sorted(allowed))
+        raise SystemExit(
+            f"Invalid config value for [{cmd}].{key}: {value!r} "
+            f"(allowed: {allowed_s})"
+        )
+    return s
 
 
+def _normalize_boolish(value, *, cmd: str, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise SystemExit(
+            f"Invalid config value for [{cmd}].{key}: {value!r} "
+            f"(expected true/false or 0/1)"
+        )
+
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+
+    raise SystemExit(
+        f"Invalid config value for [{cmd}].{key}: {value!r} "
+        f"(expected true/false)"
+    )
+
+
+def _normalize_analyze_channels(value, *, cmd: str, key: str) -> str:
+    try:
+        return parse_channels(str(value))
+    except argparse.ArgumentTypeError as e:
+        raise SystemExit(
+            f"Invalid config value for [{cmd}].{key}: {e}"
+        )
+    
 def flatten_cmd_defaults(cmd: str, section: dict) -> dict:
     """
     Turn a TOML section into argparse defaults (flat dict of dest->value).
@@ -248,16 +295,67 @@ def flatten_cmd_defaults(cmd: str, section: dict) -> dict:
     # -----------------------------
     # Small normalizations so config can be forgiving
     # -----------------------------
-    if cmd in ["detect", "analyze"] and "marker_channel" in out:
-        out["marker_channel"] = _normalize_marker_channel(out["marker_channel"])
+    if cmd in {"detect", "analyze"} and "marker_channel" in out:
+        out["marker_channel"] = _normalize_marker_channel(
+            out["marker_channel"],
+            cmd=cmd,
+            key="marker_channel",
+        )
+
     if cmd == "detect" and "channel" in out:
-        out["channel"] = _normalize_marker_channel(out["channel"])
+        out["channel"] = _normalize_marker_channel(
+            out["channel"],
+            cmd=cmd,
+            key="channel",
+        )
+
     if cmd == "analyze" and "channels" in out:
-        # Config injection bypasses argparse type=parse_channels, so normalize here.
-        out["channels"] = parse_channels(str(out["channels"]))
+        out["channels"] = _normalize_analyze_channels(
+            out["channels"],
+            cmd=cmd,
+            key="channels",
+        )
+
+    if cmd == "compare":
+        if "channels" in out:
+            out["channels"] = _normalize_choice(
+                out["channels"],
+                {"lr-overlay", "mono", "l", "r", "lr-diff", "diff"},
+                cmd=cmd,
+                key="channels",
+            )
+
+        if "layout" in out:
+            out["layout"] = _normalize_choice(
+                out["layout"],
+                {"grid", "overlay"},
+                cmd=cmd,
+                key="layout",
+            )
+
+        if "norm" in out:
+            out["norm"] = _normalize_choice(
+                out["norm"],
+                {"none", "1k", "midband"},
+                cmd=cmd,
+                key="norm",
+            )
+
+        if "shared_axes" in out:
+            out["shared_axes"] = _normalize_boolish(
+                out["shared_axes"],
+                cmd=cmd,
+                key="shared_axes",
+            )
+
+        if "legend" in out:
+            out["legend"] = _normalize_boolish(
+                out["legend"],
+                cmd=cmd,
+                key="legend",
+            )
 
     return out
-
 
 def apply_config_to_subparser(cmd_parser: argparse.ArgumentParser, defaults: dict, *, label: str = "") -> None:
     """
@@ -662,25 +760,26 @@ def parse_channels(s: str) -> str:
         raise argparse.ArgumentTypeError("invalid --channels (use mono|stereo|l|r; aliases: left/right/lr/l+r)")
     return aliases[s]
 
-def _strip_known_opts(argv: List[str], opts: List[str]) -> List[str]:
-    out = []
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        matched = False
-        for opt in opts:
-            if a == opt:
-                i += 2  # drop opt + value
-                matched = True
-                break
-            if a.startswith(opt + "="):
-                i += 1  # drop opt=value
-                matched = True
-                break
-        if not matched:
-            out.append(a)
-            i += 1
-    return out
+# ## // unused in current option parsing
+# def _strip_known_opts(argv: List[str], opts: List[str]) -> List[str]:
+#     out = []
+#     i = 0
+#     while i < len(argv):
+#         a = argv[i]
+#         matched = False
+#         for opt in opts:
+#             if a == opt:
+#                 i += 2  # drop opt + value
+#                 matched = True
+#                 break
+#             if a.startswith(opt + "="):
+#                 i += 1  # drop opt=value
+#                 matched = True
+#                 break
+#         if not matched:
+#             out.append(a)
+#             i += 1
+#     return out
 
 # -------------------------
 # DTMF markers
@@ -1017,8 +1116,13 @@ def analyze_chain(
     fmax: float,
 ) -> AnalysisResult:
     # Frequency-domain transfer-function estimate:
-    # H(f) = R(f) * conj(S(f)) / (|S(f)|^2 + eps)
-    # This guarantees: if rec_sweep == ref_sweep, then H == 1 (flat), numerically.
+    # H(f) = R(f) / S(f), implemented as:
+    #   H(f) = R(f) * conj(S(f)) / |S(f)|^2
+    # on bins where the reference sweep has enough energy.
+    #
+    # We avoid a global additive regularization floor here, because that biases
+    # self-loop measurements (rec == ref) slightly below 0 dB, especially near
+    # weak-energy edge bins.
 
     eps = EPS
 
@@ -1039,16 +1143,29 @@ def analyze_chain(
     S = np.fft.rfft(ref_sweep, n=nfft)
     R = np.fft.rfft(rec_sweep, n=nfft)
 
-    denom = (np.abs(S) ** 2).astype(np.float64)
-    floor = 1e-6 * float(np.max(denom) + 1e-24)  # relative regularization
-    H = (R * np.conj(S)) / (denom + floor)
+    power = (np.abs(S) ** 2).astype(np.float64)
+    power_floor = 1e-12 * float(np.max(power) + 1e-24)
+    valid = power > power_floor
+
+    H = np.zeros_like(S, dtype=np.complex128)
+    H[valid] = (R[valid] * np.conj(S[valid])) / power[valid]
 
     freq_full = np.fft.rfftfreq(nfft, 1.0 / sr)
     mag_lin_full = np.abs(H).astype(np.float32)
 
-    m = (freq_full >= fmin) & (freq_full <= fmax)
+    f_hi = min(float(fmax), float(f2))
+    m = (freq_full >= fmin) & (freq_full <= f_hi)
+
     freq = freq_full[m].astype(np.float32)
     mag_lin = mag_lin_full[m].astype(np.float32)
+
+    # Drop only the terminal edge bin if it lands at/very near the requested top edge.
+    # That point is the least trustworthy and can make the self-loop plot look fake-wonky.
+    if freq.size >= 2:
+        bin_w = float(freq[-1] - freq[-2])
+        if float(freq[-1]) >= (f_hi - 0.5 * bin_w):
+            freq = freq[:-1]
+            mag_lin = mag_lin[:-1]
 
     mag = 20.0 * np.log10(np.maximum(mag_lin, eps))
 
@@ -1058,14 +1175,12 @@ def analyze_chain(
     else:
         mag_s = mag.copy()
 
-    # 1 kHz-ish normalization (keep the behavior)
     refband = (freq >= 900.0) & (freq <= 1100.0)
     if np.any(refband):
         off = float(np.median(mag[refband]))
         mag = mag - off
         mag_s = mag_s - off
 
-    # Optional: derive an IR preview from H for impulse.png
     ir_full = np.fft.irfft(H, n=nfft).astype(np.float32)
     peak_i = int(np.argmax(np.abs(ir_full))) if ir_full.size else 0
     win = int(max(32, round(ir_win_s * sr)))
@@ -1868,7 +1983,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
         ax.set_ylabel("Magnitude (dB, smoothed)")
-        ax.set_title(f"{title_prefix}Cassette chain magnitude response ({ch})")
+        ax.set_title(f"{title_prefix}Signal chain magnitude response ({ch})")
         fig.tight_layout()
         fig.savefig(outdir / f"response{out_suffix(ch)}.png", dpi=150)
         plt.close(fig)
@@ -1882,7 +1997,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
             ax.set_ylabel("Difference (dB, smoothed)")
-            ax.set_title(f"{title_prefix}Cassette chain minus loopback ({ch})")
+            ax.set_title(f"{title_prefix}Signal chain minus loopback ({ch})")
             fig.tight_layout()
             fig.savefig(outdir / f"difference{out_suffix(ch)}.png", dpi=150)
             plt.close(fig)
@@ -2357,592 +2472,6 @@ def cmd_compare(args: argparse.Namespace) -> None:
     print(f"Wrote: {out_path}")
 
 # -------------------------
-# Compare (multi-run plots)
-# -------------------------
-
-def _read_json(path: Path) -> Optional[dict]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-def _read_response_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """
-    Reads response*.csv produced by analyze:
-      freq_hz, mag_db, mag_db_s, [diff_db_s]
-    Returns (freq, mag_db_s, diff_db_s_or_None)
-    """
-    freq: List[float] = []
-    mag_s: List[float] = []
-    diff_s: List[float] = []
-
-    with path.open("r", encoding="utf-8", newline="") as f:
-        r = csv.DictReader(f)
-        has_diff = ("diff_db_s" in (r.fieldnames or []))
-        for row in r:
-            try:
-                freq.append(float(row["freq_hz"]))
-                mag_s.append(float(row["mag_db_s"]))
-                if has_diff:
-                    diff_s.append(float(row["diff_db_s"]))
-            except Exception:
-                continue
-
-    f_arr = np.asarray(freq, dtype=np.float32)
-    y_arr = np.asarray(mag_s, dtype=np.float32)
-    d_arr = np.asarray(diff_s, dtype=np.float32) if diff_s else None
-    return f_arr, y_arr, d_arr
-
-def _pick_run_label(run_dir: Path, meta: Optional[dict], *, max_len: int = 90) -> str:
-    """
-    Prefer summary.json run.name; fallback to directory name.
-    """
-    label = None
-    if isinstance(meta, dict):
-        run = meta.get("run")
-        if isinstance(run, dict):
-            label = run.get("name") or run.get("id")
-    if not label:
-        label = run_dir.name
-    label = str(label).strip()
-    if len(label) > max_len:
-        label = label[: max_len - 3].rstrip() + "..."
-    return label
-
-def _apply_norm_db(freq: np.ndarray, y_db: np.ndarray, norm: str, band: Tuple[float, float]) -> np.ndarray:
-    """
-    norm:
-      - "none": do nothing
-      - "1k": subtract median within 900..1100 Hz
-      - "midband": subtract median within band (e.g. 200..2000)
-    """
-    norm = (norm or "none").strip().lower()
-    y = np.asarray(y_db, dtype=np.float32)
-
-    if norm == "none":
-        return y
-
-    if norm == "1k":
-        lo, hi = 900.0, 1100.0
-    else:  # midband
-        lo, hi = float(band[0]), float(band[1])
-
-    m = (freq >= lo) & (freq <= hi)
-    if not np.any(m):
-        return y
-
-    off = float(np.median(y[m]))
-    return (y - off).astype(np.float32)
-
-def _load_run_series(run_dir: Path, mode: str) -> dict:
-    """
-    mode:
-      - "lr-overlay": returns {"L": (f,y), "R": (f,y)} if available else falls back
-      - "mono": {"mono": (f,y)}
-      - "l": {"L": (f,y)}
-      - "r": {"R": (f,y)}
-      - "lr-diff": {"LR": (f, yL-yR)} (computed)
-      - "diff": {"diff": (f, diff_db_s)} if present in csv, else error
-    """
-    mode = (mode or "lr-overlay").strip().lower()
-
-    def p(name: str) -> Path:
-        return run_dir / name
-
-    out = {}
-
-    # mono
-    if mode == "mono":
-        csvp = p("response.csv")
-        if not csvp.exists():
-            # fallback: if only L exists, use L as mono-ish
-            csvp = p("response_l.csv") if p("response_l.csv").exists() else csvp
-        if not csvp.exists():
-            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
-        f, y, _ = _read_response_csv(csvp)
-        out["mono"] = (f, y)
-        return out
-
-    # L-only
-    if mode == "l":
-        csvp = p("response_l.csv")
-        if not csvp.exists():
-            raise FileNotFoundError(f"Missing response_l.csv in {run_dir}")
-        f, y, _ = _read_response_csv(csvp)
-        out["L"] = (f, y)
-        return out
-
-    # R-only
-    if mode == "r":
-        csvp = p("response_r.csv")
-        if not csvp.exists():
-            raise FileNotFoundError(f"Missing response_r.csv in {run_dir}")
-        f, y, _ = _read_response_csv(csvp)
-        out["R"] = (f, y)
-        return out
-
-    # L/R overlay
-    if mode == "lr-overlay":
-        has_l = p("response_l.csv").exists()
-        has_r = p("response_r.csv").exists()
-        if has_l and has_r:
-            fL, yL, _ = _read_response_csv(p("response_l.csv"))
-            fR, yR, _ = _read_response_csv(p("response_r.csv"))
-            out["L"] = (fL, yL)
-            out["R"] = (fR, yR)
-            return out
-        # fallback to mono response
-        return _load_run_series(run_dir, "mono")
-
-    # L-R diff (computed)
-    if mode == "lr-diff":
-        has_l = p("response_l.csv").exists()
-        has_r = p("response_r.csv").exists()
-        if not (has_l and has_r):
-            raise FileNotFoundError(f"Need response_l.csv + response_r.csv for lr-diff in {run_dir}")
-        fL, yL, _ = _read_response_csv(p("response_l.csv"))
-        fR, yR, _ = _read_response_csv(p("response_r.csv"))
-        if len(fR) != len(fL) or not np.allclose(fR, fL):
-            yR_i = np.interp(fL, fR, yR).astype(np.float32)
-        else:
-            yR_i = yR
-        out["LR"] = (fL, (yL - yR_i).astype(np.float32))
-        return out
-
-    # Loopback-subtracted diff from csv if present
-    if mode == "diff":
-        # diff_db_s exists only if analyze used loopback
-        # prefer mono, else L
-        cand = [p("response.csv"), p("response_l.csv"), p("response_r.csv")]
-        csvp = next((c for c in cand if c.exists()), None)
-        if csvp is None:
-            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
-        f, _y, d = _read_response_csv(csvp)
-        if d is None:
-            raise FileNotFoundError(f"No diff_db_s column found (did you analyze with --loopback?) in {run_dir}")
-        out["diff"] = (f, d.astype(np.float32))
-        return out
-
-    raise ValueError(f"Unknown compare mode: {mode}")
-
-def cmd_compare(args: argparse.Namespace) -> None:
-    runs = [Path(r).expanduser() for r in args.runs]
-    if args.max_runs and len(runs) > int(args.max_runs):
-        runs = runs[: int(args.max_runs)]
-
-    # Validate + load meta early
-    metas: List[Optional[dict]] = []
-    for rd in runs:
-        if not rd.exists() or not rd.is_dir():
-            raise SystemExit(f"Run directory not found: {rd}")
-        metas.append(_read_json(rd / "summary.json"))
-
-    # Load series
-    series_by_run = []
-    labels = []
-    for rd, meta in zip(runs, metas):
-        s = _load_run_series(rd, args.channels)
-        labels.append(_pick_run_label(rd, meta))
-        series_by_run.append(s)
-
-    # Optional normalization (applied per run, per trace)
-    norm = str(args.norm).strip().lower()
-    band = (float(args.norm_band[0]), float(args.norm_band[1]))
-
-    series_by_run_n = []
-    for s in series_by_run:
-        s2 = {}
-        for k, (f, y) in s.items():
-            y2 = _apply_norm_db(f, y, norm, band)
-            s2[k] = (f, y2)
-        series_by_run_n.append(s2)
-
-    # Shared axis limits (by default)
-    x0, x1 = float(args.xlim[0]), float(args.xlim[1])
-    y0, y1 = float(args.ylim[0]), float(args.ylim[1])
-
-    out_path = Path(args.out).expanduser()
-    ensure_dir(out_path.parent if out_path.parent != Path(".") else Path("."))
-
-    layout = str(args.layout).strip().lower()
-    shared = bool(getattr(args, "shared_axes", True))
-
-    if layout == "overlay":
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.grid(True, which="both")
-        ax.set_xscale("log")
-
-        for label, s in zip(labels, series_by_run_n):
-            # Plot each trace with a label prefix
-            for k, (f, y) in s.items():
-                ax.semilogx(f, y, label=f"{label} -- {k}")
-
-        apply_audio_freq_ticks(ax, x0, x1)
-        ax.set_ylim(y0, y1)
-        ax.set_ylabel("Magnitude (dB, smoothed)")
-        ax.set_title(args.title or "Cassette chain comparison")
-        if bool(getattr(args, "legend", True)):
-            ax.legend(loc="best", frameon=False)
-
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=int(args.dpi))
-        plt.close(fig)
-        print(f"Wrote: {out_path}")
-        return
-
-    # grid layout (default): 2x2 for up to 4, otherwise roughly square
-    n = len(runs)
-    if n <= 4:
-        cols = 2
-    else:
-        cols = int(math.ceil(math.sqrt(n)))
-    rows = int(math.ceil(n / cols))
-
-    fig, axs = plt.subplots(
-        rows, cols,
-        figsize=(cols * 7, rows * 4.6),
-        sharex=shared,
-        sharey=shared,
-    )
-    axs = np.asarray(axs).reshape(-1)
-
-    for i, ax in enumerate(axs):
-        if i >= n:
-            ax.axis("off")
-            continue
-
-        ax.grid(True, which="both")
-        ax.set_xscale("log")
-        apply_audio_freq_ticks(ax, x0, x1)
-        ax.set_ylim(y0, y1)
-        ax.set_ylabel("Magnitude (dB, smoothed)")
-
-        ax.set_title(labels[i])
-
-        s = series_by_run_n[i]
-
-        # Plot traces
-        if args.channels == "lr-overlay":
-            # Prefer consistent L/R ordering
-            if "L" in s:
-                f, y = s["L"]
-                ax.semilogx(f, y, label="Left (L)")
-            if "R" in s:
-                f, y = s["R"]
-                ax.semilogx(f, y, label="Right (R)")
-            if "mono" in s and ("L" not in s and "R" not in s):
-                f, y = s["mono"]
-                ax.semilogx(f, y, label="Mono")
-        else:
-            # single trace plot
-            for k, (f, y) in s.items():
-                ax.semilogx(f, y, label=k)
-
-        if bool(getattr(args, "legend", True)):
-            ax.legend(loc="best", frameon=False)
-
-    if args.title:
-        fig.suptitle(str(args.title), y=0.995)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=int(args.dpi))
-    plt.close(fig)
-    print(f"Wrote: {out_path}")
-
-# -------------------------
-# Compare (multi-run plots)
-# -------------------------
-
-def _read_json(path: Path) -> Optional[dict]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-def _read_response_csv(path: Path) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """
-    Reads response*.csv produced by analyze:
-      freq_hz, mag_db, mag_db_s, [diff_db_s]
-    Returns (freq, mag_db_s, diff_db_s_or_None)
-    """
-    freq: List[float] = []
-    mag_s: List[float] = []
-    diff_s: List[float] = []
-
-    with path.open("r", encoding="utf-8", newline="") as f:
-        r = csv.DictReader(f)
-        has_diff = ("diff_db_s" in (r.fieldnames or []))
-        for row in r:
-            try:
-                freq.append(float(row["freq_hz"]))
-                mag_s.append(float(row["mag_db_s"]))
-                if has_diff:
-                    diff_s.append(float(row["diff_db_s"]))
-            except Exception:
-                continue
-
-    f_arr = np.asarray(freq, dtype=np.float32)
-    y_arr = np.asarray(mag_s, dtype=np.float32)
-    d_arr = np.asarray(diff_s, dtype=np.float32) if diff_s else None
-    return f_arr, y_arr, d_arr
-
-def _pick_run_label(run_dir: Path, meta: Optional[dict], *, max_len: int = 90) -> str:
-    """
-    Prefer summary.json run.name; fallback to directory name.
-    """
-    label = None
-    if isinstance(meta, dict):
-        run = meta.get("run")
-        if isinstance(run, dict):
-            label = run.get("name") or run.get("id")
-    if not label:
-        label = run_dir.name
-    label = str(label).strip()
-    if len(label) > max_len:
-        label = label[: max_len - 3].rstrip() + "..."
-    return label
-
-def _apply_norm_db(freq: np.ndarray, y_db: np.ndarray, norm: str, band: Tuple[float, float]) -> np.ndarray:
-    """
-    norm:
-      - "none": do nothing
-      - "1k": subtract median within 900..1100 Hz
-      - "midband": subtract median within band (e.g. 200..2000)
-    """
-    norm = (norm or "none").strip().lower()
-    y = np.asarray(y_db, dtype=np.float32)
-
-    if norm == "none":
-        return y
-
-    if norm == "1k":
-        lo, hi = 900.0, 1100.0
-    else:  # midband
-        lo, hi = float(band[0]), float(band[1])
-
-    m = (freq >= lo) & (freq <= hi)
-    if not np.any(m):
-        return y
-
-    off = float(np.median(y[m]))
-    return (y - off).astype(np.float32)
-
-def _load_run_series(run_dir: Path, mode: str) -> dict:
-    """
-    mode:
-      - "lr-overlay": returns {"L": (f,y), "R": (f,y)} if available else falls back
-      - "mono": {"mono": (f,y)}
-      - "l": {"L": (f,y)}
-      - "r": {"R": (f,y)}
-      - "lr-diff": {"LR": (f, yL-yR)} (computed)
-      - "diff": {"diff": (f, diff_db_s)} if present in csv, else error
-    """
-    mode = (mode or "lr-overlay").strip().lower()
-
-    def p(name: str) -> Path:
-        return run_dir / name
-
-    out = {}
-
-    # mono
-    if mode == "mono":
-        csvp = p("response.csv")
-        if not csvp.exists():
-            # fallback: if only L exists, use L as mono-ish
-            csvp = p("response_l.csv") if p("response_l.csv").exists() else csvp
-        if not csvp.exists():
-            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
-        f, y, _ = _read_response_csv(csvp)
-        out["mono"] = (f, y)
-        return out
-
-    # L-only
-    if mode == "l":
-        csvp = p("response_l.csv")
-        if not csvp.exists():
-            raise FileNotFoundError(f"Missing response_l.csv in {run_dir}")
-        f, y, _ = _read_response_csv(csvp)
-        out["L"] = (f, y)
-        return out
-
-    # R-only
-    if mode == "r":
-        csvp = p("response_r.csv")
-        if not csvp.exists():
-            raise FileNotFoundError(f"Missing response_r.csv in {run_dir}")
-        f, y, _ = _read_response_csv(csvp)
-        out["R"] = (f, y)
-        return out
-
-    # L/R overlay
-    if mode == "lr-overlay":
-        has_l = p("response_l.csv").exists()
-        has_r = p("response_r.csv").exists()
-        if has_l and has_r:
-            fL, yL, _ = _read_response_csv(p("response_l.csv"))
-            fR, yR, _ = _read_response_csv(p("response_r.csv"))
-            out["L"] = (fL, yL)
-            out["R"] = (fR, yR)
-            return out
-        # fallback to mono response
-        return _load_run_series(run_dir, "mono")
-
-    # L-R diff (computed)
-    if mode == "lr-diff":
-        has_l = p("response_l.csv").exists()
-        has_r = p("response_r.csv").exists()
-        if not (has_l and has_r):
-            raise FileNotFoundError(f"Need response_l.csv + response_r.csv for lr-diff in {run_dir}")
-        fL, yL, _ = _read_response_csv(p("response_l.csv"))
-        fR, yR, _ = _read_response_csv(p("response_r.csv"))
-        if len(fR) != len(fL) or not np.allclose(fR, fL):
-            yR_i = np.interp(fL, fR, yR).astype(np.float32)
-        else:
-            yR_i = yR
-        out["LR"] = (fL, (yL - yR_i).astype(np.float32))
-        return out
-
-    # Loopback-subtracted diff from csv if present
-    if mode == "diff":
-        # diff_db_s exists only if analyze used loopback
-        # prefer mono, else L
-        cand = [p("response.csv"), p("response_l.csv"), p("response_r.csv")]
-        csvp = next((c for c in cand if c.exists()), None)
-        if csvp is None:
-            raise FileNotFoundError(f"Missing response CSV in {run_dir}")
-        f, _y, d = _read_response_csv(csvp)
-        if d is None:
-            raise FileNotFoundError(f"No diff_db_s column found (did you analyze with --loopback?) in {run_dir}")
-        out["diff"] = (f, d.astype(np.float32))
-        return out
-
-    raise ValueError(f"Unknown compare mode: {mode}")
-
-def cmd_compare(args: argparse.Namespace) -> None:
-    runs = [Path(r).expanduser() for r in args.runs]
-    if args.max_runs and len(runs) > int(args.max_runs):
-        runs = runs[: int(args.max_runs)]
-
-    # Validate + load meta early
-    metas: List[Optional[dict]] = []
-    for rd in runs:
-        if not rd.exists() or not rd.is_dir():
-            raise SystemExit(f"Run directory not found: {rd}")
-        metas.append(_read_json(rd / "summary.json"))
-
-    # Load series
-    series_by_run = []
-    labels = []
-    for rd, meta in zip(runs, metas):
-        s = _load_run_series(rd, args.channels)
-        labels.append(_pick_run_label(rd, meta))
-        series_by_run.append(s)
-
-    # Optional normalization (applied per run, per trace)
-    norm = str(args.norm).strip().lower()
-    band = (float(args.norm_band[0]), float(args.norm_band[1]))
-
-    series_by_run_n = []
-    for s in series_by_run:
-        s2 = {}
-        for k, (f, y) in s.items():
-            y2 = _apply_norm_db(f, y, norm, band)
-            s2[k] = (f, y2)
-        series_by_run_n.append(s2)
-
-    # Shared axis limits (by default)
-    x0, x1 = float(args.xlim[0]), float(args.xlim[1])
-    y0, y1 = float(args.ylim[0]), float(args.ylim[1])
-
-    out_path = Path(args.out).expanduser()
-    ensure_dir(out_path.parent if out_path.parent != Path(".") else Path("."))
-
-    layout = str(args.layout).strip().lower()
-    shared = bool(getattr(args, "shared_axes", True))
-
-    if layout == "overlay":
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.grid(True, which="both")
-        ax.set_xscale("log")
-
-        for label, s in zip(labels, series_by_run_n):
-            # Plot each trace with a label prefix
-            for k, (f, y) in s.items():
-                ax.semilogx(f, y, label=f"{label} -- {k}")
-
-        apply_audio_freq_ticks(ax, x0, x1)
-        ax.set_ylim(y0, y1)
-        ax.set_ylabel("Magnitude (dB, smoothed)")
-        ax.set_title(args.title or "Cassette chain comparison")
-        if bool(getattr(args, "legend", True)):
-            ax.legend(loc="best", frameon=False)
-
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=int(args.dpi))
-        plt.close(fig)
-        print(f"Wrote: {out_path}")
-        return
-
-    # grid layout (default): 2x2 for up to 4, otherwise roughly square
-    n = len(runs)
-    if n <= 4:
-        cols = 2
-    else:
-        cols = int(math.ceil(math.sqrt(n)))
-    rows = int(math.ceil(n / cols))
-
-    fig, axs = plt.subplots(
-        rows, cols,
-        figsize=(cols * 7, rows * 4.6),
-        sharex=shared,
-        sharey=shared,
-    )
-    axs = np.asarray(axs).reshape(-1)
-
-    for i, ax in enumerate(axs):
-        if i >= n:
-            ax.axis("off")
-            continue
-
-        ax.grid(True, which="both")
-        ax.set_xscale("log")
-        apply_audio_freq_ticks(ax, x0, x1)
-        ax.set_ylim(y0, y1)
-        ax.set_ylabel("Magnitude (dB, smoothed)")
-
-        ax.set_title(labels[i])
-
-        s = series_by_run_n[i]
-
-        # Plot traces
-        if args.channels == "lr-overlay":
-            # Prefer consistent L/R ordering
-            if "L" in s:
-                f, y = s["L"]
-                ax.semilogx(f, y, label="Left (L)")
-            if "R" in s:
-                f, y = s["R"]
-                ax.semilogx(f, y, label="Right (R)")
-            if "mono" in s and ("L" not in s and "R" not in s):
-                f, y = s["mono"]
-                ax.semilogx(f, y, label="Mono")
-        else:
-            # single trace plot
-            for k, (f, y) in s.items():
-                ax.semilogx(f, y, label=k)
-
-        if bool(getattr(args, "legend", True)):
-            ax.legend(loc="best", frameon=False)
-
-    if args.title:
-        fig.suptitle(str(args.title), y=0.995)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=int(args.dpi))
-    plt.close(fig)
-    print(f"Wrote: {out_path}")
-
-# -------------------------
 # CLI
 # -------------------------
 
@@ -2968,6 +2497,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     # common.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
     # common.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
 
+    ## // handled by the pre-parser
     ap.add_argument("--config", default=None, help="TOML config path (default: auto-search)")
     ap.add_argument("--preset", default=None, help="Preset name under [presets.<name>.<cmd>]")
 
@@ -3205,7 +2735,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         help="matplotlib color for Right channel in overlay plot",
     )
 
-    return ap, {"gen": g, "detect": d, "analyze": a}
+    return ap, {"gen": g, "detect": d, "analyze": a, "compare": c}
 
 # ----------------------
 # MAIN
@@ -3214,22 +2744,28 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
 def main() -> None:
     argv = sys.argv[1:]
 
-    # Grab config/preset anywhere in argv (before/after subcommand)
-    cfg_path = _scan_argv_value(argv, "--config")
-    preset = _scan_argv_value(argv, "--preset")
+    # Tiny pre-parser for global config/preset options
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre.add_argument("--preset", default=None)
 
-    cfg = load_toml_config(cfg_path)
+    pre_args, remaining = pre.parse_known_args(argv)
+
+    cfg_path = pre_args.config
+    preset = pre_args.preset
 
     ap, cmd_parsers = build_parser()
 
     if "--help-all" in argv:
         print(ap.format_help())
-        for name in ("gen", "detect", "analyze"):
-            print("\n" + "="*80 + "\n")
+        for name in ("gen", "detect", "analyze", "compare"):
+            print("\n" + "=" * 80 + "\n")
             print(cmd_parsers[name].format_help())
         raise SystemExit(0)
 
-    # Apply base sections: [gen], [detect], [analyze]
+    cfg = load_toml_config(cfg_path)
+
+    # Apply base sections: [gen], [detect], [analyze], [compare]
     for cmd, p in cmd_parsers.items():
         base = flatten_cmd_defaults(cmd, cfg.get(cmd, {}))
         apply_config_to_subparser(p, base, label=f"{cmd}")
@@ -3244,17 +2780,14 @@ def main() -> None:
             override = flatten_cmd_defaults(cmd, pset.get(cmd, {}))
             apply_config_to_subparser(p, override, label=f"presets.{preset}.{cmd}")
 
-    argv2 = _strip_known_opts(argv, ["--config", "--preset"])
-    args = ap.parse_args(argv2)
+    args = ap.parse_args(remaining)
 
-    if getattr(args, "cmd", None) in {"gen", "detect", "analyze"}:
+    if getattr(args, "cmd", None) in {"gen", "detect", "analyze", "compare"}:
         print(f"cassette-calibrator {__version__}")
 
-    # Basic console logging (only if nothing configured yet)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    # If user asked for DTMF stats, ensure INFO is visible even if env preconfigured logging
     if bool(getattr(args, "dtmf_stats", False)):
         logging.getLogger().setLevel(logging.INFO)
         LOG.setLevel(logging.INFO)

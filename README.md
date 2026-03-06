@@ -1,8 +1,10 @@
 # cassette-calibrator
 
-A CLI tool with a separate easy-to-use webUI for measuring and calibrating a compact cassette recording/playback chain using an audio test program and automated alignment. Also comes with an optional local WebUI for ease of use.
+A CLI-first cassette measurement/calibration tool with an optional local WebUI. It is designed for testing a compact cassette recording/playback chain with generated reference audio, automated marker detection, drift compensation, and response analysis.
 
-It generates a cassette-friendly measurement WAV with user-configurable DTMF markers, then analyzes a recorded playback capture to estimate the chain's magnitude response (and optional loopback-subtracted response), plus an SNR estimate.
+This program can be used for all sorts of signal chain analyses outside the realm of cassettes as well, but it's mainly inteded for that.
+
+It generates a cassette-friendly test WAV with configurable DTMF markers, then analyzes a recorded playback capture to estimate magnitude response, optional loopback-subtracted difference response, and SNR.
 
 ## What this does
 
@@ -263,6 +265,20 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.0 - Core cleanup, WebUI file transfer support, analysis fixes, and broader WebUI polish
+
+  * Cleaned up duplicate/overlapping logic in `cassette_calibrator.py` so the core analysis/detection path is less brittle and easier to maintain.
+  * Added **WebUI file upload + download support**:
+    * Upload WAVs directly from the browser into the project tree
+    * Download generated files/results back from the browser
+    * Safe filename handling + validation for uploaded WAVs
+  * Improved WebUI run/result handling:
+    * Previous runs are now populated into the UI without needing a manual refresh after page load
+    * Run/result lists can be refreshed from the UI after new work is created
+    * New analysis runs refresh the available run lists in the frontend
+  * Fixed analysis-side issues/bugs in the cassette measurement flow that affected reliability/usability.
+  * More WebUI bugfixes and general polish across browsing, result viewing, and run management.
+
 * 0.1.9 - WebUI: compare grids + TOML-driven DTMF presets; better plot ticks
   * Added **Compare** workflow in WebUI: pick multiple runs, reorder columns, choose metric + channels, and render a **single high-res grid PNG** (shared axes when CSV data exists).
   * Compare plots now use **audio-friendly frequency ticks/labels** (no more scientific-notation x-axis like 2e4 / 1e3).
@@ -279,7 +295,6 @@ In `--outdir`:
 
   * Thumbnails are now clickable: opens a fullscreen overlay viewer for easier inspection/zooming.
   * Added "Open in new tab" link per image so you can view the raw PNG directly (browser zoom works properly).
-  * Viewer shows basic file details (path + dimensions + byte size) for quick sanity checks.
   * Added fit/actual-size toggle controls (plus keyboard ESC to close).
   * Added lightweight file stat endpoint used by the viewer to display image metadata.
 
