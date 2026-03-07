@@ -27,6 +27,7 @@ import time
 import csv
 import math
 import re
+import shutil
 import unicodedata
 from datetime import datetime
 from email.parser import BytesParser
@@ -35,11 +36,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs, quote
-from cassette_calibrator import apply_audio_freq_ticks
-from matplotlib.ticker import NullFormatter
+
+# Force a headless matplotlib backend BEFORE importing matplotlib / cassette_calibrator
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 # --- TOML-backed defaults + preset merging (WebUI "Default" == TOML base) ---
 from typing import Any, Dict, Optional
+
+import cassette_calibrator as cc  # noqa: E402
+from cassette_calibrator import apply_audio_freq_ticks  # noqa: E402
+from matplotlib.ticker import NullFormatter  # noqa: E402
 
 try:
     import tomllib  # py3.11+
@@ -158,9 +164,6 @@ def get_dtmf_params(config_path: Path = DEFAULT_CONFIG_PATH, preset: Optional[st
     }
 # --- end TOML-backed defaults block ---
 
-# Force a headless matplotlib backend BEFORE importing cassette_calibrator
-os.environ.setdefault("MPLBACKEND", "Agg")
-
 # set up logging
 import logging
 
@@ -170,8 +173,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 LOG = logging.getLogger("cassette_calibrator.webui")
-
-import cassette_calibrator as cc  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 
@@ -438,9 +439,12 @@ def _coerce_float(v, *, default=None):
     if v is None or v == "":
         return default
     try:
-        return float(v)
+        x = float(v)
     except Exception:
         return default
+    if not math.isfinite(x):
+        return default
+    return x
 
 def _coerce_str(v, *, default=None):
     s = _opt_str(v)
@@ -582,6 +586,68 @@ def _load_cfg(cfg_path: str | None) -> dict:
 def _webui_cfg(cfg: dict) -> dict:
     w = cfg.get("webui", {})
     return w if isinstance(w, dict) else {}
+
+# -------------------------------------------
+# read the environment (for url prefixes etc)
+# -------------------------------------------
+
+def _load_simple_env(path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        txt = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return out
+
+    for raw_line in txt.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+
+        if not k:
+            continue
+
+        if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+            v = v[1:-1]
+
+        out[k] = v
+
+    return out
+
+def _normalize_url_prefix(v: str | None) -> str:
+    s = (v or "").strip()
+    if not s or s == "/":
+        return ""
+    if not s.startswith("/"):
+        s = "/" + s
+    return s.rstrip("/")
+
+def _strip_optional_prefix(path: str, prefix: str) -> str:
+    """
+    Accept both prefixed and unprefixed paths.
+    This lets local direct access keep working even if a reverse proxy uses a subpath.
+    """
+    if not prefix:
+        return path
+
+    if path == prefix:
+        return "/"
+    if path.startswith(prefix + "/"):
+        out = path[len(prefix):]
+        return out if out else "/"
+
+    return path
+
+def _prefix_url(prefix: str, path: str) -> str:
+    """
+    Join a normalized prefix with an absolute app path like '/api/runs'.
+    """
+    if not path.startswith("/"):
+        raise ValueError("path must start with '/'")
+    return f"{prefix}{path}" if prefix else path
 
 def _run_cc_cmd(fn, *args, **kwargs) -> tuple[bool, str, str | None]:
     """
@@ -1879,7 +1945,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="hero">
     <h1 class="hero-title">
         <span class="brand-main">cassette</span><span class="brand-accent">-calibrator</span>
-        <img class="cassette-mark" src="assets/cassette_logo_garble.svg" alt="" aria-hidden="true" />
+        <img class="cassette-mark" src="__CASSETTE_LOGO_URL__" alt="" aria-hidden="true" />
         <span class="hero-badge">WebUI</span>
     </h1>
     <div class="hero-sub">
@@ -2224,7 +2290,18 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
 <script>
+
 const DTMF_PRESETS = __DTMF_PRESETS_JSON__;
+const URL_PREFIX = __URL_PREFIX_JSON__;
+
+function prefixedUrl(u) {
+  const s = String(u || "");
+  if (!URL_PREFIX) return s;
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s === URL_PREFIX || s.startsWith(URL_PREFIX + "/")) return s;
+  if (s.startsWith("/")) return URL_PREFIX + s;
+  return URL_PREFIX + "/" + s;
+}
 
 function initDtmfPresetSelect() {
   const sel = document.getElementById("dtmf_preset");
@@ -2440,11 +2517,11 @@ async function doCompare() {
 }
 
 function fileUrl(path) {
-  return "/file?path=" + encodeURIComponent(path);
+  return prefixedUrl("/file?path=" + encodeURIComponent(path));
 }
 
 function downloadUrl(path) {
-  return "/download?path=" + encodeURIComponent(path);
+  return prefixedUrl("/download?path=" + encodeURIComponent(path));
 }
 
 function imgUrl(path) {
@@ -2607,7 +2684,7 @@ function jsq(s) {
 }
 
 async function api(path, payload) {
-  const r = await fetch(path, {
+  const r = await fetch(prefixedUrl(path), {
     method: "POST",
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(payload || {})
@@ -2622,7 +2699,6 @@ async function api(path, payload) {
     const log = (j && j.log) ? String(j.log) : "";
     const extra = (j && j.path) ? ("\n\npath: " + String(j.path)) : "";
 
-    // If backend returned log text, append it under the error headline.
     const full = log ? (msg + extra + "\n\n--- log ---\n" + log) : (msg + extra);
     throw new Error(full);
   }
@@ -2631,7 +2707,7 @@ async function api(path, payload) {
 }
 
 async function apiGetJson(url) {
-  const r = await fetch(url);
+  const r = await fetch(prefixedUrl(url));
   const t = await r.text();
   let j = null;
   try { j = JSON.parse(t); } catch (e) {}
@@ -2918,9 +2994,9 @@ async function mbUploadWav() {
     const fd = new FormData();
     fd.append("file", file, file.name);
 
-    const r = await fetch("/api/upload_wav?dir=" + encodeURIComponent(dir), {
-      method: "POST",
-      body: fd
+    const r = await fetch(prefixedUrl("/api/upload_wav?dir=" + encodeURIComponent(dir)), {
+    method: "POST",
+    body: fd
     });
 
     const t = await r.text();
@@ -3354,12 +3430,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_GET(self) -> None:
         u = urlparse(self.path)
-        if u.path == "/":
-            html = INDEX_HTML.replace("__DTMF_PRESETS_JSON__", json.dumps(DTMF_PRESETS, ensure_ascii=False))
+        prefix = getattr(self.server, "url_prefix", "")
+        req_path = _strip_optional_prefix(u.path, prefix)
+
+        # If the configured prefix is hit without trailing slash, redirect to slash form.
+        if prefix and u.path == prefix:
+            self.send_response(302)
+            self.send_header("Location", prefix + "/")
+            self.end_headers()
+            return
+
+        if req_path == "/":
+            logo_url = _prefix_url(prefix, "/assets/cassette_logo_garble.svg")
+            html = INDEX_HTML
+            html = html.replace("__DTMF_PRESETS_JSON__", json.dumps(DTMF_PRESETS, ensure_ascii=False))
+            html = html.replace("__URL_PREFIX_JSON__", json.dumps(prefix, ensure_ascii=False))
+            html = html.replace("__CASSETTE_LOGO_URL__", logo_url)
             self._text(200, html, "text/html; charset=utf-8")
             return
 
-        if u.path == "/api/state":
+        if req_path == "/api/state":
             st = {
                 "wavs": _list_files((".wav",)),
                 "results": _list_result_dirs(),
@@ -3367,14 +3457,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, st)
             return
 
-        if u.path == "/api/runs":
+        if req_path == "/api/runs":
             st = {
                 "runs": _list_runs(),
             }
             self._json(200, st)
             return
 
-        if u.path == "/api/browse":
+        if req_path == "/api/browse":
             qs = parse_qs(u.query)
             rel_dir = (qs.get("dir", [""])[0] or "").strip()
             mode = (qs.get("mode", ["file"])[0] or "file").strip().lower()
@@ -3392,7 +3482,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
-        if u.path == "/api/stat":
+        if req_path == "/api/stat":
             qs = parse_qs(u.query)
             p = (qs.get("path", [""])[0] or "").strip()
             try:
@@ -3411,7 +3501,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
-        if u.path == "/file":
+        if req_path == "/file":
             qs = parse_qs(u.query)
             p = (qs.get("path", [""])[0] or "").strip()
             try:
@@ -3427,7 +3517,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
                 return
 
-        if u.path == "/download":
+        if req_path == "/download":
             qs = parse_qs(u.query)
             p = (qs.get("path", [""])[0] or "").strip()
             try:
@@ -3450,9 +3540,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
                 return
 
-        if u.path.startswith("/assets/"):
+        if req_path.startswith("/assets/"):
             try:
-                rel = _rel_to_root_checked(u.path.lstrip("/"))
+                rel = _rel_to_root_checked(req_path.lstrip("/"))
                 full = (ROOT / rel)
                 if not full.exists() or not full.is_file():
                     self._json(404, {"error": "file not found"})
@@ -3484,6 +3574,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_POST(self) -> None:
         u = urlparse(self.path)
+        prefix = getattr(self.server, "url_prefix", "")
+        req_path = _strip_optional_prefix(u.path, prefix)
 
         try:
             cfg = self.server.cfg  # type: ignore[attr-defined]
@@ -3491,7 +3583,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = {}
 
         # multipart upload route must read raw bytes before JSON parsing
-        if u.path == "/api/upload_wav":
+        if req_path == "/api/upload_wav":
             try:
                 qs = parse_qs(u.query)
                 dir_in = (qs.get("dir", ["data"])[0] or "data").strip()
@@ -3534,9 +3626,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         payload = self._read_json_body()
-        LOG.info("POST %s -- parsed payload keys=%s", u.path, sorted(payload.keys()))
+        LOG.info("POST %s -- parsed payload keys=%s", req_path, sorted(payload.keys()))
 
-        if u.path == "/api/mkdir":
+        if req_path == "/api/mkdir":
             try:
                 path = str(payload.get("path", "") or "").strip()
                 if not path:
@@ -3554,7 +3646,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
-        if u.path == "/api/run_notes":
+        if req_path == "/api/run_notes":
             try:
                 run_dir = str(payload.get("dir", "") or "").strip()
                 if not run_dir:
@@ -3578,7 +3670,6 @@ class Handler(BaseHTTPRequestHandler):
                     obj["run"] = run
 
                 notes_raw = str(payload.get("notes", "") or "")
-                # normalize line endings
                 notes = notes_raw.replace("\r\n", "\n").replace("\r", "\n")
 
                 if notes.strip() == "":
@@ -3593,7 +3684,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": str(e)})
             return
 
-        if u.path == "/api/compare":
+        if req_path == "/api/compare":
             try:
                 runs_in = payload.get("runs", None)
                 if not isinstance(runs_in, list) or not runs_in:
@@ -3602,21 +3693,17 @@ class Handler(BaseHTTPRequestHandler):
                 metric = str(payload.get("metric", "response") or "response").strip().lower()
                 outdir = str(payload.get("outdir", "data/compare") or "data/compare").strip()
 
-                # UI controls for resolution
                 tile_w = int(payload.get("tile_w", 1100) or 1100)
                 tile_h = int(payload.get("tile_h", 650) or 650)
                 dpi = int(payload.get("dpi", 150) or 150)
 
-                # channels selection
                 ch_in = payload.get("channels", None)
                 channels: list[str] = []
                 if isinstance(ch_in, list) and ch_in:
                     channels = [_norm_ch_name(str(x)) for x in ch_in if str(x).strip()]
                 else:
-                    # default: union of channels found in first run summary
                     channels = ["L", "R"]
 
-                # load summaries
                 runs: list[dict] = []
                 for rd in runs_in:
                     rd_s = str(rd or "").strip()
@@ -3633,7 +3720,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not runs:
                     raise ValueError("no valid runs were provided")
 
-                # if channels == ["auto"], use union across runs
                 if len(channels) == 1 and channels[0].lower() == "auto":
                     seen = []
                     for r in runs:
@@ -3670,7 +3756,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if u.path == "/api/gen":
+        if req_path == "/api/gen":
             try:
                 out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
                 (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
@@ -3687,23 +3773,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if u.path == "/api/detect":
+        if req_path == "/api/detect":
             try:
                 wav = _rel_to_root_checked(str(payload.get("wav", "")))
                 args = _make_args("detect", cfg, {"wav": wav, "json": True})
 
                 ok, log_txt, err = _run_cc_cmd(cc.cmd_detect, args)
                 if not ok:
-                    # cc.cmd_detect may have printed something; return it to UI
                     self._json(400, {"ok": False, "error": err, "log": log_txt})
                     return
 
-                # On success, stdout should be JSON (because json=True)
                 s = (log_txt or "").strip()
                 try:
                     result = json.loads(s or "{}")
                 except Exception:
-                    # Defensive: if detect printed non-JSON despite json=True
                     self._json(500, {
                         "ok": False,
                         "error": "detect did not output valid JSON",
@@ -3716,8 +3799,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": str(e)})
             return
 
-        if u.path == "/api/analyze":
-            # Always have a buffer-backed log, even when we fail early
+        if req_path == "/api/analyze":
             try:
                 ref = _rel_to_root_checked(str(payload.get("ref", "")))
                 rec = _rel_to_root_checked(str(payload.get("rec", "")))
@@ -3728,11 +3810,8 @@ class Handler(BaseHTTPRequestHandler):
                 outdir = _ensure_outdir_rel(str(payload.get("outdir", "data/cassette_results")))
 
                 overrides = {"ref": ref, "rec": rec, "outdir": outdir}
-
-                # Fetch defaults ONCE
                 dfl = _cmd_argparse_defaults("analyze")
 
-                # DTMF / marker tuning from UI (best effort)
                 dtmf_in = payload.get("dtmf", None)
                 dtmf_obj = dtmf_in if isinstance(dtmf_in, dict) else {}
 
@@ -3748,7 +3827,6 @@ class Handler(BaseHTTPRequestHandler):
                 if base_dtmf_cfg.get("marker_channel") is not None:
                     base_dtmf_cfg["marker_channel"] = _normalize_marker_channel(base_dtmf_cfg["marker_channel"])
 
-                # run name
                 run_name = _opt_str(payload.get("run_name"))
                 if run_name:
                     if "run_name" in dfl:
@@ -3759,10 +3837,8 @@ class Handler(BaseHTTPRequestHandler):
                         overrides["run_name"] = run_name
                         overrides["name"] = run_name
 
-                # run notes
                 run_notes = payload.get("run_notes", None)
                 if isinstance(run_notes, str):
-                    # preserve content but normalize line endings; ignore if only whitespace
                     rn = run_notes.replace("\r\n", "\n").replace("\r", "\n")
                     if rn.strip():
                         if "run_notes" in dfl:
@@ -3776,15 +3852,12 @@ class Handler(BaseHTTPRequestHandler):
                 if loopback:
                     overrides["loopback"] = loopback
 
-                # OPTIONAL: let UI pass through marker-finding knobs if you add fields later
-                # (safe: only apply if the argparse dest exists)
                 def _maybe_float(api_key: str, *dest_names: str):
                     v = payload.get(api_key, None)
                     if v is None or v == "":
                         return
-                    try:
-                        fv = float(v)
-                    except Exception:
+                    fv = _coerce_float(v, default=None)
+                    if fv is None:
                         return
                     for dn in dest_names:
                         if dn in dfl:
@@ -3804,10 +3877,8 @@ class Handler(BaseHTTPRequestHandler):
                             overrides[dn] = iv
                             return
 
-                # common knobs you referenced in the SystemExit hint:
                 _maybe_float("min_dbfs", "min_dbfs")
                 _maybe_float("thresh", "thresh")
-                # (and if your core uses different names, add aliases here)
 
                 LOG.info("analyze: ref=%s rec=%s loopback=%s outdir=%s", ref, rec, loopback, outdir)
 
@@ -3818,7 +3889,6 @@ class Handler(BaseHTTPRequestHandler):
                 if dtmf_autotune:
                     cand_list = _dtmf_candidate_configs(base_dtmf_cfg, dtmf_preset)
                 else:
-                    # single attempt: preset + payload overrides
                     preset = DTMF_PRESETS.get(dtmf_preset) or DTMF_PRESETS["default"]
                     cfg0 = dict(preset)
                     for k, v in base_dtmf_cfg.items():
@@ -3831,10 +3901,7 @@ class Handler(BaseHTTPRequestHandler):
                 err = None
 
                 for label, dtmf_cfg in cand_list:
-                    # per-attempt overrides copy
                     ov = dict(overrides)
-
-                    # apply only args that actually exist in argparse defaults
                     _apply_dtmf_cfg(ov, dfl, dtmf_cfg)
 
                     args = _make_args("analyze", cfg, ov)
@@ -3853,11 +3920,9 @@ class Handler(BaseHTTPRequestHandler):
                         used_cfg = dtmf_cfg
                         break
 
-                    # If not autotuning, stop immediately
                     if not dtmf_autotune:
                         break
 
-                    # If it failed for reasons NOT related to markers, don't spin the ladder
                     if not _is_marker_failure(err, log_txt):
                         break
 
@@ -3899,7 +3964,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(400, {"ok": False, "error": str(e)})
             return
-
 
         self._json(404, {"error": "not found"})
 
@@ -3959,10 +4023,29 @@ def main() -> int:
         DTMF_PRESETS = dict(DTMF_PRESETS_FALLBACK)
 
     w = _webui_cfg(cfg)
+    env_file_cfg = _load_simple_env(ROOT / ".env")
 
-    host = str(args.host or w.get("host", "127.0.0.1"))
-    port = int(args.port or w.get("port", 8765))
+    host = str(
+        args.host
+        or os.environ.get("WEBUI_HOST")
+        or env_file_cfg.get("WEBUI_HOST")
+        or w.get("host", "127.0.0.1")
+    )
+
+    port = int(
+        args.port
+        or os.environ.get("WEBUI_PORT")
+        or env_file_cfg.get("WEBUI_PORT")
+        or w.get("port", 8765)
+    )
+
     open_browser = bool(w.get("open_browser", True)) and (not args.no_browser)
+
+    url_prefix = _normalize_url_prefix(
+        os.environ.get("WEBUI_URL_PREFIX")
+        or env_file_cfg.get("WEBUI_URL_PREFIX")
+        or w.get("url_prefix", "")
+    )
 
     if host not in ("127.0.0.1", "localhost"):
         print(f"[warn] Binding to '{host}' -- this WebUI is intended for local use.", file=sys.stderr)
@@ -3976,13 +4059,29 @@ def main() -> int:
         return 2
 
     httpd.cfg = cfg  # type: ignore[attr-defined]
+    httpd.url_prefix = url_prefix  # type: ignore[attr-defined]
 
     url = f"http://{host}:{port}/"
-    print(f"cassette-calibrator WebUI listening on: {url}")
+    open_url = f"http://{host}:{port}{url_prefix}/" if url_prefix else url
+
+    term_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    hr = "-" * max(20, term_width)
+
+    print()
+    print(hr)
+    if url_prefix:
+        print(f"cassette-calibrator WebUI server listening on: {url}")
+        print(f"Using custom URL prefix: {url_prefix}/")
+        print(f"Open the WebUI at: {open_url}")
+    else:
+        print(f"cassette-calibrator WebUI listening on: {url}")
+    print(hr)
+    print()
+
     if open_browser and host in ("127.0.0.1", "localhost"):
         try:
             import webbrowser
-            webbrowser.open(url, new=1)
+            webbrowser.open(open_url, new=1)
         except Exception:
             pass
 
@@ -3993,7 +4092,6 @@ def main() -> int:
     finally:
         httpd.server_close()
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

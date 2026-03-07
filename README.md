@@ -267,6 +267,16 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.3 - WebUI URL prefix support + startup/output polish
+
+  * Added proper WebUI URL prefix support for reverse-proxy/subdirectory hosting (for example `/cassette`).
+  * WebUI routes now handle prefixed requests cleanly while still allowing direct local access without the prefix.
+  * Browser-open behavior now uses the actual prefixed WebUI URL when a custom prefix is configured.
+  * Improved startup output so prefixed deployments report both the bind/listen address and the real WebUI URL more clearly.
+  * Added cleaner terminal startup banner/separator output around the WebUI startup message.
+  * Tightened float coercion/parsing so invalid/non-finite numeric values are ignored more safely instead of leaking bad values into overrides.
+  * Cleaned up backend import/bootstrap ordering around the headless matplotlib setup for safer WebUI startup behavior.
+
 * 0.2.2 - WebUI SVG logo + static asset serving polish
 
   * Added a new SVG cassette logo/mark for the WebUI header.

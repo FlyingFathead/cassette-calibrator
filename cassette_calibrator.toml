@@ -86,3 +86,4 @@ tone_s = 2.0
 host = "127.0.0.1"
 port = 8765
 open_browser = true
+url_prefix = ""
