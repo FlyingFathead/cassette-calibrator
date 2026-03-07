@@ -1552,11 +1552,27 @@ INDEX_HTML = r"""<!doctype html>
   }
 
   .item {
-    display: grid;
-    grid-template-columns: 1fr auto auto;
-    gap: 10px;
-    padding: 6px 8px;
-    border-radius: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  align-items: center;
+  }
+  
+  .item > div:first-child {
+    min-width: 0;
+  }
+  
+  .item .mono {
+    display: block;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  
+  .item > div:last-child {
+    white-space: nowrap;
   }
 
   .item:hover {
