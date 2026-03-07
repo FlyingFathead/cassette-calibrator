@@ -267,6 +267,14 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.2 - WebUI SVG logo + static asset serving polish
+
+  * Added a new SVG cassette logo/mark for the WebUI header.
+  * The WebUI now serves local static assets from `/assets/...`, so bundled logo files load correctly in the browser.
+  * Added proper SVG content-type handling (`image/svg+xml`) in the stdlib WebUI server.
+  * Tweaked header/logo presentation so the SVG mark no longer inherits the generic analysis-image border/radius styling.
+  * Increased and cleaned up the header logo sizing/alignment so the new cassette mark reads properly as part of the branding instead of a tiny side garnish.
+
 * 0.2.1 - README logo + cleaner WebUI startup bind errors
 
   * Added project logo image to the README for cleaner repo presentation.

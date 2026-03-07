@@ -253,6 +253,8 @@ def _guess_ctype(path: Path) -> str:
     suf = path.suffix.lower()
     if suf == ".png":
         return "image/png"
+    if suf == ".svg":
+        return "image/svg+xml; charset=utf-8"
     if suf == ".csv":
         return "text/csv; charset=utf-8"
     if suf == ".json":
@@ -1857,13 +1859,27 @@ INDEX_HTML = r"""<!doctype html>
     background: rgba(255,255,255,0.55);
     }
 
+   .cassette-mark {
+     height: 1.35em;
+     width: auto;
+     margin-left: 0.18em;
+     vertical-align: -0.12em;
+   
+     border: none;
+     border-radius: 0;
+     background: transparent;
+     box-shadow: none;
+     display: inline-block;
+   }
+    
   </style>
 </head>
 <body>
 
     <div class="hero">
     <h1 class="hero-title">
-        <span class="brand-main">cassette</span><span class="brand-accent">-calibrator 🖭</span>
+        <span class="brand-main">cassette</span><span class="brand-accent">-calibrator</span>
+        <img class="cassette-mark" src="assets/cassette_logo_garble.svg" alt="" aria-hidden="true" />
         <span class="hero-badge">WebUI</span>
     </h1>
     <div class="hero-sub">
@@ -3429,6 +3445,20 @@ class Handler(BaseHTTPRequestHandler):
                         "Content-Disposition": _content_disposition_attachment(full.name),
                     },
                 )
+                return
+            except Exception as e:
+                self._json(400, {"error": str(e)})
+                return
+
+        if u.path.startswith("/assets/"):
+            try:
+                rel = _rel_to_root_checked(u.path.lstrip("/"))
+                full = (ROOT / rel)
+                if not full.exists() or not full.is_file():
+                    self._json(404, {"error": "file not found"})
+                    return
+
+                self._send(200, full.read_bytes(), _guess_ctype(full))
                 return
             except Exception as e:
                 self._json(400, {"error": str(e)})

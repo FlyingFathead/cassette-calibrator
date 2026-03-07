@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">cassette-calibrator cassette logo</title>
+  <desc id="desc">A clean cassette-head icon inspired by Unicode U+1F5AD TAPE CARTRIDGE.</desc>
+  <g fill="none" stroke="#b7d5ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="13" y="13" width="102" height="102" rx="6" ry="6"/>
+    <circle cx="47" cy="47" r="13"/>
+    <circle cx="81" cy="47" r="10"/>
+    <path d="M29 81H99"/>
+    <path d="M29 81V100H55V88H73V100H99V81"/>
+  </g>
+</svg>
