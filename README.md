@@ -267,6 +267,13 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.4 - WebUI footer + startup output polish
+
+  * Added a proper WebUI footer with project / author attribution.
+  * Linked the copyright notice to the FlyingFathead GitHub profile.
+  * Polished startup console output with clearer URL/prefix messaging and terminal-width separators.
+  * Minor cleanup for safer numeric coercion in WebUI request handling.
+
 * 0.2.3 - WebUI URL prefix support + startup/output polish
 
   * Added proper WebUI URL prefix support for reverse-proxy/subdirectory hosting (for example `/cassette`).

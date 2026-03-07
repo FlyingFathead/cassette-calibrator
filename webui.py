@@ -1383,6 +1383,12 @@ INDEX_HTML = r"""<!doctype html>
     --card-border: #b7c3cf;
     --card-shadow: 0 10px 28px rgba(24, 35, 52, 0.10);
 
+    --footer-bg: linear-gradient(180deg, rgba(255,255,255,0.30) 0%, rgba(223,234,246,0.55) 100%);
+    --footer-border: #b7c3cf;
+    --footer-text: #425364;
+    --footer-link: #355571;
+    --footer-shadow: 0 8px 24px rgba(24, 35, 52, 0.10);
+    
     --panel-bg: #eef3f8;
     --panel-border: #c7d2dd;
 
@@ -1937,7 +1943,47 @@ INDEX_HTML = r"""<!doctype html>
      box-shadow: none;
      display: inline-block;
    }
-    
+
+   .page-footer {
+    margin-top: 26px;
+    padding: 14px 18px;
+    border: 1px solid var(--footer-border);
+    border-radius: 14px;
+    background: var(--footer-bg);
+    color: var(--footer-text);
+    box-shadow: var(--footer-shadow);
+    font-size: 12px;
+  }
+
+  .page-footer .footer-main {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 16px;
+  }
+
+  .page-footer .footer-title {
+    font-weight: 700;
+    color: var(--page-text);
+  }
+
+  .page-footer .footer-meta {
+    margin-top: 6px;
+    color: var(--footer-text);
+    line-height: 1.5;
+  }
+
+  .page-footer a {
+    color: var(--footer-link);
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(53, 85, 113, 0.55);
+  }
+
+  .page-footer a:hover {
+    border-bottom-style: solid;
+  }
+
   </style>
 </head>
 <body>
@@ -2238,6 +2284,25 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
   <!-- </div> -->
+
+  <!-- Footer -->  
+
+  <footer class="page-footer">
+    <div class="footer-main">
+      <div class="footer-title">cassette-calibrator (WebUI) by FlyingFathead</div>
+      <div>
+  <a href="https://github.com/FlyingFathead" target="_blank" rel="noopener noreferrer">
+        Copyright © 2026 FlyingFathead
+    </a>
+    </div>
+    </div>
+    <div class="footer-meta">
+      Project homepage on GitHub:
+      <a href="https://github.com/FlyingFathead/cassette-calibrator" target="_blank" rel="noopener noreferrer">
+        github.com/FlyingFathead/cassette-calibrator
+      </a>
+    </div>
+  </footer>
 
   <!-- Image viewer (fullscreen-ish) -->
   <div id="iv_backdrop" class="iv-backdrop" onclick="closeImgViewer()"></div>
