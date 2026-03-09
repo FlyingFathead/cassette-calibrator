@@ -267,8 +267,11 @@ In `--outdir`:
 
 ## Changelog / History
 
-* 0.2.7 - WebUI defaults + config precedence cleanup
+* 0.2.7 - WebUI defaults cleanup + optional spoken voice cues
 
+  * Added optional spoken voice cues for the generated test audio (`begin test` / `end test`) for human/operator reference.
+  * Added `voice_cues.py` and the `voicecues` command for generating reusable cue WAVs into `data/voice_cues`.
+  * Added `gen` support for spoken cue insertion, including cue directory, cue padding, cue level, auto-generation, and forced regeneration options.
   * [webui] Fixed backend form/default fallback handling so WebUI no longer hardcodes legacy fallback paths like `data/sweepcass.wav` and `data/cassette_results` when command defaults are already available from the real CLI parser.
   * [webui] `_build_form_defaults()` now starts from actual argparse defaults and then applies TOML config overrides, keeping WebUI defaults aligned with the CLI instead of maintaining a separate fallback layer.
   * [webui] WebUI generation/analyze default paths now follow `cassette_calibrator.toml` and parser defaults more cleanly, including `[gen].out` and `[analyze].outdir`.
