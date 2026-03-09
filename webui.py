@@ -192,6 +192,10 @@ MAX_LIST_ITEMS = 4000
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024  # 256 MiB
 UPLOAD_EXTS = {".wav"}
 
+# ----------------
+# helper functions
+# ----------------
+
 def _ascii_download_fallback(name: str) -> str:
     s = unicodedata.normalize("NFKD", str(name or "download"))
     s = s.encode("ascii", "ignore").decode("ascii")
@@ -323,6 +327,20 @@ def _validate_uploaded_wav(path: Path) -> dict:
         "channels": channels,
         "duration_s": dur_s,
     }
+
+def _parse_boolish(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+
+    return default
 
 # -----------------------
 # DTMF / marker presets (WebUI-side)
@@ -4121,7 +4139,13 @@ def main() -> int:
         or w.get("port", 8765)
     )
 
-    open_browser = bool(w.get("open_browser", True)) and (not args.no_browser)
+    open_browser_default = bool(w.get("open_browser", True))
+
+    open_browser = _parse_boolish(
+        os.environ.get("WEBUI_OPEN_BROWSER")
+        or env_file_cfg.get("WEBUI_OPEN_BROWSER"),
+        open_browser_default,
+    ) and (not args.no_browser)
 
     url_prefix = _normalize_url_prefix(
         os.environ.get("WEBUI_URL_PREFIX")
