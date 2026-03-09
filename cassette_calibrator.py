@@ -78,6 +78,8 @@ LOG = logging.getLogger("cassette_calibrator")
 # -------------------------
 
 def _get_version() -> str:
+    root = Path(__file__).resolve().parent
+
     # 1) If installed as a package, prefer the packaged version.
     try:
         from importlib.metadata import version as pkg_version  # py3.8+
@@ -92,12 +94,21 @@ def _get_version() -> str:
             ["git", "describe", "--tags", "--dirty", "--always"],
             text=True,
             stderr=subprocess.DEVNULL,
+            cwd=str(root),
         ).strip()
         return v[1:] if v.startswith("v") else v
     except Exception:
         pass
 
-    # 3) Last resort.
+    # 3) Fallback: VERSION file in repo root.
+    try:
+        v = (root / "VERSION").read_text(encoding="utf-8").strip()
+        if v:
+            return v
+    except Exception:
+        pass
+
+    # 4) Last resort.
     return "0.0.0"
 
 __version__ = _get_version()

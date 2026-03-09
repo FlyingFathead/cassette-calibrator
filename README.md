@@ -267,6 +267,17 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.5 - WebUI detect summary + env override polish
+
+  * [webui] Added a human-readable detection summary under the Step 2 marker-detection output.
+  * [webui] Kept the raw JSON / "terminal-like" detect output intact for technical inspection.
+  * [webui] Added clear visual detection status reporting:
+    * green OK when both start and end markers are found
+    * warning/fail states when one or both markers are missing
+  * [webui] Detection summary now shows key parsed values in a more readable form, including WAV path, sample rate, channel, marker patterns, marker times, DTMF event count, and final pass/fail status.
+  * [webui] Added `.env` support for overriding browser auto-open behavior via `WEBUI_OPEN_BROWSER`.
+  * [webui] Added safer bool parsing for browser auto-open configuration (`true/false`, `yes/no`, `on/off`, `1/0`).
+
 * 0.2.4 - WebUI footer + startup output polish
 
   * Added a proper WebUI footer with project / author attribution.

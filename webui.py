@@ -44,6 +44,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 from typing import Any, Dict, Optional
 
 import cassette_calibrator as cc  # noqa: E402
+APP_VERSION = getattr(cc, "__version__", "0.0.0")
 from cassette_calibrator import apply_audio_freq_ticks  # noqa: E402
 from matplotlib.ticker import NullFormatter  # noqa: E402
 
@@ -1389,7 +1390,7 @@ INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>cassette-calibrator 🖭 WebUI</title>
+  <title>cassette-calibrator 🖭 WebUI v__APP_VERSION__</title>
   <style>
 
   :root {
@@ -1922,14 +1923,22 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .hero-badge {
-    display: inline-block;
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+
     margin-left: 10px;
-    padding: 4px 10px 5px 10px;
+    padding: 5px 10px 6px 10px;
     vertical-align: middle;
+
     font-size: 0.38em;
     font-weight: 800;
     letter-spacing: 0.04em;
     text-transform: uppercase;
+    line-height: 1.0;
+
     color: #24415c;
     background: linear-gradient(180deg, #f7fbff 0%, #dfeaf6 100%);
     border: 1px solid rgba(86, 113, 141, 0.35);
@@ -1937,6 +1946,19 @@ INDEX_HTML = r"""<!doctype html>
     box-shadow:
         0 1px 0 rgba(255,255,255,0.8),
         0 4px 12px rgba(40, 60, 84, 0.16);
+    }
+
+    .hero-badge-label {
+    display: block;
+    }
+
+    .hero-badge-version {
+    display: block;
+    font-size: 0.82em;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    opacity: 0.92;
+    text-transform: none;
     }
 
     .hero-sub {
@@ -2019,6 +2041,70 @@ INDEX_HTML = r"""<!doctype html>
     drop-shadow(0 2px 6px rgba(28,44,66,0.22));
   }
 
+  .detect-summary {
+  margin-top: 10px;
+  border-radius: 10px;
+  padding: 12px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel-bg);
+  }
+  
+  .detect-summary.ok {
+    border-color: #2e7d32;
+    background: #eaf7ec;
+  }
+  
+  .detect-summary.fail {
+    border-color: #b71c1c;
+    background: #fdecec;
+  }
+  
+  .detect-summary.warn {
+    border-color: #b26a00;
+    background: #fff4df;
+  }
+  
+  .detect-summary h4 {
+    margin: 0 0 8px 0;
+  }
+  
+  .detect-summary .status-line {
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+  
+  .detect-summary .status-ok {
+    color: #1b5e20;
+  }
+  
+  .detect-summary .status-fail {
+    color: #8b0000;
+  }
+  
+  .detect-summary .status-warn {
+    color: #8a5300;
+  }
+  
+  .detect-summary dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 12px;
+  }
+  
+  .detect-summary dt {
+    font-weight: 600;
+  }
+  
+  .detect-summary dd {
+    margin: 0;
+  }
+  
+  .detect-summary code,
+  .detect-summary .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
   </style>
 </head>
 <body>
@@ -2027,7 +2113,10 @@ INDEX_HTML = r"""<!doctype html>
     <h1 class="hero-title">
         <span class="brand-main">cassette</span><span class="brand-accent">-calibrator</span>
         <img class="cassette-mark" src="__CASSETTE_LOGO_URL__" alt="" aria-hidden="true" />
-        <span class="hero-badge">WebUI</span>
+        <span class="hero-badge">
+            <span class="hero-badge-label">WEBUI</span>
+            <span class="hero-badge-version">v__APP_VERSION__</span>
+        </span>
     </h1>
     <div class="hero-sub">
     <i>Find out how tapehead-brained your signal path really is.</i>
@@ -2086,6 +2175,8 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <button onclick="doDetect()">Detect markers</button>
       <pre id="detect_out"></pre>
+      <div id="detect_summary"></div>
+
     </div>
 
     <div class="card">
@@ -2331,12 +2422,14 @@ INDEX_HTML = r"""<!doctype html>
     </a>
     </div>
     </div>
-    <div class="footer-meta">
-      Project homepage on GitHub:
-      <a href="https://github.com/FlyingFathead/cassette-calibrator" target="_blank" rel="noopener noreferrer">
-        github.com/FlyingFathead/cassette-calibrator
-      </a>
-    </div>
+        <div class="footer-meta">
+        Project homepage on GitHub:
+        <a href="https://github.com/FlyingFathead/cassette-calibrator" target="_blank" rel="noopener noreferrer">
+            github.com/FlyingFathead/cassette-calibrator
+        </a>
+        <br />
+        Version: <code>__APP_VERSION__</code>
+        </div>
   </footer>
 
   <!-- Image viewer (fullscreen-ish) -->
@@ -2495,6 +2588,88 @@ function _moveOption(selectFrom, selectTo, value, text) {
   opt.value = value;
   opt.textContent = text || value;
   selectTo.appendChild(opt);
+}
+
+function fmtTimeSec(v) {
+  if (v === null || v === undefined || v === "") return "not found";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "not found";
+  return `${n.toFixed(3)} s`;
+}
+
+function renderDetectSummary(result) {
+  if (!result || typeof result !== "object") {
+    return `<div class="detect-summary fail">
+      <h4>Detection summary</h4>
+      <div class="status-line status-fail">FAIL -- no valid detection result</div>
+    </div>`;
+  }
+
+  const hasStart = result.t_marker_start !== null && result.t_marker_start !== undefined;
+  const hasEnd = result.t_marker_end !== null && result.t_marker_end !== undefined;
+
+  let statusClass = "fail";
+  let statusText = "FAIL -- marker detection failed";
+  let detailText = "Neither the start marker nor the end marker was found.";
+
+  if (hasStart && hasEnd) {
+    statusClass = "ok";
+    statusText = "OK -- both start and end markers were found";
+    detailText = "This recording passed the basic marker check and should be usable for analysis.";
+  } else if (hasStart || hasEnd) {
+    statusClass = "warn";
+    statusText = "WARNING -- only one marker was found";
+    detailText = hasStart
+      ? "The start marker was found, but the end marker is missing."
+      : "The end marker was found, but the start marker is missing.";
+  }
+
+  const wav = result.wav || "(unknown)";
+  const sr = result.sr ?? "(unknown)";
+  const channel = result.channel || "(unknown)";
+  const markerStart = result.marker_start || "(unknown)";
+  const markerEnd = result.marker_end || "(unknown)";
+  const events = result.events ?? "(unknown)";
+
+  return `
+    <div class="detect-summary ${statusClass}">
+      <h4>Detection summary</h4>
+      <div class="status-line status-${statusClass}">${esc(statusText)}</div>
+      <div style="margin-bottom:10px;">${esc(detailText)}</div>
+
+      <dl>
+        <dt>File</dt>
+        <dd><span class="mono">${esc(wav)}</span></dd>
+
+        <dt>Sample rate</dt>
+        <dd>${esc(String(sr))} Hz</dd>
+
+        <dt>Detection channel</dt>
+        <dd>${esc(String(channel))}</dd>
+
+        <dt>Start marker pattern</dt>
+        <dd><code>${esc(String(markerStart))}</code></dd>
+
+        <dt>End marker pattern</dt>
+        <dd><code>${esc(String(markerEnd))}</code></dd>
+
+        <dt>Start marker</dt>
+        <dd>${hasStart ? `✅ found at ${fmtTimeSec(result.t_marker_start)}` : `❌ not found`}</dd>
+
+        <dt>End marker</dt>
+        <dd>${hasEnd ? `✅ found at ${fmtTimeSec(result.t_marker_end)}` : `❌ not found`}</dd>
+
+        <dt>Start marker center</dt>
+        <dd>${fmtTimeSec(result.t_marker_start_center)}</dd>
+
+        <dt>End marker center</dt>
+        <dd>${fmtTimeSec(result.t_marker_end_center)}</dd>
+
+        <dt>DTMF events detected</dt>
+        <dd>${esc(String(events))}</dd>
+      </dl>
+    </div>
+  `;
 }
 
 async function refreshCompareRuns(preselectDir) {
@@ -3141,11 +3316,27 @@ async function doGen() {
 async function doDetect() {
   try {
     setLog("detect_out", "running...");
+    document.getElementById("detect_summary").innerHTML = "";
+
     const wav = document.getElementById("detect_wav").value;
     const r = await api("/api/detect", { wav });
+
+    // Keep the raw terminal-ish JSON view
     setLog("detect_out", JSON.stringify(r.result, null, 2));
+
+    // Add the human-readable summary below it
+    document.getElementById("detect_summary").innerHTML =
+      renderDetectSummary(r.result);
+
   } catch (e) {
     setLog("detect_out", "ERROR: " + e.message);
+    document.getElementById("detect_summary").innerHTML = `
+      <div class="detect-summary fail">
+        <h4>Detection summary</h4>
+        <div class="status-line status-fail">FAIL -- detection request failed</div>
+        <div>${esc(e.message || "Unknown error")}</div>
+      </div>
+    `;
   }
 }
 
@@ -3546,6 +3737,7 @@ class Handler(BaseHTTPRequestHandler):
             html = html.replace("__DTMF_PRESETS_JSON__", json.dumps(DTMF_PRESETS, ensure_ascii=False))
             html = html.replace("__URL_PREFIX_JSON__", json.dumps(prefix, ensure_ascii=False))
             html = html.replace("__CASSETTE_LOGO_URL__", logo_url)
+            html = html.replace("__APP_VERSION__", pyhtml.escape(APP_VERSION))
             self._text(200, html, "text/html; charset=utf-8")
             return
 
