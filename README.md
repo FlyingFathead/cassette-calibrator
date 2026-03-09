@@ -267,6 +267,15 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.6 - WebUI generation summary + summary/status polish
+
+  * [webui] Added a human-readable generation summary under the Step 1 test WAV output.
+  * [webui] Generation summary now shows parsed core details more cleanly, including output path, sample rate, duration, peak, marker strings, noise window, tone, and sweep settings.
+  * [webui] Added clearer success / warning / fail summary panels for generation and detection results.
+  * [webui] Fixed and cleaned up summary-panel CSS so the status boxes render consistently instead of using broken/garbled rules.
+  * [webui] Hardened frontend HTML escaping for rendered text fields to avoid busted output from unsafe characters.
+  * [webui] Updated the WebUI HTTP server version string to follow the actual app version dynamically.
+
 * 0.2.5 - WebUI detect summary + env override polish
 
   * [webui] Added a human-readable detection summary under the Step 2 marker-detection output.

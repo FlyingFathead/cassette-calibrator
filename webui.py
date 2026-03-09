@@ -2041,69 +2041,83 @@ INDEX_HTML = r"""<!doctype html>
     drop-shadow(0 2px 6px rgba(28,44,66,0.22));
   }
 
-  .detect-summary {
+.op-summary,
+.detect-summary {
   margin-top: 10px;
   border-radius: 10px;
   padding: 12px;
   border: 1px solid var(--panel-border);
   background: var(--panel-bg);
-  }
-  
-  .detect-summary.ok {
-    border-color: #2e7d32;
-    background: #eaf7ec;
-  }
-  
-  .detect-summary.fail {
-    border-color: #b71c1c;
-    background: #fdecec;
-  }
-  
-  .detect-summary.warn {
-    border-color: #b26a00;
-    background: #fff4df;
-  }
-  
-  .detect-summary h4 {
-    margin: 0 0 8px 0;
-  }
-  
-  .detect-summary .status-line {
-    font-weight: 700;
-    margin-bottom: 8px;
-  }
-  
-  .detect-summary .status-ok {
-    color: #1b5e20;
-  }
-  
-  .detect-summary .status-fail {
-    color: #8b0000;
-  }
-  
-  .detect-summary .status-warn {
-    color: #8a5300;
-  }
-  
-  .detect-summary dl {
-    margin: 0;
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 6px 12px;
-  }
-  
-  .detect-summary dt {
-    font-weight: 600;
-  }
-  
-  .detect-summary dd {
-    margin: 0;
-  }
-  
-  .detect-summary code,
-  .detect-summary .mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
+}
+
+.op-summary.ok,
+.detect-summary.ok {
+  border-color: #2e7d32;
+  background: #eaf7ec;
+}
+
+.op-summary.fail,
+.detect-summary.fail {
+  border-color: #b71c1c;
+  background: #fdecec;
+}
+
+.op-summary.warn,
+.detect-summary.warn {
+  border-color: #b26a00;
+  background: #fff4df;
+}
+
+.op-summary h4,
+.detect-summary h4 {
+  margin: 0 0 8px 0;
+}
+
+.op-summary .status-line,
+.detect-summary .status-line {
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.op-summary .status-ok,
+.detect-summary .status-ok {
+  color: #1b5e20;
+}
+
+.op-summary .status-fail,
+.detect-summary .status-fail {
+  color: #8b0000;
+}
+
+.op-summary .status-warn,
+.detect-summary .status-warn {
+  color: #8a5300;
+}
+
+.op-summary dl,
+.detect-summary dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 12px;
+}
+
+.op-summary dt,
+.detect-summary dt {
+  font-weight: 600;
+}
+
+.op-summary dd,
+.detect-summary dd {
+  margin: 0;
+}
+
+.op-summary code,
+.op-summary .mono,
+.detect-summary code,
+.detect-summary .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 
   </style>
 </head>
@@ -2158,6 +2172,7 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="doGen()">Generate</button>
         <div id="gen_file"></div>
         <pre id="gen_log"></pre>
+        <div id="gen_summary"></div>
     </div>
 
     <div class="card">
@@ -2597,6 +2612,137 @@ function fmtTimeSec(v) {
   return `${n.toFixed(3)} s`;
 }
 
+function parseGenLog(log) {
+  const s = String(log || "");
+  const out = {
+    out_path: null,
+    sr: null,
+    dur_s: null,
+    peak: null,
+    marker_start: null,
+    marker_end: null,
+    noisewin_s: null,
+    tone_hz: null,
+    tone_s: null,
+    tone_dbfs: null,
+    sweep_f1: null,
+    sweep_f2: null,
+    sweep_s: null,
+    sweep_dbfs: null,
+    raw: s
+  };
+
+  let m;
+
+  m = s.match(/^\s*Wrote:\s+(.+)$/m);
+  if (m) out.out_path = m[1].trim();
+
+  m = s.match(/^\s*sr\s*=\s*([0-9]+)\s*,\s*dur\s*=\s*([0-9.]+)s\s*,\s*peak\s*=\s*([0-9.]+)\s*$/m);
+  if (m) {
+    out.sr = Number(m[1]);
+    out.dur_s = Number(m[2]);
+    out.peak = Number(m[3]);
+  }
+
+  m = s.match(/^\s*marker_start='([^']*)'\s*,\s*marker_end='([^']*)'\s*$/m);
+  if (m) {
+    out.marker_start = m[1];
+    out.marker_end = m[2];
+  }
+
+  m = s.match(/^\s*noisewin_s\s*=\s*([0-9.]+)\s*$/m);
+  if (m) out.noisewin_s = Number(m[1]);
+
+  m = s.match(/^\s*tone\s*=\s*([0-9.]+)Hz\s+for\s+([0-9.]+)s\s+at\s+(-?[0-9.]+)\s+dBFS peak\s*$/m);
+  if (m) {
+    out.tone_hz = Number(m[1]);
+    out.tone_s = Number(m[2]);
+    out.tone_dbfs = Number(m[3]);
+  }
+
+  m = s.match(/^\s*sweep\s*=\s*([0-9.]+)-([0-9.]+)Hz\s+for\s+([0-9.]+)s\s+at\s+(-?[0-9.]+)\s+dBFS peak\s*$/m);
+  if (m) {
+    out.sweep_f1 = Number(m[1]);
+    out.sweep_f2 = Number(m[2]);
+    out.sweep_s = Number(m[3]);
+    out.sweep_dbfs = Number(m[4]);
+  }
+
+  return out;
+}
+
+function renderGenSummary(info) {
+  if (!info || typeof info !== "object") {
+    return `<div class="op-summary fail">
+      <h4>Generation summary</h4>
+      <div class="status-line status-fail">FAIL ❌ no valid generation result</div>
+    </div>`;
+  }
+
+  const hasOut = !!optStr(info.out_path);
+  const hasCore = Number.isFinite(info.sr) && Number.isFinite(info.dur_s);
+
+  let statusClass = "fail";
+  let statusText = "FAIL ❌ test WAV generation failed";
+  let detailText = "The output file was not created successfully.";
+
+  if (hasOut && hasCore) {
+    statusClass = "ok";
+    statusText = "OK ✅ test WAV was generated successfully";
+    detailText = "The reference WAV was written and looks ready to use.";
+  } else if (hasOut) {
+    statusClass = "warn";
+    statusText = "WARNING ⚠️ file was written, but the summary could not be parsed fully";
+    detailText = "The WAV may still be usable, but some output fields were not parsed from the terminal log.";
+  }
+
+  return `
+    <div class="op-summary ${statusClass}">
+      <h4>Generation summary</h4>
+      <div class="status-line status-${statusClass}">${esc(statusText)}</div>
+      <div style="margin-bottom:10px;">${esc(detailText)}</div>
+
+      <dl>
+        <dt>Output file</dt>
+        <dd><span class="mono">${esc(optStr(info.out_path) || "(unknown)")}</span></dd>
+
+        <dt>Sample rate</dt>
+        <dd>${info.sr !== null ? esc(String(info.sr)) + " Hz" : "(unknown)"}</dd>
+
+        <dt>Duration</dt>
+        <dd>${Number.isFinite(info.dur_s) ? esc(info.dur_s.toFixed(2)) + " s" : "(unknown)"}</dd>
+
+        <dt>Peak</dt>
+        <dd>${Number.isFinite(info.peak) ? esc(info.peak.toFixed(3)) : "(unknown)"}</dd>
+
+        <dt>Start marker</dt>
+        <dd><code>${esc(optStr(info.marker_start) || "(unknown)")}</code></dd>
+
+        <dt>End marker</dt>
+        <dd><code>${esc(optStr(info.marker_end) || "(unknown)")}</code></dd>
+
+        <dt>Noise window</dt>
+        <dd>${Number.isFinite(info.noisewin_s) ? esc(String(info.noisewin_s)) + " s" : "(unknown)"}</dd>
+
+        <dt>Tone</dt>
+        <dd>${
+          Number.isFinite(info.tone_hz) && Number.isFinite(info.tone_s) && Number.isFinite(info.tone_dbfs)
+            ? `${esc(String(info.tone_hz))} Hz for ${esc(String(info.tone_s))} s at ${esc(String(info.tone_dbfs))} dBFS`
+            : "(unknown)"
+        }</dd>
+
+        <dt>Sweep</dt>
+        <dd>${
+          Number.isFinite(info.sweep_f1) && Number.isFinite(info.sweep_f2) &&
+          Number.isFinite(info.sweep_s) && Number.isFinite(info.sweep_dbfs)
+            ? `${esc(String(info.sweep_f1))}-${esc(String(info.sweep_f2))} Hz for ${esc(String(info.sweep_s))} s at ${esc(String(info.sweep_dbfs))} dBFS`
+            : "(unknown)"
+        }</dd>
+      </dl>
+    </div>
+  `;
+}
+
 function renderDetectSummary(result) {
   if (!result || typeof result !== "object") {
     return `<div class="detect-summary fail">
@@ -2609,16 +2755,16 @@ function renderDetectSummary(result) {
   const hasEnd = result.t_marker_end !== null && result.t_marker_end !== undefined;
 
   let statusClass = "fail";
-  let statusText = "FAIL -- marker detection failed";
+  let statusText = "FAIL ❌ marker detection failed";
   let detailText = "Neither the start marker nor the end marker was found.";
 
   if (hasStart && hasEnd) {
     statusClass = "ok";
-    statusText = "OK -- both start and end markers were found";
+    statusText = "OK ✅ both start and end markers were found";
     detailText = "This recording passed the basic marker check and should be usable for analysis.";
   } else if (hasStart || hasEnd) {
     statusClass = "warn";
-    statusText = "WARNING -- only one marker was found";
+    statusText = "WARNING ⚠️ only one marker was found, the result likely cannot be analyzed. Please re-record your audio with both start and end markers intact.";
     detailText = hasStart
       ? "The start marker was found, but the end marker is missing."
       : "The end marker was found, but the start marker is missing.";
@@ -2950,7 +3096,11 @@ async function runsSaveNotes() {
 }
 
 function esc(s) {
-  return (s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;");
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 function jsq(s) {
@@ -3299,17 +3449,33 @@ async function doGen() {
   try {
     setLog("gen_log", "running...");
     document.getElementById("gen_file").innerHTML = "";
+    document.getElementById("gen_summary").innerHTML = "";
 
     const out = document.getElementById("gen_out").value;
     const r = await api("/api/gen", { out });
 
-    setLog("gen_log", r.log || JSON.stringify(r, null, 2));
+    const logTxt = r.log || JSON.stringify(r, null, 2);
+    setLog("gen_log", logTxt);
+
+    const info = parseGenLog(logTxt);
+    info.out_path = info.out_path || r.out || out;
+
+    document.getElementById("gen_summary").innerHTML =
+      renderGenSummary(info);
 
     if (r.out) {
       document.getElementById("gen_file").innerHTML = fileActionTag(r.out);
     }
   } catch (e) {
     setLog("gen_log", "ERROR: " + e.message);
+    document.getElementById("gen_file").innerHTML = "";
+    document.getElementById("gen_summary").innerHTML = `
+      <div class="op-summary fail">
+        <h4>Generation summary</h4>
+        <div class="status-line status-fail">FAIL ❌ generation request failed</div>
+        <div>${esc(e.message || "Unknown error")}</div>
+      </div>
+    `;
   }
 }
 
@@ -3648,7 +3814,7 @@ console.log("webui script loaded; handlers exported to window");
 """
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "cassette-calibrator-webui/0.2"
+    server_version = f"cassette-calibrator-webui/{APP_VERSION}"
 
     def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
         self.send_response(code)
