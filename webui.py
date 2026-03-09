@@ -1984,6 +1984,23 @@ INDEX_HTML = r"""<!doctype html>
     border-bottom-style: solid;
   }
 
+  .cassette-mark {
+  height: 1.45em;
+  width: auto;
+  margin-left: 0.18em;
+  vertical-align: -0.12em;
+
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  display: inline-block;
+
+  filter:
+    drop-shadow(0 1px 0 rgba(255,255,255,0.35))
+    drop-shadow(0 2px 6px rgba(28,44,66,0.22));
+  }
+
   </style>
 </head>
 <body>
