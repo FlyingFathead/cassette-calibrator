@@ -548,6 +548,13 @@ def _dtmf_candidate_configs(base_cfg: dict, preset_name: str) -> list[tuple[str,
 # HELPERS
 # -----------------------
 
+def _payload_str_or_default(payload: dict, key: str, default: str) -> str:
+    v = payload.get(key, None)
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
+
 def _opt_str(v) -> str | None:
     if v is None:
         return None
@@ -605,6 +612,32 @@ def _load_cfg(cfg_path: str | None) -> dict:
 def _webui_cfg(cfg: dict) -> dict:
     w = cfg.get("webui", {})
     return w if isinstance(w, dict) else {}
+
+def _build_form_defaults(cfg: dict) -> dict:
+    gen_defaults = dict(_cmd_argparse_defaults("gen"))
+    analyze_defaults = dict(_cmd_argparse_defaults("analyze"))
+
+    gen_cfg = cfg.get("gen", {}) if isinstance(cfg.get("gen"), dict) else {}
+    analyze_cfg = cfg.get("analyze", {}) if isinstance(cfg.get("analyze"), dict) else {}
+
+    try:
+        gen_defaults.update(cc.flatten_cmd_defaults("gen", gen_cfg))
+    except Exception:
+        gen_defaults.update(gen_cfg)
+
+    try:
+        analyze_defaults.update(cc.flatten_cmd_defaults("analyze", analyze_cfg))
+    except Exception:
+        analyze_defaults.update(analyze_cfg)
+
+    gen_out = str(gen_defaults.get("out") or "")
+    analyze_outdir = str(analyze_defaults.get("outdir") or "")
+
+    return {
+        "gen_out": gen_out,
+        "an_ref": gen_out,
+        "an_outdir": analyze_outdir,
+    }
 
 # -------------------------------------------
 # read the environment (for url prefixes etc)
@@ -2166,7 +2199,7 @@ INDEX_HTML = r"""<!doctype html>
         <label>Generated test WAV location if local (relative path)</label>
             
       <div class="grid2">
-        <input id="gen_out" value="data/sweepcass.wav" />
+        <input id="gen_out" value="__GEN_OUT_DEFAULT__" />
         <button onclick="openBrowser('gen_out', {mode:'file', exts:['.wav'], title:'Choose output WAV', allowNew:true})">Browse</button>
       </div>
         <button onclick="doGen()">Generate</button>
@@ -2220,7 +2253,7 @@ INDEX_HTML = r"""<!doctype html>
       
       <label>🅰️ <b>Reference WAV</b> (= original test reference audio)</label>
       <div class="grid2">
-        <input id="an_ref" placeholder="data/sweepcass.wav" />
+        <input id="an_ref" value="__AN_REF_DEFAULT__" />
         <button onclick="openBrowser('an_ref', {mode:'file', exts:['.wav'], title:'Choose reference WAV'})">Browse</button>
       </div>
 
@@ -2291,7 +2324,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <label>Output directory (relative path; don't change unless for some specific purpose)</label>
       <div class="grid2">
-        <input id="an_outdir" value="data/cassette_results" />
+        <input id="an_outdir" value="__AN_OUTDIR_DEFAULT__" />
         <button onclick="openBrowser('an_outdir', {mode:'dir', title:'Choose or create output directory', allowNew:true})">Browse</button>
       </div>
 
@@ -2629,6 +2662,10 @@ function parseGenLog(log) {
     sweep_f2: null,
     sweep_s: null,
     sweep_dbfs: null,
+    spoken_cues_mode: null,
+    spoken_cues_status: null,
+    spoken_cues_pad_s: null,
+    spoken_cues_dbfs: null,
     raw: s
   };
 
@@ -2668,6 +2705,14 @@ function parseGenLog(log) {
     out.sweep_dbfs = Number(m[4]);
   }
 
+  m = s.match(/^\s*spoken_cues=(on|off|requested)(?:,\s*status=(.*?))?(?:,\s*pad_s=([0-9.]+))?(?:,\s*level=(-?[0-9.]+)\s+dBFS peak)?\s*$/m);
+  if (m) {
+    out.spoken_cues_mode = m[1];
+    out.spoken_cues_status = m[2] ? m[2].trim() : null;
+    out.spoken_cues_pad_s = m[3] !== undefined ? Number(m[3]) : null;
+    out.spoken_cues_dbfs = m[4] !== undefined ? Number(m[4]) : null;
+  }
+
   return out;
 }
 
@@ -2695,6 +2740,15 @@ function renderGenSummary(info) {
     statusText = "WARNING ⚠️ file was written, but the summary could not be parsed fully";
     detailText = "The WAV may still be usable, but some output fields were not parsed from the terminal log.";
   }
+
+  const spokenMode = optStr(info.spoken_cues_mode) || "(not reported)";
+  const spokenStatus = optStr(info.spoken_cues_status) || "(not reported)";
+  const spokenPad = Number.isFinite(info.spoken_cues_pad_s)
+    ? `${esc(String(info.spoken_cues_pad_s))} s`
+    : "(n/a)";
+  const spokenLevel = Number.isFinite(info.spoken_cues_dbfs)
+    ? `${esc(String(info.spoken_cues_dbfs))} dBFS`
+    : "(n/a)";
 
   return `
     <div class="op-summary ${statusClass}">
@@ -2738,6 +2792,18 @@ function renderGenSummary(info) {
             ? `${esc(String(info.sweep_f1))}-${esc(String(info.sweep_f2))} Hz for ${esc(String(info.sweep_s))} s at ${esc(String(info.sweep_dbfs))} dBFS`
             : "(unknown)"
         }</dd>
+
+        <dt>Spoken cues</dt>
+        <dd>${esc(spokenMode)}</dd>
+
+        <dt>Spoken cue status</dt>
+        <dd>${esc(spokenStatus)}</dd>
+
+        <dt>Spoken cue pad</dt>
+        <dd>${spokenPad}</dd>
+
+        <dt>Spoken cue level</dt>
+        <dd>${spokenLevel}</dd>
       </dl>
     </div>
   `;
@@ -3899,11 +3965,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if req_path == "/":
             logo_url = _prefix_url(prefix, "/assets/cassette_logo_garble.svg")
+            form_defaults = _build_form_defaults(getattr(self.server, "cfg", {}) or {})
+
             html = INDEX_HTML
             html = html.replace("__DTMF_PRESETS_JSON__", json.dumps(DTMF_PRESETS, ensure_ascii=False))
             html = html.replace("__URL_PREFIX_JSON__", json.dumps(prefix, ensure_ascii=False))
             html = html.replace("__CASSETTE_LOGO_URL__", logo_url)
             html = html.replace("__APP_VERSION__", pyhtml.escape(APP_VERSION))
+
+            html = html.replace("__GEN_OUT_DEFAULT__", pyhtml.escape(form_defaults["gen_out"], quote=True))
+            html = html.replace("__AN_REF_DEFAULT__", pyhtml.escape(form_defaults["an_ref"], quote=True))
+            html = html.replace("__AN_OUTDIR_DEFAULT__", pyhtml.escape(form_defaults["an_outdir"], quote=True))
+
             self._text(200, html, "text/html; charset=utf-8")
             return
 
@@ -4216,7 +4289,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if req_path == "/api/gen":
             try:
-                out = _rel_to_root_checked(str(payload.get("out", "data/sweepcass.wav")))
+                form_defaults = _build_form_defaults(cfg)
+                out_raw = _payload_str_or_default(payload, "out", form_defaults["gen_out"])
+                out = _rel_to_root_checked(out_raw)
                 (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
 
                 args = _make_args("gen", cfg, {"out": out})
@@ -4265,7 +4340,9 @@ class Handler(BaseHTTPRequestHandler):
                 loopback_in = str(payload.get("loopback", "") or "").strip()
                 loopback = _rel_to_root_checked(loopback_in) if loopback_in else None
 
-                outdir = _ensure_outdir_rel(str(payload.get("outdir", "data/cassette_results")))
+                form_defaults = _build_form_defaults(cfg)
+                outdir_raw = _payload_str_or_default(payload, "outdir", form_defaults["an_outdir"])
+                outdir = _ensure_outdir_rel(outdir_raw)
 
                 overrides = {"ref": ref, "rec": rec, "outdir": outdir}
                 dfl = _cmd_argparse_defaults("analyze")

@@ -267,6 +267,14 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.2.7 - WebUI defaults + config precedence cleanup
+
+  * [webui] Fixed backend form/default fallback handling so WebUI no longer hardcodes legacy fallback paths like `data/sweepcass.wav` and `data/cassette_results` when command defaults are already available from the real CLI parser.
+  * [webui] `_build_form_defaults()` now starts from actual argparse defaults and then applies TOML config overrides, keeping WebUI defaults aligned with the CLI instead of maintaining a separate fallback layer.
+  * [webui] WebUI generation/analyze default paths now follow `cassette_calibrator.toml` and parser defaults more cleanly, including `[gen].out` and `[analyze].outdir`.
+  * [webui] Kept `.env`-based WebUI overrides intact for host/port/browser/url-prefix handling.
+  * [webui] Preserved URL prefix support and prefixed browser-open behavior while cleaning up config/default precedence.
+
 * 0.2.6 - WebUI generation summary + summary/status polish
 
   * [webui] Added a human-readable generation summary under the Step 1 test WAV output.

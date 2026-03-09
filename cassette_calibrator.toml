@@ -1,5 +1,5 @@
 [gen]
-out = "data/sweepcass.wav"
+out = "data/test_audio.wav"
 dtmf_ramp_ms = 5.0
 marker_start = "D#B*"
 marker_end   = "*B#D"
@@ -18,6 +18,16 @@ f2 = 20000.0
 sweep_s = 30.0
 sweep_dbfs = -20.0
 peak = 0.90
+spoken_cues = true
+spoken_cues_dir = "data/voice_cues"
+spoken_cues_pad_s = 1.0
+spoken_cues_dbfs = -14.0
+spoken_cues_autogen = true
+spoken_cues_regen = false
+
+[voicecues]
+outdir = "data/voice_cues"
+force = false
 
 [detect]
 marker_start = "D#B*"
@@ -30,7 +40,7 @@ min_dbfs = -55.0
 marker_channel = "mono"
 
 [analyze]
-outdir = "data/runs"
+outdir = "data/cassette_results"
 marker_start = "D#B*"
 marker_end   = "*B#D"
 noisewin_s   = 2.0
@@ -60,17 +70,17 @@ tone_s = 3.0
 [presets.noisy_cassette.detect]
 min_dbfs = -45.0
 thresh = 5.0
-marker_channel = "mix"
+marker_channel = "mono"
 
 [presets.line_in.detect]
 min_dbfs = -28.0
 thresh = 7.0
-marker_channel = "mix"
+marker_channel = "mono"
 
 [presets.aggressive.detect]
 min_dbfs = -55.0
 thresh = 4.0
-marker_channel = "mix"
+marker_channel = "mono"
 
 [presets.walkman.gen]
 marker_dbfs = -10.0

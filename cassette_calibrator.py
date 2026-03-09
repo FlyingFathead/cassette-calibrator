@@ -210,11 +210,10 @@ def load_toml_config(path: Optional[str]) -> dict:
     except Exception as e:
         raise SystemExit(f"Failed to read TOML config '{cfg_path}': {e}")
 
-
 def _normalize_marker_channel(v: str, *, cmd: str, key: str) -> str:
     s = str(v).strip().lower()
 
-    if s == "mono":
+    if s in {"mono", "mix", "sum", "avg", "mean"}:
         return "mono"
     if s in {"l", "left"}:
         return "L"
@@ -223,7 +222,7 @@ def _normalize_marker_channel(v: str, *, cmd: str, key: str) -> str:
 
     raise SystemExit(
         f"Invalid config value for [{cmd}].{key}: {v!r} "
-        f"(allowed: mono, L/left, R/right)"
+        f"(allowed: mono/mix, L/left, R/right)"
     )
 
 def _normalize_choice(value, allowed: set[str], *, cmd: str, key: str) -> str:
@@ -1368,10 +1367,82 @@ def compute_snr(
     snr_db = 20.0 * math.log10(tone_r / max(noise_r, 1e-12))
     return float(snr_db), {"noise_rms": noise_r, "tone_rms": tone_r}, warnings
 
+# -------------------------
+# Voice cues
+# -------------------------
+
+def warn(msg: str) -> None:
+    print(f"[warn] {msg}", file=sys.stderr)
+
+
+def peak_normalize(x: np.ndarray, peak: float = 0.9) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    m = float(np.max(np.abs(x)) + EPS)
+    if m <= EPS:
+        return np.zeros_like(x, dtype=np.float32)
+    return (x / m * float(peak)).astype(np.float32)
+
+
+def resample_audio_to_sr(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0 or int(sr_in) == int(sr_out):
+        return x.astype(np.float32)
+
+    frac = Fraction(int(sr_out), int(sr_in))
+    y = signal.resample_poly(x, frac.numerator, frac.denominator)
+    return np.asarray(y, dtype=np.float32)
+
+
+def render_default_voice_cues(outdir: Path, *, force: bool = False) -> Tuple[Path, Path]:
+    """
+    Generate begin_test.wav and end_test.wav into outdir using voice_cues.py.
+    This is optional sugar for humans, not part of the real marker method.
+    """
+    try:
+        import voice_cues as vc
+    except Exception as e:
+        raise RuntimeError(f"could not import voice_cues.py: {e}") from e
+
+    ensure_dir(outdir)
+
+    begin_path = outdir / "begin_test.wav"
+    end_path = outdir / "end_test.wav"
+
+    if force or not begin_path.exists():
+        vc.write_wav(begin_path, vc.begin_test(), sr=int(getattr(vc, "SR", 22050)))
+
+    if force or not end_path.exists():
+        vc.write_wav(end_path, vc.end_test(), sr=int(getattr(vc, "SR", 22050)))
+
+    return begin_path, end_path
+
+
+def load_voice_cue_wav(path: Path, *, target_sr: int, target_dbfs: float) -> np.ndarray:
+    """
+    Read a cue WAV, mono it, resample to target_sr, then peak-normalize to target_dbfs.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"voice cue not found: {path}")
+
+    sr, y = read_wav(path)
+    x = to_mono(y)
+    x = resample_audio_to_sr(x, sr, target_sr)
+    x = peak_normalize(x, amp_from_dbfs(target_dbfs))
+    return x.astype(np.float32)
 
 # -------------------------
 # Commands
 # -------------------------
+
+def cmd_voicecues(args: argparse.Namespace) -> None:
+    outdir = Path(str(args.outdir))
+    try:
+        begin_path, end_path = render_default_voice_cues(outdir, force=bool(args.force))
+    except Exception as e:
+        raise SystemExit(f"Could not generate voice cues: {e}")
+
+    print(f"Wrote: {begin_path}")
+    print(f"Wrote: {end_path}")
 
 def cmd_gen(args: argparse.Namespace) -> None:
     sr = args.sr
@@ -1428,8 +1499,68 @@ def cmd_gen(args: argparse.Namespace) -> None:
             ramp_ms=args.dtmf_ramp_ms,
         )
 
+    # ---------------------------------
+    # Optional spoken cues (human only)
+    # ---------------------------------
+    spoken_begin = np.zeros(0, dtype=np.float32)
+    spoken_end = np.zeros(0, dtype=np.float32)
+    spoken_pad = np.zeros(0, dtype=np.float32)
+    spoken_status = "off"
+
+    if bool(getattr(args, "spoken_cues", False)):
+        cue_dir = Path(str(getattr(args, "spoken_cues_dir", "data/voice_cues")))
+        cue_begin_path = cue_dir / "begin_test.wav"
+        cue_end_path = cue_dir / "end_test.wav"
+
+        spoken_pad = np.zeros(int(sr * float(args.spoken_cues_pad_s)), dtype=np.float32)
+
+        need_autogen = bool(getattr(args, "spoken_cues_autogen", True)) and (
+            bool(getattr(args, "spoken_cues_regen", False))
+            or (not cue_begin_path.exists())
+            or (not cue_end_path.exists())
+        )
+
+        if need_autogen:
+            try:
+                render_default_voice_cues(
+                    cue_dir,
+                    force=bool(getattr(args, "spoken_cues_regen", False)),
+                )
+                spoken_status = f"generated in {cue_dir}"
+            except Exception as e:
+                spoken_status = f"requested but generation failed: {e}"
+                warn(f"spoken cues requested but could not be generated: {e} -- continuing without spoken cues")
+
+        try:
+            spoken_begin = load_voice_cue_wav(
+                cue_begin_path,
+                target_sr=sr,
+                target_dbfs=float(args.spoken_cues_dbfs),
+            )
+            spoken_end = load_voice_cue_wav(
+                cue_end_path,
+                target_sr=sr,
+                target_dbfs=float(args.spoken_cues_dbfs),
+            )
+
+            if spoken_status == "off":
+                spoken_status = f"loaded from {cue_dir}"
+        except Exception as e:
+            spoken_begin = np.zeros(0, dtype=np.float32)
+            spoken_end = np.zeros(0, dtype=np.float32)
+            spoken_pad = np.zeros(0, dtype=np.float32)
+
+            if spoken_status.startswith("generated in "):
+                spoken_status = f"generated but load failed: {e}"
+            else:
+                spoken_status = f"requested but unavailable: {e}"
+
+            warn(f"spoken cues requested but unavailable: {e} -- continuing without spoken cues")
+
     x = np.concatenate([
         pre,
+        spoken_begin,
+        spoken_pad,
         marker_start,
         noisewin,
         pad,
@@ -1440,15 +1571,18 @@ def cmd_gen(args: argparse.Namespace) -> None:
         sweep,
         pad,
         marker_end,
+        spoken_pad,
+        spoken_end,
         post
     ]).astype(np.float32)
 
-    # Keep peak under args.peak (do not normalize to 0 dBFS)
+    # Keep peak under args.peak
     peak = float(np.max(np.abs(x)) + 1e-12)
     if peak > args.peak:
         x = x * (args.peak / peak)
 
     write_wav_int16(out_path, sr, x)
+
     print(f"Wrote: {out_path}")
     print(f"  sr={sr}, dur={len(x)/sr:.2f}s, peak={np.max(np.abs(x)):.3f}")
     print(f"  marker_start='{args.marker_start}', marker_end='{args.marker_end}'")
@@ -1456,6 +1590,24 @@ def cmd_gen(args: argparse.Namespace) -> None:
     print(f"  tone={args.tone_hz}Hz for {args.tone_s}s at {args.tone_dbfs} dBFS peak")
     print(f"  sweep={args.f1}-{args.f2}Hz for {args.sweep_s}s at {args.sweep_dbfs} dBFS peak")
 
+    spoken_enabled = bool(getattr(args, "spoken_cues", False))
+    spoken_present = bool(spoken_begin.size and spoken_end.size)
+
+    if spoken_enabled and spoken_present:
+        print(
+            f"  spoken_cues=on, status={spoken_status}, "
+            f"pad_s={args.spoken_cues_pad_s}, level={args.spoken_cues_dbfs} dBFS peak"
+        )
+    elif spoken_enabled:
+        print(
+            f"  spoken_cues=requested, status={spoken_status}, "
+            f"pad_s={args.spoken_cues_pad_s}, level={args.spoken_cues_dbfs} dBFS peak"
+        )
+    else:
+        print(
+            f"  spoken_cues=off, status=disabled, "
+            f"pad_s={args.spoken_cues_pad_s}, level={args.spoken_cues_dbfs} dBFS peak"
+        )
 
 def cmd_detect(args: argparse.Namespace) -> None:
     sr, y = read_wav(Path(args.wav))
@@ -2501,7 +2653,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         dest="cmd",
         required=True,
         title="commands",
-        metavar="{gen,detect,analyze,compare}",
+        metavar="{gen,voicecues,detect,analyze,compare}",
     )
 
     # common = argparse.ArgumentParser(add_help=False)
@@ -2517,6 +2669,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     d = sub.add_parser("detect", help="Detect start/end markers in a recorded file")
     a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
     c = sub.add_parser("compare", help="Compare multiple analyze run directories (shared axes by default)")
+    v = sub.add_parser("voicecues", help="Generate optional spoken cue WAVs for human reference")
 
     # -------- compare --------
     c.add_argument("runs", nargs="+", help="Analyze run directories (each containing summary.json + response*.csv)")
@@ -2592,6 +2745,42 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     g.add_argument("--tick-offset-s", type=float, default=1.5,
                 help="first tick offset from sweep start (seconds)")
 
+    # // voice cues
+    g.add_argument(
+        "--spoken-cues",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="prepend/append optional spoken begin/end cues for human reference",
+    )
+    g.add_argument(
+        "--spoken-cues-dir",
+        default="data/voice_cues",
+        help="directory containing begin_test.wav and end_test.wav",
+    )
+    g.add_argument(
+        "--spoken-cues-pad-s",
+        type=float,
+        default=1.0,
+        help="silence after begin cue and before end cue",
+    )
+    g.add_argument(
+        "--spoken-cues-dbfs",
+        type=float,
+        default=-14.0,
+        help="peak level for spoken cues",
+    )
+    g.add_argument(
+        "--spoken-cues-autogen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="auto-generate missing spoken cue WAVs from voice_cues.py if needed",
+    )
+    g.add_argument(
+        "--spoken-cues-regen",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="re-render spoken cue WAVs before building the main test file",
+    )
 
     # ------- detect -------
     d.add_argument("--channel", choices=["mono", "L", "R"], default="mono",
@@ -2746,7 +2935,17 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         help="matplotlib color for Right channel in overlay plot",
     )
 
-    return ap, {"gen": g, "detect": d, "analyze": a, "compare": c}
+    # -------- voicecues --------
+    v.add_argument("--outdir", default="data/voice_cues")
+    v.add_argument(
+        "--force",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="re-render cue WAVs even if they already exist",
+    )
+    v.set_defaults(func=cmd_voicecues)
+
+    return ap, {"gen": g, "voicecues": v, "detect": d, "analyze": a, "compare": c}
 
 # ----------------------
 # MAIN
@@ -2769,7 +2968,7 @@ def main() -> None:
 
     if "--help-all" in argv:
         print(ap.format_help())
-        for name in ("gen", "detect", "analyze", "compare"):
+        for name in ("gen", "voicecues", "detect", "analyze", "compare"):
             print("\n" + "=" * 80 + "\n")
             print(cmd_parsers[name].format_help())
         raise SystemExit(0)
@@ -2793,7 +2992,7 @@ def main() -> None:
 
     args = ap.parse_args(remaining)
 
-    if getattr(args, "cmd", None) in {"gen", "detect", "analyze", "compare"}:
+    if getattr(args, "cmd", None) in {"gen", "voicecues", "detect", "analyze", "compare"}:
         print(f"cassette-calibrator {__version__}")
 
     if not logging.getLogger().handlers:
