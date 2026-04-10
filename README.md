@@ -4,9 +4,11 @@
 
 A CLI-first cassette measurement/calibration tool with an optional local WebUI. It is designed for testing a compact cassette recording/playback chain with generated reference audio, automated marker detection, drift compensation, and response analysis.
 
-This program can be used for all sorts of signal chain analyses outside the realm of cassettes as well, but it's mainly inteded for that.
+The same workflow also works for plenty of other signal-chain measurements outside cassette use, but cassettes are the main target.
 
 It generates a cassette-friendly test WAV with configurable DTMF markers, then analyzes a recorded playback capture to estimate magnitude response, optional loopback-subtracted difference response, and SNR.
+
+The WebUI now also supports saved-run browsing, run regeneration from stored source WAV paths, configurable locked y-axis plotting for analysis/regen/compare, compare-grid rendering, editable run notes, and optional filesystem restriction to a configured WebUI root.
 
 ## What this does
 
@@ -44,7 +46,7 @@ Notes:
 
 ## Local WebUI (optional)
 
-A local-only, stdlib-only WebUI is included as `webui.py`. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
+A local-only, stdlib-only WebUI is included as `webui.py`. It supports generation, marker detection, analysis, saved-run browsing, note editing, regeneration, compare-grid rendering, WAV upload, and optional restricted-root filesystem access. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
 
 Launch:
 
@@ -62,15 +64,35 @@ Config (optional) via `cassette_calibrator.toml`:
 host = "127.0.0.1"
 port = 8765
 open_browser = true
+
+# Optional: reverse-proxy/subdirectory hosting
+url_prefix = ""
+
+# Optional: when true, older runs without explicit stored plot settings
+# can fall back to current config values for plot lock/min/max.
+legacy_run_plot_fallback_from_config = true
+
+# Optional: restrict the WebUI filesystem browser / file serving / writes
+# to a specific project subdirectory instead of the whole project root.
+restrict_to_root_dir = false
+allow_project_root_access = true
+root_dir = "data"
 ```
 
 ### WebUI features
 
-* Run `gen`, `detect`, `analyze` with the same defaults you use from CLI
-* Browse files safely (relative paths only) and create output directories
+* Run `gen`, `detect`, and `analyze` with the same defaults you use from CLI / TOML
+* Browse files safely using relative paths only
+* Upload WAV files into the allowed project area from the browser
+* Create output directories from the browser
 * Browse prior runs by scanning for `summary.json`
 * View plots/images referenced in `summary.json`
-* **Edit run notes for an existing run** (Save or Cancel) without re-running analysis
+* **Edit run notes for an existing run** without re-running analysis
+* **Regenerate a saved run** from the original stored source WAV paths
+* **Reuse saved effective analysis settings for regeneration**, including stored replay payloads
+* **Lock response plot y-axis** in analysis, regeneration, and compare rendering
+* Render compare grids across multiple saved runs
+* Optionally restrict WebUI browsing / file serving / writes to a configured subdirectory instead of the whole project root
 
 ### Editing run notes (WebUI)
 
@@ -83,21 +105,57 @@ Behavior:
 * Uses an atomic write (temp file + replace)
 * Preserves `mtime` so the run list ordering does not change just because notes were edited
 
-### Path rules (important)
+### Regenerating saved runs (WebUI)
 
-**Important:** the WebUI only accepts **relative paths under the project directory** (no absolute paths, no "..").
+The WebUI can regenerate a previously saved run by reading that run's `summary.json` and reusing the saved source WAV paths.
+
+Behavior:
+
+* Reads the original reference / recorded WAV paths from the saved run metadata
+* Creates a new run instead of overwriting the old one
+* Appends `-- regen` to the run name
+* Appends a regeneration note with source run path + timestamp
+* Preserves locked y-axis choices made in the regeneration UI
+* Reuses the saved effective replay payload when available, so regeneration follows the original analysis settings much more closely
+* Older runs without stored replay payloads fall back to legacy summary-based reconstruction
+
+Important:
+
+* Regeneration only works if the original source WAV files still exist under the allowed project area
+* The regenerated run writes a fresh `summary.json` and records which run it was regenerated from
+
+## Path rules (important)
+
+**Important:** the WebUI only accepts **relative paths under the allowed project area**. No absolute paths, and no `..`.
+
 If you paste `/home/you/recorded.wav`, you'll get:
 
 `ERROR: path must be relative (no absolute paths, no '..')`
 
-Fix: put the file under the repo (recommended `data/`) and use `data/recorded.wav` (or use the Browse button which returns relative paths).
+Fix: put the file under the repo (recommended `data/`) and use `data/recorded.wav`, or use the Browse button which returns safe relative paths.
+
+### WebUI root restriction
+
+By default, the WebUI operates under the project root.
+
+Optionally, you can restrict it to a configured subdirectory using:
+
+```toml
+[webui]
+restrict_to_root_dir = true
+allow_project_root_access = false
+root_dir = "data"
+```
+
+When restricted, the WebUI browser / file serving / uploads / directory creation / output paths are confined to that configured root.
 
 Security posture:
 
-* Binds to `127.0.0.1` by default.
-* Rejects absolute paths and any `..` traversal.
-* Only serves/browses files under the project directory.
-* Can write only within the project directory (for output dirs and run note edits).
+* Binds to `127.0.0.1` by default
+* Rejects absolute paths and any `..` traversal
+* Only serves/browses files under the allowed WebUI root
+* Can write only within the allowed WebUI root
+* The browser "Up" navigation stops cleanly at the allowed root instead of wandering higher
 
 ## Workflow
 
@@ -175,6 +233,12 @@ Run name/notes:
 * You can set a run name and run notes via CLI flags (see `python3 cassette_calibrator.py analyze --help`) and/or via the WebUI.
 * WebUI can also edit notes later for an existing run by updating that run's `summary.json`.
 
+WebUI note:
+
+* Saved runs can later be regenerated from the WebUI.
+* Regeneration creates a new run and reuses the stored source WAV paths plus the saved effective replay payload when available.
+* This is especially useful after changing plot lock/min/max or when re-checking old runs without manually rebuilding the full command line.
+
 ### 4b) Optional: ticks mode (non-linear drift correction)
 
 Cassette transports can drift non-linearly (wow/flutter). The default method uses a single linear warp based on the start/end markers, which corrects overall speed mismatch but can't fully fix curvature within the sweep.
@@ -239,23 +303,19 @@ In `--outdir`:
 ## Notes and gotchas
 
 * HF loss is often mechanical (azimuth, head wear, dirty path, wrong tape-type EQ) before it's "EQ fixing".
-
 * Cassette transports drift. This tool compensates drift with a linear warp between start/end markers.
-
 * For non-linear drift (wow/flutter), enable ticks mode (`gen --ticks` + `analyze --ticks`) for piecewise correction.
-
 * If marker detection fails:
-
   * Generate hotter markers: `--marker-dbfs -10`
   * Loosen detection: lower `--thresh` (e.g. 4.5) or set `--min-dbfs -60`
-
 * Before measuring: clean heads/capstan/pinch roller; check azimuth if HF looks nuked.
-
 * Set record level using the 1 kHz reference tone (avoid clipping / redlining).
-
 * Keep any NR / enhancers off unless you are specifically measuring them.
-
 * WebUI paths are **relative to the project root**. Put files under `data/` and browse/pick them.
+* Locked y-axis plotting is useful when comparing runs; otherwise autoscaling can make two bad runs look deceptively similar.
+* Regeneration of old runs depends on the original reference / recorded WAV files still being present.
+* Older runs that predate stored replay payload support may regenerate with a best-effort legacy fallback instead of a perfect reproduction of the original analysis invocation.
+* WebUI filesystem access can be restricted to a configured subdirectory; when enabled, paths outside that root are rejected.
 
 ## TODO / WIP
 
@@ -266,6 +326,23 @@ In `--outdir`:
 * Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
 
 ## Changelog / History
+
+* 0.3.0 - WebUI run regeneration, locked y-axis workflow, and stricter root/path handling
+
+  * [webui] Added saved-run regeneration from `summary.json`, creating a new run from the original stored source WAV paths instead of forcing manual re-entry.
+  * [webui] Regenerated runs now append `-- regen` to the run name and add a regeneration note with source run path + timestamp.
+  * [webui] Added persistent replay-payload storage in `summary.json` so regeneration can reuse the original effective analysis settings much more faithfully.
+  * [webui] Fixed regeneration to reuse the actual successful effective analysis args, not just the incoming minimal WebUI override payload.
+  * [webui] Preserved and exposed locked y-axis controls across main analysis, saved-run regeneration, and compare-grid rendering.
+  * [webui] Added per-run plot config fallback handling for older runs via `_summary_plot_cfg()` and config-driven defaults.
+  * [webui] Improved compare rendering so locked y-axis behavior is explicit and consistent when rendering shared-axis compare plots.
+  * [webui] Hardened optional WebUI root restriction behavior:
+    * configurable restricted root under `[webui]`
+    * cleaner enforcement of allowed-root traversal limits
+    * browser "Up" navigation stops at the allowed root
+    * uploads, browsing, file serving, and directory creation stay within the allowed root
+  * [webui] Clarified allowed-root state in the browser UI and tightened path-handling behavior for restricted deployments.
+  * [webui] Generalized the WebUI into a more coherent saved-run workflow: browse -> inspect -> edit notes -> regenerate -> compare.
 
 * 0.2.7 - WebUI defaults cleanup + optional spoken voice cues
 

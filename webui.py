@@ -9,7 +9,8 @@ Local-only WebUI for cassette-calibrator.
 
 Security posture:
 - Rejects absolute paths and any ".." path traversal
-- Only serves/browses files under the project directory
+- Only serves/browses files under the allowed WebUI root
+- The allowed WebUI root is the project root by default, or a configured subdirectory when restricted mode is enabled
 """
 
 from __future__ import annotations
@@ -175,7 +176,78 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("cassette_calibrator.webui")
 
+# resolve what is our root path and what is allowed for traversal
 ROOT = Path(__file__).resolve().parent
+
+WEBUI_ROOT = ROOT
+WEBUI_ROOT_REL = "."
+WEBUI_RESTRICT_TO_ROOT_DIR = False
+WEBUI_ALLOW_PROJECT_ROOT_ACCESS = True
+
+def _webui_is_restricted() -> bool:
+    return bool(WEBUI_RESTRICT_TO_ROOT_DIR) and (not bool(WEBUI_ALLOW_PROJECT_ROOT_ACCESS))
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    for p in paths:
+        try:
+            key = str(p.resolve())
+        except Exception:
+            key = str(p)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(p)
+
+    return out
+
+def _default_browser_root_rel() -> str:
+    if _webui_is_restricted():
+        return WEBUI_ROOT_REL
+    return "data" if (ROOT / "data").exists() else "."
+
+def _list_bases() -> list[Path]:
+    if _webui_is_restricted():
+        return [WEBUI_ROOT]
+
+    bases: list[Path] = []
+    if (ROOT / "data").exists():
+        bases.append(ROOT / "data")
+    bases.append(ROOT)
+    return _dedupe_paths(bases)
+
+def _resolve_webui_root_from_cfg(cfg: dict) -> tuple[Path, str]:
+    w = cfg.get("webui", {}) if isinstance(cfg.get("webui"), dict) else {}
+
+    restrict = bool(w.get("restrict_to_root_dir", False))
+    allow_project = bool(w.get("allow_project_root_access", True))
+    raw_root = str(w.get("root_dir", "data") or "data").strip()
+
+    if (not restrict) or allow_project:
+        return ROOT, "."
+
+    if not raw_root:
+        raise SystemExit("[webui].root_dir must not be empty")
+
+    if os.path.isabs(raw_root):
+        raise SystemExit("[webui].root_dir must be a relative path under the project root")
+
+    parts = Path(raw_root).parts
+    if any(part == ".." for part in parts):
+        raise SystemExit("[webui].root_dir must not contain '..'")
+
+    full = (ROOT / raw_root).resolve()
+    try:
+        full.relative_to(ROOT)
+    except Exception as e:
+        raise SystemExit("[webui].root_dir escapes project root") from e
+
+    full.mkdir(parents=True, exist_ok=True)
+    return full, str(full.relative_to(ROOT))
 
 IGNORE_DIRS = {
     ".git",
@@ -196,6 +268,41 @@ UPLOAD_EXTS = {".wav"}
 # ----------------
 # helper functions
 # ----------------
+
+# what keys to keep and copy during re-generation
+REGEN_COPY_KEYS = (
+    "fine_align",
+    "drift_warn",
+    "pre_s",
+    "pad_s",
+    "noisewin_s",
+    "tone_s",
+    "tone_hz",
+    "f1",
+    "f2",
+    "sweep_s",
+    "ir_win_s",
+    "f_plot_min",
+    "f_plot_max",
+    "win_ms",
+    "hop_ms",
+    "marker_tone_s",
+    "marker_gap_s",
+    "marker_dbfs",
+    "snr_noise_s",
+    "snr_tone_s",
+    "smooth_oct",
+    "countdown",
+    "countdown_from",
+    "lr_overlay_color_l",
+    "lr_overlay_color_r",
+)
+
+def _copy_present(dst: dict, src: dict, keys: tuple[str, ...]) -> None:
+    for k in keys:
+        v = src.get(k)
+        if v is not None:
+            dst[k] = v
 
 def _ascii_download_fallback(name: str) -> str:
     s = unicodedata.normalize("NFKD", str(name or "download"))
@@ -548,6 +655,326 @@ def _dtmf_candidate_configs(base_cfg: dict, preset_name: str) -> list[tuple[str,
 # HELPERS
 # -----------------------
 
+# regen for reanalysis
+def _require_existing_rel_wav(value, *, label: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} path is missing from saved run metadata")
+
+    rel = _rel_to_root_checked(raw)
+    full = ROOT / rel
+
+    if not full.exists():
+        raise FileNotFoundError(
+            f"{label} not found: {rel}\n"
+            "This saved run can only be regenerated if the original source WAV "
+            "still exists under the project directory."
+        )
+
+    if not full.is_file():
+        raise FileNotFoundError(f"{label} is not a file: {rel}")
+
+    if full.suffix.lower() != ".wav":
+        raise ValueError(f"{label} is not a WAV file: {rel}")
+
+    return rel
+
+def _channels_mode_from_summary(summary: dict) -> str:
+    chs = summary.get("channels_analyzed", [])
+    norm = [_norm_ch_name(str(c)) for c in chs]
+
+    if norm == ["mono"]:
+        return "mono"
+    if norm == ["L"]:
+        return "l"
+    if norm == ["R"]:
+        return "r"
+    if "L" in norm and "R" in norm:
+        return "stereo"
+
+    return "stereo"
+
+def _summary_has_impulse(summary: dict) -> bool:
+    per = summary.get("per_channel", {})
+    if not isinstance(per, dict):
+        return False
+
+    for item in per.values():
+        if not isinstance(item, dict):
+            continue
+        outs = item.get("outputs", {})
+        if isinstance(outs, dict) and outs.get("impulse_png"):
+            return True
+
+    return False
+
+def _api_analyze_from_payload(payload: dict, cfg: dict) -> dict:
+    ref = _require_existing_rel_wav(payload.get("ref"), label="Reference WAV")
+    rec = _require_existing_rel_wav(payload.get("rec"), label="Recorded WAV")
+
+    loopback = None
+    loopback_raw = _opt_str(payload.get("loopback"))
+    if loopback_raw:
+        loopback = _require_existing_rel_wav(loopback_raw, label="Loopback WAV")
+
+    form_defaults = _build_form_defaults(cfg)
+    outdir_raw = _payload_str_or_default(payload, "outdir", form_defaults["an_outdir"])
+    outdir = _ensure_outdir_rel(outdir_raw)
+
+    overrides = {
+        "ref": ref,
+        "rec": rec,
+        "outdir": outdir,
+    }
+
+    if loopback:
+        overrides["loopback"] = loopback
+
+    dfl = _cmd_argparse_defaults("analyze")
+
+    def _set_first_dest(value, *dest_names: str) -> None:
+        for dn in dest_names:
+            if dn in dfl:
+                overrides[dn] = value
+                return
+
+    def _maybe_str(api_key: str, *dest_names: str, normalizer=None) -> None:
+        if api_key not in payload:
+            return
+        s = _opt_str(payload.get(api_key))
+        if s is None:
+            return
+        if normalizer is not None:
+            s = normalizer(s)
+        _set_first_dest(s, *dest_names)
+
+    def _maybe_bool(api_key: str, *dest_names: str) -> None:
+        if api_key not in payload:
+            return
+        _set_first_dest(bool(payload.get(api_key)), *dest_names)
+
+    def _maybe_float(api_key: str, *dest_names: str) -> None:
+        if api_key not in payload:
+            return
+        fv = _coerce_float(payload.get(api_key), default=None)
+        if fv is None:
+            return
+        _set_first_dest(fv, *dest_names)
+
+    def _maybe_int(api_key: str, *dest_names: str) -> None:
+        if api_key not in payload:
+            return
+        v = payload.get(api_key)
+        if v is None or v == "":
+            return
+        try:
+            iv = int(v)
+        except Exception:
+            return
+        _set_first_dest(iv, *dest_names)
+
+    _maybe_str("run_name", "run_name", "name")
+    _maybe_str("run_notes", "run_notes", "notes")
+    _maybe_str("channels", "channels")
+    _maybe_str("marker_channel", "marker_channel", normalizer=lambda s: _normalize_marker_channel(str(s)))
+    _maybe_str("marker_start", "marker_start")
+    _maybe_str("marker_end", "marker_end")
+    _maybe_str("tick_sym", "tick_sym")
+    _maybe_str("lr_overlay_color_l", "lr_overlay_color_l")
+    _maybe_str("lr_overlay_color_r", "lr_overlay_color_r")
+
+    _maybe_bool("lock_y_axis", "lock_y_axis")
+    _maybe_bool("fine_align", "fine_align")
+    _maybe_bool("lr_overlay", "lr_overlay")
+    _maybe_bool("save_ir", "save_ir")
+    _maybe_bool("countdown", "countdown")
+    _maybe_bool("ticks", "ticks")
+
+    _maybe_float("plot_y_min", "plot_y_min")
+    _maybe_float("plot_y_max", "plot_y_max")
+    _maybe_float("min_dbfs", "min_dbfs")
+    _maybe_float("thresh", "thresh")
+    _maybe_float("drift_warn", "drift_warn")
+    _maybe_float("pre_s", "pre_s")
+    _maybe_float("pad_s", "pad_s")
+    _maybe_float("noisewin_s", "noisewin_s")
+    _maybe_float("tone_s", "tone_s")
+    _maybe_float("tone_hz", "tone_hz")
+    _maybe_float("f1", "f1")
+    _maybe_float("f2", "f2")
+    _maybe_float("sweep_s", "sweep_s")
+    _maybe_float("ir_win_s", "ir_win_s")
+    _maybe_float("f_plot_min", "f_plot_min")
+    _maybe_float("f_plot_max", "f_plot_max")
+    _maybe_float("win_ms", "win_ms")
+    _maybe_float("hop_ms", "hop_ms")
+    _maybe_float("marker_tone_s", "marker_tone_s")
+    _maybe_float("marker_gap_s", "marker_gap_s")
+    _maybe_float("marker_dbfs", "marker_dbfs")
+    _maybe_float("snr_noise_s", "snr_noise_s")
+    _maybe_float("snr_tone_s", "snr_tone_s")
+    _maybe_float("tick_interval_s", "tick_interval_s")
+    _maybe_float("tick_tone_s", "tick_tone_s")
+    _maybe_float("tick_dbfs", "tick_dbfs")
+    _maybe_float("tick_offset_s", "tick_offset_s")
+    _maybe_float("tick_match_tol_s", "tick_match_tol_s")
+
+    _maybe_int("smooth_oct", "smooth_oct")
+    _maybe_int("countdown_from", "countdown_from")
+    _maybe_int("tick_min_matches", "tick_min_matches")
+
+    dtmf_in = payload.get("dtmf", None)
+    dtmf_obj = dtmf_in if isinstance(dtmf_in, dict) else {}
+
+    dtmf_preset = _coerce_str(dtmf_obj.get("preset"), default="default") or "default"
+    dtmf_autotune = bool(dtmf_obj.get("autotune", True))
+
+    base_dtmf_cfg = {
+        "min_dbfs": _coerce_float(dtmf_obj.get("min_dbfs"), default=None),
+        "thresh": _coerce_float(dtmf_obj.get("thresh"), default=None),
+        "marker_channel": _coerce_str(dtmf_obj.get("marker_channel"), default=None),
+    }
+
+    if base_dtmf_cfg.get("marker_channel") is not None:
+        base_dtmf_cfg["marker_channel"] = _normalize_marker_channel(base_dtmf_cfg["marker_channel"])
+
+    replay_payload = dict(overrides)
+
+    replay_dtmf = {
+        "preset": dtmf_preset,
+        "autotune": dtmf_autotune,
+    }
+    for k, v in base_dtmf_cfg.items():
+        if v is not None:
+            replay_dtmf[k] = v
+
+    LOG.info("analyze: ref=%s rec=%s loopback=%s outdir=%s", ref, rec, loopback, outdir)
+
+    attempts = []
+    used_label = None
+    used_cfg = None
+    used_args_payload = None
+
+    if dtmf_autotune:
+        cand_list = _dtmf_candidate_configs(base_dtmf_cfg, dtmf_preset)
+    else:
+        preset = DTMF_PRESETS.get(dtmf_preset) or DTMF_PRESETS["default"]
+        cfg0 = dict(preset)
+        for k, v in base_dtmf_cfg.items():
+            if v is not None:
+                cfg0[k] = v
+        cand_list = [("as_requested", cfg0)]
+
+    ok = False
+    log_txt = ""
+    err = None
+
+    for label, dtmf_cfg in cand_list:
+        ov = dict(overrides)
+        _apply_dtmf_cfg(ov, dfl, dtmf_cfg)
+
+        args = _make_args("analyze", cfg, ov)
+        ok, log_txt, err = _run_cc_cmd(cc.cmd_analyze, args)
+
+        attempts.append({
+            "label": label,
+            "dtmf_cfg": dtmf_cfg,
+            "ok": bool(ok),
+            "error": err,
+        })
+
+        if ok:
+            used_label = label
+            used_cfg = dtmf_cfg
+            used_args_payload = dict(vars(args))            
+            break
+
+        if not dtmf_autotune:
+            break
+
+        if not _is_marker_failure(err, log_txt):
+            break
+
+    if not ok:
+        raise ValueError(
+            json.dumps({
+                "ok": False,
+                "error": err,
+                "log": log_txt,
+                "dtmf": {
+                    "preset": dtmf_preset,
+                    "autotune": dtmf_autotune,
+                    "attempts": attempts,
+                },
+            }, ensure_ascii=False)
+        )
+
+    base = ROOT / outdir
+    candidates = list(base.rglob("summary.json")) if base.exists() else []
+    if not candidates:
+        raise RuntimeError("analyze succeeded but summary.json was not created")
+
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    summary_path = candidates[0]
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    plot_cfg = _summary_plot_cfg(summary, cfg)
+    summary["_webui_plot_cfg"] = plot_cfg
+
+    # Save the actual effective replay payload so regen can reuse the original analysis settings.
+    # Use the successful effective args, not just the incoming WebUI overrides.
+    replay_payload = dict(used_args_payload or overrides)
+
+    # Prefer the actually-used DTMF config if autotune settled on something specific.
+    if used_cfg is not None:
+        replay_payload["dtmf"] = {
+            "preset": dtmf_preset,
+            "autotune": False,
+            **{k: v for k, v in used_cfg.items() if v is not None},
+        }
+    else:
+        replay_payload["dtmf"] = replay_dtmf
+
+    summary["_webui_replay_payload"] = replay_payload
+    _write_json_atomic_preserve_mtime(summary_path, summary)
+
+    return {
+        "ok": True,
+        "summary": summary,
+        "log": log_txt,
+        "dtmf": {
+            "preset": dtmf_preset,
+            "used": used_label,
+            "cfg": used_cfg,
+            "attempts": attempts,
+        },
+    }
+
+# fallback for legacy versions
+def _summary_plot_cfg(summary: dict, cfg: dict) -> dict:
+    plot = summary.get("plot", {}) if isinstance(summary, dict) else {}
+    if not isinstance(plot, dict):
+        plot = {}
+
+    webui_cfg = cfg.get("webui", {}) if isinstance(cfg.get("webui"), dict) else {}
+    use_cfg_fallback = bool(webui_cfg.get("legacy_run_plot_fallback_from_config", True))
+
+    form_defaults = _build_form_defaults(cfg)
+
+    if use_cfg_fallback:
+        default_lock = bool(form_defaults.get("an_lock_y_axis", True))
+        default_ymin = float(form_defaults.get("an_plot_y_min", -35.0))
+        default_ymax = float(form_defaults.get("an_plot_y_max", 5.0))
+    else:
+        default_lock = True
+        default_ymin = -35.0
+        default_ymax = 5.0
+
+    return {
+        "lock_y_axis": bool(plot.get("lock_y_axis", default_lock)),
+        "plot_y_min": float(plot.get("plot_y_min", default_ymin)),
+        "plot_y_max": float(plot.get("plot_y_max", default_ymax)),
+    }
+
 def _payload_str_or_default(payload: dict, key: str, default: str) -> str:
     v = payload.get(key, None)
     if v is None:
@@ -581,22 +1008,38 @@ def _is_rel_safe(p: str) -> bool:
         return False
     return True
 
-def _rel_to_root_checked(p: str) -> str:
+def _rel_to_project_root_checked(p: str) -> str:
     p = (p or "").strip()
     if not _is_rel_safe(p):
         raise ValueError("path must be relative (no absolute paths, no '..')")
+
     full = (ROOT / p).resolve()
-    # Ensure it doesn't escape ROOT (resolve can still escape via symlinks)
     try:
         full.relative_to(ROOT)
     except Exception as e:
         raise ValueError("path escapes project root") from e
+
     return str(full.relative_to(ROOT))
+
+def _rel_to_root_checked(p: str) -> str:
+    rel = _rel_to_project_root_checked(p)
+    full = (ROOT / rel).resolve()
+    base = WEBUI_ROOT if _webui_is_restricted() else ROOT
+
+    try:
+        full.relative_to(base)
+    except Exception as e:
+        if _webui_is_restricted():
+            raise ValueError(f"path is outside the allowed WebUI root: {WEBUI_ROOT_REL}")
+        raise ValueError("path escapes project root") from e
+
+    return rel
 
 def _ensure_outdir_rel(p: str) -> str:
     p = (p or "").strip()
     if not p:
         raise ValueError("outdir is required")
+
     p = _rel_to_root_checked(p)
     (ROOT / p).mkdir(parents=True, exist_ok=True)
     return p
@@ -637,6 +1080,9 @@ def _build_form_defaults(cfg: dict) -> dict:
         "gen_out": gen_out,
         "an_ref": gen_out,
         "an_outdir": analyze_outdir,
+        "an_lock_y_axis": bool(analyze_defaults.get("lock_y_axis", True)),
+        "an_plot_y_min": float(analyze_defaults.get("plot_y_min", -35.0)),
+        "an_plot_y_max": float(analyze_defaults.get("plot_y_max", 5.0)),
     }
 
 # -------------------------------------------
@@ -762,8 +1208,8 @@ def _make_args(cmd: str, cfg: dict, overrides: dict | None) -> SimpleNamespace:
         args.update(overrides)
 
     # Normalizations (because we bypass argparse parsing)
-    if cmd == "analyze" and "channels" in args:
-        args["channels"] = cc.parse_channels(str(args["channels"]))
+    if cmd == "analyze" and "channels" in args and isinstance(args["channels"], str):
+        args["channels"] = cc.parse_channels(args["channels"])
 
     if cmd == "detect" and "channel" in args:
         args["channel"] = _normalize_marker_channel(str(args["channel"]))
@@ -780,13 +1226,13 @@ def _walk_pruned(base: Path):
         dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
         yield root_p, dirs, files
 
-
 def _list_files(exts: tuple[str, ...], max_items: int = 2000) -> list[str]:
     out: list[str] = []
-    # Prefer data/ first
-    for base in (ROOT / "data", ROOT):
+
+    for base in _list_bases():
         if not base.exists():
             continue
+
         for root_p, _dirs, files in _walk_pruned(base):
             for fn in files:
                 p = root_p / fn
@@ -795,48 +1241,55 @@ def _list_files(exts: tuple[str, ...], max_items: int = 2000) -> list[str]:
                         rel = str(p.relative_to(ROOT))
                     except Exception:
                         continue
+
                     out.append(rel)
                     if len(out) >= max_items:
                         break
+
             if len(out) >= max_items:
                 break
-    return sorted(set(out))
 
+        if len(out) >= max_items:
+            break
+
+    return sorted(set(out))
 
 def _list_result_dirs(max_items: int = 2000) -> list[str]:
     out: list[str] = []
-    for p in ROOT.rglob("summary.json"):
-        try:
-            rel = str(p.parent.relative_to(ROOT))
-        except Exception:
+
+    for base in _list_bases():
+        if not base.exists():
             continue
-        out.append(rel)
+
+        for p in base.rglob("summary.json"):
+            try:
+                rel = str(p.parent.relative_to(ROOT))
+            except Exception:
+                continue
+
+            out.append(rel)
+            if len(out) >= max_items:
+                break
+
         if len(out) >= max_items:
             break
+
     return sorted(set(out))
 
-
 def _list_runs(max_items: int = 500) -> list[dict]:
-    """
-    Return runs with lightweight metadata:
-      {dir, mtime, name, created_at, label}
-    Prefers scanning under data/ if it exists.
-    """
     runs: list[dict] = []
-
-    bases = []
-    if (ROOT / "data").exists():
-        bases.append(ROOT / "data")
-    bases.append(ROOT)
-
     seen = set()
 
-    for base in bases:
+    for base in _list_bases():
+        if not base.exists():
+            continue
+
         for p in base.rglob("summary.json"):
             try:
                 run_dir = str(p.parent.relative_to(ROOT))
             except Exception:
                 continue
+
             if run_dir in seen:
                 continue
             seen.add(run_dir)
@@ -859,7 +1312,6 @@ def _list_runs(max_items: int = 500) -> list[dict]:
             except Exception:
                 pass
 
-            # label: "name -- dir" or just dir
             label = (f"{name} -- {run_dir}" if name else run_dir)
 
             runs.append({
@@ -872,25 +1324,23 @@ def _list_runs(max_items: int = 500) -> list[dict]:
 
             if len(runs) >= max_items:
                 break
+
         if len(runs) >= max_items:
             break
 
     runs.sort(key=lambda x: x.get("mtime", 0), reverse=True)
     return runs
 
-
 def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | None) -> dict:
-    """
-    mode: "file" or "dir"
-    exts: list like [".wav", ".png"] to filter files; ignored for mode="dir"
-    q: optional substring filter (case-insensitive) on name/path
-    """
     rel_dir = (rel_dir or "").strip()
-    if rel_dir == "":
-        # Default to data/ when present
-        rel_dir = "data" if (ROOT / "data").exists() else "."
+    browse_root = WEBUI_ROOT if _webui_is_restricted() else ROOT
 
-    # Special-case "." for root browsing
+    if rel_dir == "":
+        rel_dir = _default_browser_root_rel()
+
+    if rel_dir == "." and _webui_is_restricted():
+        rel_dir = WEBUI_ROOT_REL
+
     if rel_dir == ".":
         rel_checked = "."
         full = ROOT
@@ -901,7 +1351,6 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
     if not full.exists() or not full.is_dir():
         raise ValueError(f"not a directory: {rel_dir}")
 
-    # Normalize exts
     exts_norm: list[str] = []
     if exts:
         for e in exts:
@@ -917,7 +1366,6 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
     entries = []
     count = 0
 
-    # Always include dirs; include files only if mode=="file"
     for p in sorted(full.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
         name = p.name
         if name in IGNORE_DIRS:
@@ -928,7 +1376,6 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
         except Exception:
             continue
 
-        # Query filter
         if qn:
             if qn not in name.lower() and qn not in relp.lower():
                 continue
@@ -946,9 +1393,9 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
         else:
             if mode != "file":
                 continue
-            if exts_norm:
-                if p.suffix.lower() not in exts_norm:
-                    continue
+            if exts_norm and p.suffix.lower() not in exts_norm:
+                continue
+
             st = p.stat()
             entries.append({
                 "name": name,
@@ -963,12 +1410,16 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
             break
 
     parent = None
-    if full != ROOT:
+    if full != browse_root:
         parent = str(full.parent.relative_to(ROOT))
+
+    root_dir = WEBUI_ROOT_REL if _webui_is_restricted() else "."
 
     return {
         "cwd": rel_checked if rel_checked != "." else ".",
         "parent": parent,
+        "root_dir": root_dir,
+        "at_root": (full == browse_root),
         "mode": mode,
         "exts": exts_norm,
         "q": q or "",
@@ -1016,14 +1467,18 @@ def _slug(s: str) -> str:
             out.append("_")
     return "".join(out).strip("_") or "x"
 
-def _load_summary_for_run_dir(rel_run_dir: str) -> dict:
+def _load_summary_for_run_dir(rel_run_dir: str, cfg: dict | None = None) -> dict:
     rel_run_dir = _rel_to_root_checked(rel_run_dir)
     p = (ROOT / rel_run_dir / "summary.json")
     if not p.exists() or not p.is_file():
         raise ValueError(f"summary.json not found for run: {rel_run_dir}")
+
     obj = json.loads(p.read_text(encoding="utf-8"))
     if not isinstance(obj, dict):
         raise ValueError(f"summary.json is not an object for run: {rel_run_dir}")
+
+    plot_cfg = _summary_plot_cfg(obj, cfg or {})
+    obj["_webui_plot_cfg"] = plot_cfg
     return obj
 
 def _run_label(rel_run_dir: str, summary: dict) -> str:
@@ -1199,6 +1654,9 @@ def _compare_render_grid(
     tile_w: int,
     tile_h: int,
     dpi: int,
+    lock_y_axis: bool = True,
+    plot_y_min: float | None = None,
+    plot_y_max: float | None = None,
 ) -> tuple[str, str]:
     """
     Returns (out_png_rel, log_text).
@@ -1289,7 +1747,7 @@ def _compare_render_grid(
         xs_all: list[float] = []
         ys_all: list[float] = []
 
-        for (ch, j), (xs, ys) in series.items():
+        for (_ch, _j), (xs, ys) in series.items():
             for x, y in zip(xs, ys):
                 if logx_default and x <= 0:
                     continue
@@ -1298,19 +1756,36 @@ def _compare_render_grid(
                 xs_all.append(x)
                 ys_all.append(y)
 
-        if xs_all and ys_all:
+        if xs_all:
             x_min = min(xs_all)
             x_max = max(xs_all)
-            y_min = min(ys_all)
-            y_max = max(ys_all)
-
-            # avoid degenerate limits
             if x_min == x_max:
                 x_min *= 0.9
                 x_max *= 1.1
+
+        if lock_y_axis:
+            if plot_y_min is None or plot_y_max is None:
+                raise ValueError("plot_y_min/plot_y_max are required when lock_y_axis is enabled")
+
+            y0 = float(plot_y_min)
+            y1 = float(plot_y_max)
+
+            if not (math.isfinite(y0) and math.isfinite(y1)):
+                raise ValueError("plot_y_min/plot_y_max must be finite")
+            if y0 >= y1:
+                raise ValueError("plot_y_min must be smaller than plot_y_max")
+
+            y_min = y0
+            y_max = y1
+            log_lines.append(f"[info] compare: locked y-axis enabled ({y_min:.2f} .. {y_max:.2f} dB)")
+
+        elif ys_all:
+            y_min = min(ys_all)
+            y_max = max(ys_all)
             if y_min == y_max:
                 y_min -= 1.0
                 y_max += 1.0
+            log_lines.append(f"[info] compare: auto y-axis from data ({y_min:.2f} .. {y_max:.2f})")
 
     # Helpers: row/col labels
     def _short_run_label(r: dict) -> str:
@@ -2004,19 +2479,6 @@ INDEX_HTML = r"""<!doctype html>
     background: rgba(255,255,255,0.55);
     }
 
-   .cassette-mark {
-     height: 1.35em;
-     width: auto;
-     margin-left: 0.18em;
-     vertical-align: -0.12em;
-   
-     border: none;
-     border-radius: 0;
-     background: transparent;
-     box-shadow: none;
-     display: inline-block;
-   }
-
    .page-footer {
     margin-top: 26px;
     padding: 14px 18px;
@@ -2057,7 +2519,7 @@ INDEX_HTML = r"""<!doctype html>
     border-bottom-style: solid;
   }
 
-  .cassette-mark {
+.cassette-mark {
   height: 1.45em;
   width: auto;
   margin-left: 0.18em;
@@ -2072,7 +2534,7 @@ INDEX_HTML = r"""<!doctype html>
   filter:
     drop-shadow(0 1px 0 rgba(255,255,255,0.35))
     drop-shadow(0 2px 6px rgba(28,44,66,0.22));
-  }
+}
 
 .op-summary,
 .detect-summary {
@@ -2150,6 +2612,39 @@ INDEX_HTML = r"""<!doctype html>
 .detect-summary code,
 .detect-summary .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.mb-status {
+  display: none;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-border);
+  background: var(--panel-bg);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.mb-status.show {
+  display: block;
+}
+
+.mb-status.error {
+  border-color: #b71c1c;
+  background: #fdecec;
+  color: #8b0000;
+}
+
+.mb-status.warn {
+  border-color: #b26a00;
+  background: #fff4df;
+  color: #8a5300;
+}
+
+.mb-status.info {
+  border-color: #2f5f8a;
+  background: #eaf2fb;
+  color: #24415c;
 }
 
   </style>
@@ -2322,6 +2817,30 @@ INDEX_HTML = r"""<!doctype html>
         <button onclick="openBrowser('an_lb', {mode:'file', exts:['.wav'], title:'Choose loopback WAV'})">Browse</button>
       </div>
 
+      <div class="block">
+        <h4>Response plot y-axis</h4>
+        <div class="small">
+          Locks the y-axis for response plots and the stereo L/R overlay plot, so comparisons do not lie by autoscaling.
+        </div>
+
+        <label style="display:flex; gap:10px; align-items:center; margin-top:10px;">
+          <input id="an_lock_y_axis" type="checkbox" __AN_LOCK_Y_AXIS_CHECKED__ style="width:auto; margin:0;" />
+          Lock y-axis
+        </label>
+
+        <div class="row" style="align-items:flex-end; margin-top:8px;">
+          <div style="flex:1; min-width:160px;">
+            <label>Min dB</label>
+            <input id="an_plot_y_min" type="number" step="0.5" value="__AN_PLOT_Y_MIN_DEFAULT__" />
+          </div>
+
+          <div style="flex:1; min-width:160px;">
+            <label>Max dB</label>
+            <input id="an_plot_y_max" type="number" step="0.5" value="__AN_PLOT_Y_MAX_DEFAULT__" />
+          </div>
+        </div>
+      </div>      
+
       <label>Output directory (relative path; don't change unless for some specific purpose)</label>
       <div class="grid2">
         <input id="an_outdir" value="__AN_OUTDIR_DEFAULT__" />
@@ -2363,6 +2882,33 @@ INDEX_HTML = r"""<!doctype html>
     <button onclick="loadSelectedRun()">Load run</button>
     <div id="runs_header"></div>
 
+    <div class="block">
+      <h4>Regenerate selected run</h4>
+      <div class="small">
+        Re-runs the selected analysis using the saved source WAV paths from summary.json.
+        A new regenerated run will be created, with "-- regen" appended to the run name.
+      </div>
+
+      <label style="display:flex; gap:10px; align-items:center; margin-top:10px;">
+        <input id="runs_lock_y_axis" type="checkbox" checked style="width:auto; margin:0;" />
+        Lock y-axis
+      </label>
+
+      <div class="row" style="align-items:flex-end; margin-top:8px;">
+        <div style="flex:1; min-width:160px;">
+          <label>Min dB</label>
+          <input id="runs_plot_y_min" type="number" step="0.5" value="__AN_PLOT_Y_MIN_DEFAULT__" />
+        </div>
+
+        <div style="flex:1; min-width:160px;">
+          <label>Max dB</label>
+          <input id="runs_plot_y_max" type="number" step="0.5" value="__AN_PLOT_Y_MAX_DEFAULT__" />
+        </div>
+      </div>
+
+      <button onclick="rerunSelectedRun()">Regenerate run</button>
+    </div>
+    
     <div style="margin-top:8px;">
         <button id="runs_notes_edit_btn" onclick="runsEditNotes()" style="display:none">Edit notes</button>
     </div>
@@ -2451,6 +2997,30 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
 
+        <div class="block">
+        <h4>Plot y-axis</h4>
+        <div class="small">
+          Locks the y-axis for compare plots so run-to-run comparisons do not lie by autoscaling.
+        </div>
+
+        <label style="display:flex; gap:10px; align-items:center; margin-top:10px;">
+          <input id="cmp_lock_y_axis" type="checkbox" checked style="width:auto; margin:0;" />
+          Lock y-axis
+        </label>
+
+        <div class="row" style="align-items:flex-end; margin-top:8px;">
+          <div style="flex:1; min-width:160px;">
+            <label>Min dB</label>
+            <input id="cmp_plot_y_min" type="number" step="0.5" value="__CMP_PLOT_Y_MIN_DEFAULT__" />
+          </div>
+
+          <div style="flex:1; min-width:160px;">
+            <label>Max dB</label>
+            <input id="cmp_plot_y_max" type="number" step="0.5" value="__CMP_PLOT_Y_MAX_DEFAULT__" />
+          </div>
+        </div>
+      </div>
+
       <button onclick="doCompare()">Render compare grid</button>
 
       <pre id="cmp_log"></pre>
@@ -2509,11 +3079,13 @@ INDEX_HTML = r"""<!doctype html>
     <div class="modal-body">
 
         <div class="modal-controls">
-        <button onclick="mbUp()">Up</button>
-        <button onclick="mbHome()">Home</button>
-        <input id="mb_q" placeholder="filter..." oninput="mbRefresh()" />
-        <span id="mb_hint" class="muted"></span>
+          <button id="mb_up_btn" onclick="mbUp()">Up</button>
+          <button onclick="mbHome()">Home</button>
+          <input id="mb_q" placeholder="filter..." oninput="mbRefresh()" />
+          <span id="mb_hint" class="muted"></span>
         </div>
+
+        <div id="mb_status" class="mb-status" role="alert" aria-live="polite"></div>        
 
         <div id="mb_upload_row" class="block" style="display:none; margin-top:8px;">
         <h4 style="margin:0 0 8px 0;">Upload WAV</h4>
@@ -2596,6 +3168,37 @@ function readDtmfCfg() {
     thresh: parseFloat(document.getElementById("dtmf_thresh").value),
     marker_channel: document.getElementById("dtmf_marker_channel").value
   };
+}
+
+function syncAnalyzeYAxisUi() {
+  const locked = document.getElementById("an_lock_y_axis").checked;
+  document.getElementById("an_plot_y_min").disabled = !locked;
+  document.getElementById("an_plot_y_max").disabled = !locked;
+}
+
+function syncCompareYAxisUi() {
+  const locked = document.getElementById("cmp_lock_y_axis").checked;
+  document.getElementById("cmp_plot_y_min").disabled = !locked;
+  document.getElementById("cmp_plot_y_max").disabled = !locked;
+}
+
+function mbSetStatus(msg, kind = "info") {
+  const el = document.getElementById("mb_status");
+  if (!el) return;
+
+  const text = String(msg || "").trim();
+  if (!text) {
+    el.textContent = "";
+    el.className = "mb-status";
+    return;
+  }
+
+  el.textContent = text;
+  el.className = `mb-status show ${kind}`;
+}
+
+function mbClearStatus() {
+  mbSetStatus("", "info");
 }
 
 let MB = {
@@ -2884,6 +3487,41 @@ function renderDetectSummary(result) {
   `;
 }
 
+async function rerunSelectedRun() {
+  try {
+    const dir = (document.getElementById("runs_sel").value || "").trim();
+    if (!dir) return;
+
+    setLog("runs_log", "regenerating run from saved source WAVs...");
+
+    const r = await api("/api/run_regen", {
+      dir,
+      lock_y_axis: document.getElementById("runs_lock_y_axis").checked,
+      plot_y_min: parseFloat(document.getElementById("runs_plot_y_min").value),
+      plot_y_max: parseFloat(document.getElementById("runs_plot_y_max").value)
+    });
+
+    const newRunDir = ((((r || {}).summary || {}).run || {}).outdir || "").trim();
+
+    await refreshRuns({
+      preselectDir: newRunDir,
+      autoload: true,
+      preserveSelection: false,
+      placeholder: true
+    });
+
+    // prepend regen command log on top of the loaded summary JSON
+    if (r.log) {
+      const cur = document.getElementById("runs_log").textContent || "";
+      setLog("runs_log", r.log + "\n\n" + cur);
+    }
+
+    await refreshCompareRuns(newRunDir);
+  } catch (e) {
+    setLog("runs_log", "ERROR: " + e.message);
+  }
+}
+
 async function refreshCompareRuns(preselectDir) {
   try {
     const avail = document.getElementById("cmp_avail");
@@ -2989,7 +3627,21 @@ async function doCompare() {
     const tile_h = parseInt(document.getElementById("cmp_tile_h").value || "650", 10);
     const dpi = parseInt(document.getElementById("cmp_dpi").value || "150", 10);
 
-    const r = await api("/api/compare", { runs, metric, channels, tile_w, tile_h, dpi });
+    const lock_y_axis = document.getElementById("cmp_lock_y_axis").checked;
+    const plot_y_min = parseFloat(document.getElementById("cmp_plot_y_min").value);
+    const plot_y_max = parseFloat(document.getElementById("cmp_plot_y_max").value);
+
+    const r = await api("/api/compare", {
+      runs,
+      metric,
+      channels,
+      tile_w,
+      tile_h,
+      dpi,
+      lock_y_axis,
+      plot_y_min,
+      plot_y_max
+    });
 
     let head = `ok -- ${r.metric} -- channels=${(r.channels||[]).join(",")} -- dpi=${r.dpi} -- tile=${r.tile_w}x${r.tile_h}\n`;
     if (r.log) head += "\n" + r.log;
@@ -3300,6 +3952,12 @@ function renderRunHeader(summary, fallbackTitle, prefix, forceNotes) {
   `;
 }
 
+function syncRunsYAxisUi() {
+  const locked = document.getElementById("runs_lock_y_axis").checked;
+  document.getElementById("runs_plot_y_min").disabled = !locked;
+  document.getElementById("runs_plot_y_max").disabled = !locked;
+}
+
 /* -------- modal browser -------- */
 
 function openBrowser(targetId, opts) {
@@ -3315,6 +3973,8 @@ function openBrowser(targetId, opts) {
   document.getElementById("mb_title").textContent = MB.title;
   document.getElementById("mb_q").value = "";
   document.getElementById("mb_upload_status").textContent = "";
+  mbClearStatus();
+
   document.getElementById("mb_hint").textContent =
     (MB.mode === "dir")
       ? "Pick a directory"
@@ -3327,6 +3987,7 @@ function openBrowser(targetId, opts) {
 
 function closeBrowser() {
   MB.open = false;
+  mbClearStatus();
   document.getElementById("mb_backdrop").style.display = "none";
   document.getElementById("mb").style.display = "none";
 }
@@ -3344,6 +4005,25 @@ async function mbRefresh() {
   const st = await apiGetJson("/api/browse?" + params.toString());
   MB.cwd = st.cwd;
   document.getElementById("mb_path").textContent = st.cwd;
+
+  const rootLabel = st.root_dir || ".";
+  const atRoot = !!st.at_root;
+  const upBtn = document.getElementById("mb_up_btn");
+
+  if (upBtn) {
+    upBtn.title = atRoot
+      ? `Already at allowed root: ${rootLabel}`
+      : "Go to parent directory";
+  }
+
+  document.getElementById("mb_hint").textContent =
+    atRoot
+      ? `At allowed root: ${rootLabel}`
+      : (
+          MB.mode === "dir"
+            ? "Pick a directory"
+            : ("Pick a file" + (MB.exts.length ? (" (" + MB.exts.join(", ") + ")") : ""))
+        );  
 
   const canUploadWav =
     MB.mode === "file" &&
@@ -3396,27 +4076,38 @@ async function mbRefresh() {
 
 function mbEnter(path) {
   MB.cwd = path;
+  mbClearStatus();
   mbRefresh();
 }
 
 async function mbUp() {
-  // Ask server for current, then use parent
-  const params = new URLSearchParams();
-  if (MB.cwd) params.set("dir", MB.cwd);
-  params.set("mode", MB.mode);
-  for (const e of MB.exts) params.append("ext", e);
+  try {
+    const params = new URLSearchParams();
+    if (MB.cwd) params.set("dir", MB.cwd);
+    params.set("mode", MB.mode);
+    for (const e of MB.exts) params.append("ext", e);
 
-  const st = await apiGetJson("/api/browse?" + params.toString());
-  if (st.parent) {
-    MB.cwd = st.parent;
-  } else {
-    MB.cwd = ".";
+    const st = await apiGetJson("/api/browse?" + params.toString());
+
+    if (st.parent) {
+      MB.cwd = st.parent;
+      mbClearStatus();
+      await mbRefresh();
+      return;
+    }
+
+    // Already at allowed root, do not silently pretend anything happened
+    MB.cwd = st.cwd || MB.cwd || ".";
+    const rootLabel = st.root_dir || st.cwd || ".";
+    mbSetStatus(`You can't go above the allowed root directory: ${rootLabel}`, "error");
+  } catch (e) {
+    mbSetStatus("ERROR: " + e.message, "error");
   }
-  mbRefresh();
 }
 
 function mbHome() {
   MB.cwd = "";
+  mbClearStatus();
   mbRefresh();
 }
 
@@ -3681,8 +4372,23 @@ async function doAnalyze() {
 
     const run_notes = (document.getElementById("an_notes").value || "").trim();
 
+    const lock_y_axis = document.getElementById("an_lock_y_axis").checked;
+    const plot_y_min = parseFloat(document.getElementById("an_plot_y_min").value);
+    const plot_y_max = parseFloat(document.getElementById("an_plot_y_max").value);
+
     const dtmf = readDtmfCfg();
-    const r = await api("/api/analyze", { ref, rec, loopback, outdir, run_name, run_notes, dtmf });
+    const r = await api("/api/analyze", {
+      ref,
+      rec,
+      loopback,
+      outdir,
+      run_name,
+      run_notes,
+      lock_y_axis,
+      plot_y_min,
+      plot_y_max,
+      dtmf
+    });
 
     // Header (includes notes block if summary.run.notes exists)
     document.getElementById("an_header").innerHTML =
@@ -3792,9 +4498,23 @@ async function loadSelectedRun() {
     document.getElementById("runs_notes_status").textContent = "";
     document.getElementById("runs_notes_edit_btn").style.display = "none";
 
-    const sumPath = dir.replace(/\/+$/,"") + "/summary.json";
-    const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
+    // old method
+    // const sumPath = dir.replace(/\/+$/,"") + "/summary.json";
+    // const summary = await apiGetJson("/file?path=" + encodeURIComponent(sumPath));
 
+    const r = await apiGetJson("/api/run_summary?dir=" + encodeURIComponent(dir));
+    const summary = r.summary;
+
+    const plotCfg = (summary && summary._webui_plot_cfg) ? summary._webui_plot_cfg : {};
+    const runsLock = document.getElementById("runs_lock_y_axis");
+    const runsMin = document.getElementById("runs_plot_y_min");
+    const runsMax = document.getElementById("runs_plot_y_max");
+
+    if (runsLock) runsLock.checked = !!plotCfg.lock_y_axis;
+    if (runsMin && Number.isFinite(Number(plotCfg.plot_y_min))) runsMin.value = Number(plotCfg.plot_y_min);
+    if (runsMax && Number.isFinite(Number(plotCfg.plot_y_max))) runsMax.value = Number(plotCfg.plot_y_max);
+    syncRunsYAxisUi();
+    
     RUNS_CTX.dir = dir;
     RUNS_CTX.summary = summary;
 
@@ -3837,6 +4557,25 @@ async function initPage() {
 window.addEventListener("DOMContentLoaded", () => {
   initDtmfPresetSelect();
   applyDtmfPreset(document.getElementById("dtmf_preset").value);
+
+  const anLock = document.getElementById("an_lock_y_axis");
+  if (anLock) {
+    anLock.addEventListener("change", syncAnalyzeYAxisUi);
+    syncAnalyzeYAxisUi();
+  }
+
+  const runsLock = document.getElementById("runs_lock_y_axis");
+  if (runsLock) {
+    runsLock.addEventListener("change", syncRunsYAxisUi);
+    syncRunsYAxisUi();
+  }
+
+  const cmpLock = document.getElementById("cmp_lock_y_axis");
+  if (cmpLock) {
+    cmpLock.addEventListener("change", syncCompareYAxisUi);
+    syncCompareYAxisUi();
+  }  
+
   initPage();
 });
 
@@ -3847,6 +4586,7 @@ Object.assign(window, {
   doAnalyze,
   refreshRuns,
   loadSelectedRun,
+  rerunSelectedRun,
   openBrowser,
   closeBrowser,
   mbUp,
@@ -3956,6 +4696,12 @@ class Handler(BaseHTTPRequestHandler):
         prefix = getattr(self.server, "url_prefix", "")
         req_path = _strip_optional_prefix(u.path, prefix)
 
+        # try to read config
+        try:
+            cfg = self.server.cfg  # type: ignore[attr-defined]
+        except Exception:
+            cfg = {}
+
         # If the configured prefix is hit without trailing slash, redirect to slash form.
         if prefix and u.path == prefix:
             self.send_response(302)
@@ -3964,7 +4710,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if req_path == "/":
-            logo_url = _prefix_url(prefix, "/assets/cassette_logo_garble.svg")
+            logo_url = _prefix_url(prefix, "/assets/cassette_logo_garble_v2.svg")
             form_defaults = _build_form_defaults(getattr(self.server, "cfg", {}) or {})
 
             html = INDEX_HTML
@@ -3976,6 +4722,28 @@ class Handler(BaseHTTPRequestHandler):
             html = html.replace("__GEN_OUT_DEFAULT__", pyhtml.escape(form_defaults["gen_out"], quote=True))
             html = html.replace("__AN_REF_DEFAULT__", pyhtml.escape(form_defaults["an_ref"], quote=True))
             html = html.replace("__AN_OUTDIR_DEFAULT__", pyhtml.escape(form_defaults["an_outdir"], quote=True))
+
+            # y-axis locking check
+            html = html.replace(
+                "__AN_LOCK_Y_AXIS_CHECKED__",
+                "checked" if form_defaults["an_lock_y_axis"] else "",
+            )
+            html = html.replace(
+                "__AN_PLOT_Y_MIN_DEFAULT__",
+                pyhtml.escape(str(form_defaults["an_plot_y_min"]), quote=True),
+            )
+            html = html.replace(
+                "__AN_PLOT_Y_MAX_DEFAULT__",
+                pyhtml.escape(str(form_defaults["an_plot_y_max"]), quote=True),
+            )
+            html = html.replace(
+                "__CMP_PLOT_Y_MIN_DEFAULT__",
+                pyhtml.escape(str(form_defaults["an_plot_y_min"]), quote=True),
+            )
+            html = html.replace(
+                "__CMP_PLOT_Y_MAX_DEFAULT__",
+                pyhtml.escape(str(form_defaults["an_plot_y_max"]), quote=True),
+            )
 
             self._text(200, html, "text/html; charset=utf-8")
             return
@@ -3993,6 +4761,16 @@ class Handler(BaseHTTPRequestHandler):
                 "runs": _list_runs(),
             }
             self._json(200, st)
+            return
+
+        if req_path == "/api/run_summary":
+            qs = parse_qs(u.query)
+            run_dir = (qs.get("dir", [""])[0] or "").strip()
+            try:
+                summary = _load_summary_for_run_dir(run_dir, cfg)
+                self._json(200, {"ok": True, "summary": summary})
+            except Exception as e:
+                self._json(400, {"ok": False, "error": str(e)})
             return
 
         if req_path == "/api/browse":
@@ -4073,7 +4851,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if req_path.startswith("/assets/"):
             try:
-                rel = _rel_to_root_checked(req_path.lstrip("/"))
+                rel = _rel_to_project_root_checked(req_path.lstrip("/"))
                 full = (ROOT / rel)
                 if not full.exists() or not full.is_file():
                     self._json(404, {"error": "file not found"})
@@ -4117,7 +4895,11 @@ class Handler(BaseHTTPRequestHandler):
         if req_path == "/api/upload_wav":
             try:
                 qs = parse_qs(u.query)
-                dir_in = (qs.get("dir", ["data"])[0] or "data").strip()
+
+                # check if traversal is allowed
+                default_upload_dir = WEBUI_ROOT_REL if _webui_is_restricted() else "data"
+                dir_in = (qs.get("dir", [default_upload_dir])[0] or default_upload_dir).strip()
+
                 rel_dir = _ensure_outdir_rel(dir_in)
                 target_dir = ROOT / rel_dir
 
@@ -4157,6 +4939,137 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         payload = self._read_json_body()
+
+        if req_path == "/api/run_regen":
+            try:
+                run_dir = str(payload.get("dir", "") or "").strip()
+                if not run_dir:
+                    raise ValueError("dir is required")
+
+                summary = _load_summary_for_run_dir(run_dir, cfg)
+                run_meta = summary.get("run", {}) if isinstance(summary.get("run"), dict) else {}
+                plot_cfg = _summary_plot_cfg(summary, cfg)
+
+                ref = _require_existing_rel_wav(summary.get("ref"), label="Reference WAV")
+                rec = _require_existing_rel_wav(summary.get("rec"), label="Recorded WAV")
+
+                loopback = None
+                loopback_raw = _opt_str(summary.get("loopback"))
+                if loopback_raw:
+                    loopback = _require_existing_rel_wav(loopback_raw, label="Loopback WAV")
+
+                lock_y_axis = bool(payload.get("lock_y_axis", plot_cfg["lock_y_axis"]))
+                plot_y_min = _coerce_float(payload.get("plot_y_min"), default=plot_cfg["plot_y_min"])
+                plot_y_max = _coerce_float(payload.get("plot_y_max"), default=plot_cfg["plot_y_max"])
+
+                if plot_y_min is None or plot_y_max is None:
+                    raise ValueError("plot y-axis values must be numeric")
+                if plot_y_min >= plot_y_max:
+                    raise ValueError("plot_y_min must be smaller than plot_y_max")
+
+                base_outdir_raw = _opt_str(run_meta.get("base_outdir")) or _build_form_defaults(cfg)["an_outdir"]
+                outdir = _ensure_outdir_rel(base_outdir_raw)
+
+                old_name = _opt_str(run_meta.get("name"))
+                regen_name = f"{old_name} -- regen" if old_name else f"{Path(run_dir).name} -- regen"
+
+                old_notes = _opt_str(run_meta.get("notes"))
+                regen_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                regen_note = f"[regen from {run_dir} at {regen_ts}]"
+                regen_notes = f"{old_notes}\n\n{regen_note}".strip() if old_notes else regen_note
+
+                saved_replay = summary.get("_webui_replay_payload")
+
+                if isinstance(saved_replay, dict):
+                    regen_payload = dict(saved_replay)
+
+                    # hard overrides for this new regenerated run
+                    regen_payload["ref"] = ref
+                    regen_payload["rec"] = rec
+                    regen_payload["outdir"] = outdir
+                    regen_payload["run_name"] = regen_name
+                    regen_payload["run_notes"] = regen_notes
+                    regen_payload["lock_y_axis"] = lock_y_axis
+                    regen_payload["plot_y_min"] = plot_y_min
+                    regen_payload["plot_y_max"] = plot_y_max
+
+                    if loopback:
+                        regen_payload["loopback"] = loopback
+                    else:
+                        regen_payload.pop("loopback", None)
+
+                else:
+                    # legacy fallback for older runs without _webui_replay_payload
+                    regen_payload = {
+                        "ref": ref,
+                        "rec": rec,
+                        "outdir": outdir,
+                    }
+
+                    _copy_present(regen_payload, summary, REGEN_COPY_KEYS)
+
+                    regen_payload.update({
+                        "run_name": regen_name,
+                        "run_notes": regen_notes,
+                        "channels": _channels_mode_from_summary(summary),
+                        "marker_channel": _norm_ch_name(summary.get("marker_channel") or "mono"),
+                        "marker_start": str(summary.get("marker_start") or ""),
+                        "marker_end": str(summary.get("marker_end") or ""),
+                        "lock_y_axis": lock_y_axis,
+                        "plot_y_min": plot_y_min,
+                        "plot_y_max": plot_y_max,
+                        "lr_overlay": bool((summary.get("stereo_outputs") or {}).get("lr_overlay_png")),
+                        "save_ir": _summary_has_impulse(summary),
+                    })
+
+                    if loopback:
+                        regen_payload["loopback"] = loopback
+
+                    ticks = summary.get("ticks", {})
+                    if isinstance(ticks, dict) and bool(ticks.get("enabled", False)):
+                        regen_payload["ticks"] = True
+                        if ticks.get("sym") is not None:
+                            regen_payload["tick_sym"] = ticks.get("sym")
+                        if ticks.get("interval_s") is not None:
+                            regen_payload["tick_interval_s"] = ticks.get("interval_s")
+                        if ticks.get("tone_s") is not None:
+                            regen_payload["tick_tone_s"] = ticks.get("tone_s")
+                        if ticks.get("dbfs") is not None:
+                            regen_payload["tick_dbfs"] = ticks.get("dbfs")
+                        if ticks.get("offset_s") is not None:
+                            regen_payload["tick_offset_s"] = ticks.get("offset_s")
+                        if ticks.get("match_tol_s") is not None:
+                            regen_payload["tick_match_tol_s"] = ticks.get("match_tol_s")
+                        if ticks.get("min_matches") is not None:
+                            regen_payload["tick_min_matches"] = ticks.get("min_matches")
+
+                result = _api_analyze_from_payload(regen_payload, cfg)
+
+                if isinstance(result.get("summary"), dict):
+                    result["summary"]["regenerated_from_run"] = run_dir
+
+                    new_run_dir = _opt_str(((result["summary"].get("run") or {}).get("outdir")))
+                    if new_run_dir:
+                        new_summary_path = ROOT / _rel_to_root_checked(new_run_dir) / "summary.json"
+                        if new_summary_path.exists() and new_summary_path.is_file():
+                            _write_json_atomic_preserve_mtime(new_summary_path, result["summary"])
+
+                self._json(200, result)
+
+            except Exception as e:
+                msg = str(e)
+
+                try:
+                    obj = json.loads(msg)
+                    if isinstance(obj, dict) and obj.get("ok") is False:
+                        self._json(400, obj)
+                        return
+                except Exception:
+                    pass
+
+                self._json(400, {"ok": False, "error": msg})
+            return
+        
         LOG.info("POST %s -- parsed payload keys=%s", req_path, sorted(payload.keys()))
 
         if req_path == "/api/mkdir":
@@ -4221,6 +5134,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(runs_in, list) or not runs_in:
                     raise ValueError("runs must be a non-empty list of run dirs")
 
+                lock_y_axis = bool(payload.get("lock_y_axis", True))
+                plot_y_min = _coerce_float(payload.get("plot_y_min"), default=None)
+                plot_y_max = _coerce_float(payload.get("plot_y_max"), default=None)
+
                 metric = str(payload.get("metric", "response") or "response").strip().lower()
                 outdir = str(payload.get("outdir", "data/compare") or "data/compare").strip()
 
@@ -4241,7 +5158,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not rd_s:
                         continue
                     rd_rel = _rel_to_root_checked(rd_s)
-                    summ = _load_summary_for_run_dir(rd_rel)
+                    summ = _load_summary_for_run_dir(rd_rel, cfg)
                     runs.append({
                         "dir": rd_rel,
                         "summary": summ,
@@ -4270,6 +5187,9 @@ class Handler(BaseHTTPRequestHandler):
                     tile_w=tile_w,
                     tile_h=tile_h,
                     dpi=dpi,
+                    lock_y_axis=lock_y_axis,
+                    plot_y_min=plot_y_min,
+                    plot_y_max=plot_y_max,
                 )
 
                 self._json(200, {
@@ -4282,6 +5202,9 @@ class Handler(BaseHTTPRequestHandler):
                     "tile_h": tile_h,
                     "dpi": dpi,
                     "log": log_txt,
+                    "lock_y_axis": lock_y_axis,
+                    "plot_y_min": plot_y_min,
+                    "plot_y_max": plot_y_max,                    
                 })
             except Exception as e:
                 self._json(400, {"ok": False, "error": str(e)})
@@ -4334,170 +5257,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if req_path == "/api/analyze":
             try:
-                ref = _rel_to_root_checked(str(payload.get("ref", "")))
-                rec = _rel_to_root_checked(str(payload.get("rec", "")))
-
-                loopback_in = str(payload.get("loopback", "") or "").strip()
-                loopback = _rel_to_root_checked(loopback_in) if loopback_in else None
-
-                form_defaults = _build_form_defaults(cfg)
-                outdir_raw = _payload_str_or_default(payload, "outdir", form_defaults["an_outdir"])
-                outdir = _ensure_outdir_rel(outdir_raw)
-
-                overrides = {"ref": ref, "rec": rec, "outdir": outdir}
-                dfl = _cmd_argparse_defaults("analyze")
-
-                dtmf_in = payload.get("dtmf", None)
-                dtmf_obj = dtmf_in if isinstance(dtmf_in, dict) else {}
-
-                dtmf_preset = _coerce_str(dtmf_obj.get("preset"), default="default") or "default"
-                dtmf_autotune = bool(dtmf_obj.get("autotune", True))
-
-                base_dtmf_cfg = {
-                    "min_dbfs": _coerce_float(dtmf_obj.get("min_dbfs"), default=None),
-                    "thresh": _coerce_float(dtmf_obj.get("thresh"), default=None),
-                    "marker_channel": _coerce_str(dtmf_obj.get("marker_channel"), default=None),
-                }
-
-                if base_dtmf_cfg.get("marker_channel") is not None:
-                    base_dtmf_cfg["marker_channel"] = _normalize_marker_channel(base_dtmf_cfg["marker_channel"])
-
-                run_name = _opt_str(payload.get("run_name"))
-                if run_name:
-                    if "run_name" in dfl:
-                        overrides["run_name"] = run_name
-                    elif "name" in dfl:
-                        overrides["name"] = run_name
-                    else:
-                        overrides["run_name"] = run_name
-                        overrides["name"] = run_name
-
-                run_notes = payload.get("run_notes", None)
-                if isinstance(run_notes, str):
-                    rn = run_notes.replace("\r\n", "\n").replace("\r", "\n")
-                    if rn.strip():
-                        if "run_notes" in dfl:
-                            overrides["run_notes"] = rn
-                        elif "notes" in dfl:
-                            overrides["notes"] = rn
-                        else:
-                            overrides["run_notes"] = rn
-                            overrides["notes"] = rn
-
-                if loopback:
-                    overrides["loopback"] = loopback
-
-                def _maybe_float(api_key: str, *dest_names: str):
-                    v = payload.get(api_key, None)
-                    if v is None or v == "":
-                        return
-                    fv = _coerce_float(v, default=None)
-                    if fv is None:
-                        return
-                    for dn in dest_names:
-                        if dn in dfl:
-                            overrides[dn] = fv
-                            return
-
-                def _maybe_int(api_key: str, *dest_names: str):
-                    v = payload.get(api_key, None)
-                    if v is None or v == "":
-                        return
-                    try:
-                        iv = int(v)
-                    except Exception:
-                        return
-                    for dn in dest_names:
-                        if dn in dfl:
-                            overrides[dn] = iv
-                            return
-
-                _maybe_float("min_dbfs", "min_dbfs")
-                _maybe_float("thresh", "thresh")
-
-                LOG.info("analyze: ref=%s rec=%s loopback=%s outdir=%s", ref, rec, loopback, outdir)
-
-                attempts = []
-                used_label = None
-                used_cfg = None
-
-                if dtmf_autotune:
-                    cand_list = _dtmf_candidate_configs(base_dtmf_cfg, dtmf_preset)
-                else:
-                    preset = DTMF_PRESETS.get(dtmf_preset) or DTMF_PRESETS["default"]
-                    cfg0 = dict(preset)
-                    for k, v in base_dtmf_cfg.items():
-                        if v is not None:
-                            cfg0[k] = v
-                    cand_list = [("as_requested", cfg0)]
-
-                ok = False
-                log_txt = ""
-                err = None
-
-                for label, dtmf_cfg in cand_list:
-                    ov = dict(overrides)
-                    _apply_dtmf_cfg(ov, dfl, dtmf_cfg)
-
-                    args = _make_args("analyze", cfg, ov)
-
-                    ok, log_txt, err = _run_cc_cmd(cc.cmd_analyze, args)
-
-                    attempts.append({
-                        "label": label,
-                        "dtmf_cfg": dtmf_cfg,
-                        "ok": bool(ok),
-                        "error": err,
-                    })
-
-                    if ok:
-                        used_label = label
-                        used_cfg = dtmf_cfg
-                        break
-
-                    if not dtmf_autotune:
-                        break
-
-                    if not _is_marker_failure(err, log_txt):
-                        break
-
-                if not ok:
-                    self._json(400, {
-                        "ok": False,
-                        "error": err,
-                        "log": log_txt,
-                        "dtmf": {
-                            "preset": dtmf_preset,
-                            "autotune": dtmf_autotune,
-                            "attempts": attempts,
-                        },
-                    })
-                    return
-
-                base = ROOT / outdir
-                candidates = list(base.rglob("summary.json")) if base.exists() else []
-                if not candidates:
-                    self._json(500, {"ok": False, "error": "analyze succeeded but summary.json was not created", "log": log_txt})
-                    return
-
-                candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-                summary_path = candidates[0]
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-
-                self._json(200, {
-                    "ok": True,
-                    "summary": summary,
-                    "log": log_txt,
-                    "dtmf": {
-                        "preset": dtmf_preset,
-                        "used": used_label,
-                        "cfg": used_cfg,
-                        "attempts": attempts,
-                    },
-                })
-
+                result = _api_analyze_from_payload(payload, cfg)
+                self._json(200, result)
             except Exception as e:
-                self._json(400, {"ok": False, "error": str(e)})
+                msg = str(e)
+
+                try:
+                    obj = json.loads(msg)
+                    if isinstance(obj, dict) and "ok" in obj and obj.get("ok") is False:
+                        self._json(400, obj)
+                        return
+                except Exception:
+                    pass
+
+                self._json(400, {"ok": False, "error": msg})
             return
 
         self._json(404, {"error": "not found"})
@@ -4550,14 +5323,20 @@ def main() -> int:
 
     cfg = _load_cfg(args.config)
 
+    global WEBUI_ROOT, WEBUI_ROOT_REL, WEBUI_RESTRICT_TO_ROOT_DIR, WEBUI_ALLOW_PROJECT_ROOT_ACCESS
     global DTMF_PRESETS
+
+    w = _webui_cfg(cfg)
+    WEBUI_RESTRICT_TO_ROOT_DIR = bool(w.get("restrict_to_root_dir", False))
+    WEBUI_ALLOW_PROJECT_ROOT_ACCESS = bool(w.get("allow_project_root_access", True))
+    WEBUI_ROOT, WEBUI_ROOT_REL = _resolve_webui_root_from_cfg(cfg)
+
     try:
         DTMF_PRESETS = _build_dtmf_presets_from_cfg(cfg)
     except Exception as e:
         LOG.warning("DTMF preset build failed: %s -- using fallback presets", e)
         DTMF_PRESETS = dict(DTMF_PRESETS_FALLBACK)
 
-    w = _webui_cfg(cfg)
     env_file_cfg = _load_simple_env(ROOT / ".env")
 
     host = str(
@@ -4610,12 +5389,21 @@ def main() -> int:
 
     print()
     print(hr)
+    print(f"::: cassette-calibrator (WebUI) | v{APP_VERSION}")
+    print(f"::: Project homepage: github.com/FlyingFathead/cassette-calibrator")
+
     if url_prefix:
-        print(f"cassette-calibrator WebUI server listening on: {url}")
-        print(f"Using custom URL prefix: {url_prefix}/")
-        print(f"Open the WebUI at: {open_url}")
+        print(f"::: Server listening on: {url}")
+        print(f"::: Using custom URL prefix: {url_prefix}/")
+        print(f"::: Open the WebUI at: {open_url}")
     else:
-        print(f"cassette-calibrator WebUI listening on: {url}")
+        print(f"::: Server listening on: {url}")
+
+    if _webui_is_restricted():
+        print(f"::: WebUI file root restricted to: {WEBUI_ROOT_REL}/")
+    else:
+        print("::: WebUI file root: project root")
+
     print(hr)
     print()
 

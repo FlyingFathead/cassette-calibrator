@@ -80,36 +80,82 @@ LOG = logging.getLogger("cassette_calibrator")
 def _get_version() -> str:
     root = Path(__file__).resolve().parent
 
-    # 1) If installed as a package, prefer the packaged version.
+    def _read_version_file():
+        try:
+            v = (root / "VERSION").read_text(encoding="utf-8").strip()
+            return v or None
+        except Exception:
+            return None
+
+    def _git(args):
+        try:
+            import subprocess
+            return subprocess.check_output(
+                ["git"] + list(args),
+                cwd=str(root),
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return None
+
+    def _norm_tag(tag):
+        if not tag:
+            return None
+        return tag[1:] if tag.startswith("v") else tag
+
+    # 1) Canonical local version file first.
+    base = _read_version_file()
+    if base:
+        inside_git = _git(["rev-parse", "--is-inside-work-tree"])
+        if inside_git == "true":
+            exact_tag = _norm_tag(_git(["describe", "--tags", "--exact-match"]))
+            short_hash = _git(["rev-parse", "--short", "HEAD"]) or "unknown"
+            status = _git(["status", "--porcelain"]) or ""
+            dirty_tree = bool(status.strip())
+
+            # Perfect case: exact matching tag, clean tree
+            if exact_tag == base and not dirty_tree:
+                return base
+
+            suffixes = []
+
+            # If HEAD is not exactly on the VERSION tag, mark it dirty-ish.
+            # This is your preferred blunt behavior.
+            if exact_tag != base:
+                suffixes.append("dirty")
+                if short_hash and short_hash != "unknown":
+                    suffixes.insert(0, "g" + short_hash)
+
+            # Actual uncommitted changes
+            elif dirty_tree:
+                suffixes.append("dirty")
+
+            if suffixes:
+                return base + "-" + "-".join(suffixes)
+
+        # VERSION exists, but git info is unavailable or irrelevant
+        return base
+
+    # 2) If installed as a package, use packaged version.
     try:
         from importlib.metadata import version as pkg_version  # py3.8+
-        return pkg_version("cassette-calibrator")
-    except Exception:
-        pass
-
-    # 2) If running from a git checkout, use git tags.
-    try:
-        import subprocess
-        v = subprocess.check_output(
-            ["git", "describe", "--tags", "--dirty", "--always"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            cwd=str(root),
-        ).strip()
-        return v[1:] if v.startswith("v") else v
-    except Exception:
-        pass
-
-    # 3) Fallback: VERSION file in repo root.
-    try:
-        v = (root / "VERSION").read_text(encoding="utf-8").strip()
+        v = pkg_version("cassette-calibrator").strip()
         if v:
             return v
     except Exception:
         pass
 
+    # 3) Fallback: raw git describe if no VERSION file exists.
+    try:
+        v = _git(["describe", "--tags", "--dirty", "--always"])
+        if v:
+            return _norm_tag(v) or v
+    except Exception:
+        pass
+
     # 4) Last resort.
-    return "0.0.0"
+    return "0.0.0-unknown"
 
 __version__ = _get_version()
 
@@ -1223,6 +1269,11 @@ def apply_audio_freq_ticks(ax, fmin: float, fmax: float) -> None:
     ax.xaxis.set_major_formatter(FuncFormatter(fmt))
     ax.set_xlabel("Hertz/Kilohertz")
 
+def apply_locked_y_axis(ax, enabled: bool, y_min: float, y_max: float) -> None:
+    if not enabled:
+        return
+    ax.set_ylim(float(y_min), float(y_max))
+
 def plot_title_prefix(run_meta: Optional[dict], *, max_len: int = 80) -> str:
     """
     Returns '<run name>\\n' (or '' if no run name).
@@ -1713,6 +1764,16 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         raise SystemExit(f"Sample rates differ: ref={sr_ref}, rec={sr_rec}. Resample one first.")
     sr = sr_ref
 
+    if bool(getattr(args, "lock_y_axis", True)):
+        y_min = float(getattr(args, "plot_y_min", -35.0))
+        y_max = float(getattr(args, "plot_y_max", 5.0))
+
+        if not (math.isfinite(y_min) and math.isfinite(y_max)):
+            raise SystemExit("plot_y_min and plot_y_max must be finite numbers")
+
+        if y_min >= y_max:
+            raise SystemExit("plot_y_min must be smaller than plot_y_max")
+
     # -------------------------
     # DTMF detection knobs (analyze)
     # -------------------------
@@ -2145,6 +2206,13 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
         apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
+        apply_locked_y_axis(
+            ax,
+            bool(getattr(args, "lock_y_axis", True)),
+            float(getattr(args, "plot_y_min", -35.0)),
+            float(getattr(args, "plot_y_max", 5.0)),
+        )
+
         ax.set_ylabel("Magnitude (dB, smoothed)")
         ax.set_title(f"{title_prefix}Signal chain magnitude response ({ch})")
         fig.tight_layout()
@@ -2226,6 +2294,14 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
             apply_audio_freq_ticks(ax, args.f_plot_min, args.f_plot_max)
 
+            # y-axis lock (if in use)
+            apply_locked_y_axis(
+                ax,
+                bool(getattr(args, "lock_y_axis", True)),
+                float(getattr(args, "plot_y_min", -35.0)),
+                float(getattr(args, "plot_y_max", 5.0)),
+            )
+
             ax.set_ylabel("Magnitude (dB, smoothed)")
             ax.set_title(f"{title_prefix}Cassette chain magnitude response (L/R overlay)")
 
@@ -2295,6 +2371,12 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         "sweep_s": args.sweep_s,
         "ir_win_s": args.ir_win_s,
         "smooth_oct": args.smooth_oct,
+
+        "plot": {
+            "lock_y_axis": bool(getattr(args, "lock_y_axis", True)),
+            "plot_y_min": float(getattr(args, "plot_y_min", -35.0)),
+            "plot_y_max": float(getattr(args, "plot_y_max", 5.0)),
+        },
 
         "ticks": {
             "enabled": bool(getattr(args, "ticks", False)),
@@ -2873,6 +2955,26 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     a.add_argument("--smooth-oct", type=int, default=12)
     a.add_argument("--f-plot-min", type=float, default=20.0)
     a.add_argument("--f-plot-max", type=float, default=20000.0)
+
+    # axis locking (better for A/B comparison clarity)
+    a.add_argument(
+        "--lock-y-axis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="lock response plot y-axis to plot_y_min..plot_y_max (default: on)",
+    )
+    a.add_argument(
+        "--plot-y-min",
+        type=float,
+        default=-35.0,
+        help="locked response plot y-axis minimum in dB",
+    )
+    a.add_argument(
+        "--plot-y-max",
+        type=float,
+        default=5.0,
+        help="locked response plot y-axis maximum in dB",
+    )
 
     a.add_argument("--win-ms", type=float, default=40.0)
     a.add_argument("--hop-ms", type=float, default=10.0)
