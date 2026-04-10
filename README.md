@@ -46,7 +46,7 @@ Notes:
 
 ## Local WebUI (optional)
 
-A local-only, stdlib-only WebUI is included as `webui.py`. It supports generation, marker detection, analysis, saved-run browsing, note editing, regeneration, compare-grid rendering, WAV upload, and optional restricted-root filesystem access. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
+A stdlib-only WebUI is included as `webui.py`. It supports generation, marker detection, analysis, saved-run browsing, note editing, regeneration, compare-grid rendering, WAV upload, and optional restricted-root filesystem access. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
 
 Launch:
 
