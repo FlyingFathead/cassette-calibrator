@@ -101,6 +101,17 @@ port = 8765
 open_browser = true
 url_prefix = ""
 legacy_run_plot_fallback_from_config = true
+
 root_dir = "data"
 restrict_to_root_dir = true
 allow_project_root_access = false
+
+# Restrict where Step 1 test WAVs may be written
+restrict_gen_out_to_dir = true
+gen_out_root_dir = "data/gen_test_audio"
+
+# Optional: suggest a timestamped test WAV name in the WebUI
+# using the browser's local time, to reduce accidental overwrite.
+propose_timestamped_test_audio_default = true
+
+warn_on_overwrite = true

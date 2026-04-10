@@ -265,10 +265,6 @@ MAX_LIST_ITEMS = 4000
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024  # 256 MiB
 UPLOAD_EXTS = {".wav"}
 
-# ----------------
-# helper functions
-# ----------------
-
 # what keys to keep and copy during re-generation
 REGEN_COPY_KEYS = (
     "fine_align",
@@ -298,6 +294,28 @@ REGEN_COPY_KEYS = (
     "lr_overlay_color_r",
 )
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+# ----------------
+# helper functions
+# ----------------
+
+def _browse_root_for_scope(scope: str | None, cfg: dict) -> tuple[Path, str]:
+    s = (scope or "").strip().lower()
+
+    if s == "gen_out":
+        full, rel = _ensure_gen_out_root_ready(cfg)
+        return full, rel
+
+    if _webui_is_restricted():
+        return WEBUI_ROOT, WEBUI_ROOT_REL
+
+    return ROOT, "."
+
 def _copy_present(dst: dict, src: dict, keys: tuple[str, ...]) -> None:
     for k in keys:
         v = src.get(k)
@@ -316,12 +334,6 @@ def _content_disposition_attachment(name: str) -> str:
     fallback = _ascii_download_fallback(name).replace("\\", "_").replace('"', "_")
     quoted = quote(name, safe="")
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quoted}'
-
-_WINDOWS_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-}
 
 def _safe_upload_filename(name: str, *, allowed_exts: set[str]) -> str:
     raw = str(name or "")
@@ -449,6 +461,108 @@ def _parse_boolish(value, default: bool) -> bool:
         return False
 
     return default
+
+# --------------------------------------
+# generated audio helpers / directories
+# --------------------------------------
+
+def _resolve_gen_out_root_from_cfg(cfg: dict) -> tuple[Path, str]:
+    w = _webui_cfg(cfg)
+
+    restrict = bool(w.get("restrict_gen_out_to_dir", False))
+    raw_root = str(w.get("gen_out_root_dir", "data/gen_test_audio") or "data/gen_test_audio").strip()
+
+    # If not restricted, gen output can live anywhere under the normal WebUI root.
+    if not restrict:
+        if _webui_is_restricted():
+            return WEBUI_ROOT, WEBUI_ROOT_REL
+        return ROOT, "."
+
+    if not raw_root:
+        raise SystemExit("[webui].gen_out_root_dir must not be empty when restrict_gen_out_to_dir=true")
+
+    if os.path.isabs(raw_root):
+        raise SystemExit("[webui].gen_out_root_dir must be a relative path under the project root")
+
+    if any(part == ".." for part in Path(raw_root).parts):
+        raise SystemExit("[webui].gen_out_root_dir must not contain '..'")
+
+    full = (ROOT / raw_root).resolve()
+    try:
+        full.relative_to(ROOT)
+    except Exception as e:
+        raise SystemExit("[webui].gen_out_root_dir escapes project root") from e
+
+    # If the whole WebUI is already restricted, the gen-out dir must stay inside that root too.
+    if _webui_is_restricted():
+        try:
+            full.relative_to(WEBUI_ROOT)
+        except Exception as e:
+            raise SystemExit(
+                f"[webui].gen_out_root_dir must stay inside the allowed WebUI root: {WEBUI_ROOT_REL}"
+            ) from e
+
+    return full, str(full.relative_to(ROOT))
+
+def _ensure_gen_out_root_ready(cfg: dict) -> tuple[Path, str]:
+    full, rel = _resolve_gen_out_root_from_cfg(cfg)
+    w = _webui_cfg(cfg)
+
+    if bool(w.get("restrict_gen_out_to_dir", False)):
+        try:
+            full.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise SystemExit(
+                f"Could not create [webui].gen_out_root_dir '{rel}': {e}"
+            ) from e
+
+    return full, rel
+
+def _gen_out_base(cfg: dict) -> Path:
+    full, _ = _ensure_gen_out_root_ready(cfg)
+    return full
+
+def _ensure_gen_out_rel(p: str, cfg: dict) -> str:
+    rel = _rel_to_root_checked(p)
+    full = (ROOT / rel).resolve()
+
+    base = _gen_out_base(cfg)
+    try:
+        full.relative_to(base)
+    except Exception as e:
+        raise ValueError(
+            f"generated test WAV path must stay under: {base.relative_to(ROOT)}"
+        ) from e
+
+    if full.suffix.lower() != ".wav":
+        raise ValueError("generated test WAV must use .wav extension")
+
+    full.parent.mkdir(parents=True, exist_ok=True)
+    return str(full.relative_to(ROOT))
+
+def _webui_warn_on_overwrite(cfg: dict) -> bool:
+    w = _webui_cfg(cfg)
+    return bool(w.get("warn_on_overwrite", True))
+
+def _timestamped_nonconflicting_rel(rel_path: str, *, cfg: dict) -> str:
+    rel = _ensure_gen_out_rel(rel_path, cfg)
+    full = (ROOT / rel).resolve()
+
+    parent = full.parent
+    stem = full.stem
+    suf = full.suffix
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    cand = parent / f"{stem}-{ts}{suf}"
+    if not cand.exists():
+        return str(cand.relative_to(ROOT))
+
+    for i in range(2, 10000):
+        cand = parent / f"{stem}-{ts}-{i:02d}{suf}"
+        if not cand.exists():
+            return str(cand.relative_to(ROOT))
+
+    raise RuntimeError("could not allocate timestamped output filename")
 
 # -----------------------
 # DTMF / marker presets (WebUI-side)
@@ -1073,7 +1187,14 @@ def _build_form_defaults(cfg: dict) -> dict:
     except Exception:
         analyze_defaults.update(analyze_cfg)
 
-    gen_out = str(gen_defaults.get("out") or "")
+    gen_out = str(gen_defaults.get("out") or "").strip() or "data/test_audio.wav"
+
+    try:
+        gen_out = _ensure_gen_out_rel(gen_out, cfg)
+    except Exception:
+        gen_root, _ = _ensure_gen_out_root_ready(cfg)
+        gen_out = str((gen_root / "test_audio.wav").relative_to(ROOT))
+
     analyze_outdir = str(analyze_defaults.get("outdir") or "")
 
     return {
@@ -1083,6 +1204,24 @@ def _build_form_defaults(cfg: dict) -> dict:
         "an_lock_y_axis": bool(analyze_defaults.get("lock_y_axis", True)),
         "an_plot_y_min": float(analyze_defaults.get("plot_y_min", -35.0)),
         "an_plot_y_max": float(analyze_defaults.get("plot_y_max", 5.0)),
+    }
+
+def _webui_timestamped_gen_out_cfg(cfg: dict) -> dict:
+    """
+    WebUI-only generation filename suggestion config.
+
+    Keeps CLI/TOML [gen].out as the seed path, but lets the WebUI
+    suggest a timestamped filename by default so users do not
+    accidentally overwrite an older reference WAV.
+    """
+    form_defaults = _build_form_defaults(cfg)
+    seed = str(form_defaults.get("gen_out") or "data/test_audio.wav").strip() or "data/test_audio.wav"
+
+    w = _webui_cfg(cfg)
+
+    return {
+        "enabled": bool(w.get("propose_timestamped_test_audio_default", True)),
+        "seed": seed,
     }
 
 # -------------------------------------------
@@ -1331,22 +1470,35 @@ def _list_runs(max_items: int = 500) -> list[dict]:
     runs.sort(key=lambda x: x.get("mtime", 0), reverse=True)
     return runs
 
-def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | None) -> dict:
+def _browse_dir(
+    rel_dir: str,
+    *,
+    mode: str,
+    exts: list[str] | None,
+    q: str | None,
+    scope: str | None,
+    cfg: dict,
+) -> dict:
     rel_dir = (rel_dir or "").strip()
-    browse_root = WEBUI_ROOT if _webui_is_restricted() else ROOT
+    browse_root, browse_root_rel = _browse_root_for_scope(scope, cfg)
 
     if rel_dir == "":
-        rel_dir = _default_browser_root_rel()
+        rel_dir = browse_root_rel
 
-    if rel_dir == "." and _webui_is_restricted():
-        rel_dir = WEBUI_ROOT_REL
+    if rel_dir == "." and browse_root_rel != ".":
+        rel_dir = browse_root_rel
 
     if rel_dir == ".":
         rel_checked = "."
         full = ROOT
     else:
         rel_checked = _rel_to_root_checked(rel_dir)
-        full = (ROOT / rel_checked)
+        full = (ROOT / rel_checked).resolve()
+
+    try:
+        full.relative_to(browse_root)
+    except Exception as e:
+        raise ValueError(f"path is outside the allowed browser root: {browse_root_rel}") from e
 
     if not full.exists() or not full.is_dir():
         raise ValueError(f"not a directory: {rel_dir}")
@@ -1413,12 +1565,10 @@ def _browse_dir(rel_dir: str, *, mode: str, exts: list[str] | None, q: str | Non
     if full != browse_root:
         parent = str(full.parent.relative_to(ROOT))
 
-    root_dir = WEBUI_ROOT_REL if _webui_is_restricted() else "."
-
     return {
         "cwd": rel_checked if rel_checked != "." else ".",
         "parent": parent,
-        "root_dir": root_dir,
+        "root_dir": browse_root_rel,
         "at_root": (full == browse_root),
         "mode": mode,
         "exts": exts_norm,
@@ -2647,6 +2797,63 @@ INDEX_HTML = r"""<!doctype html>
   color: #24415c;
 }
 
+.ow-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 12, 18, 0.72);
+  display: none;
+  z-index: 30000;
+}
+
+.ow-modal {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(680px, calc(100vw - 32px));
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
+  border-radius: 14px;
+  padding: 16px;
+  display: none;
+  z-index: 30001;
+  box-shadow: 0 18px 56px rgba(0,0,0,0.42);
+}
+
+.ow-path {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: #f6f9fc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.ow-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.ow-actions button {
+  margin-top: 0;
+}
+
+.ow-btn-danger {
+  background: #f8dfdf;
+  border-color: #d18d8d;
+}
+
+.ow-btn-danger:hover {
+  background: #f3d0d0;
+  border-color: #b96e6e;
+}
+
   </style>
 </head>
 <body>
@@ -2695,7 +2902,14 @@ INDEX_HTML = r"""<!doctype html>
             
       <div class="grid2">
         <input id="gen_out" value="__GEN_OUT_DEFAULT__" />
-        <button onclick="openBrowser('gen_out', {mode:'file', exts:['.wav'], title:'Choose output WAV', allowNew:true})">Browse</button>
+        <button onclick="openBrowser('gen_out', {
+        mode:'file',
+        exts:['.wav'],
+        title:'Choose output WAV',
+        allowNew:true,
+        allowUpload:false,
+        scope:'gen_out'
+        })">Browse</button>
       </div>
         <button onclick="doGen()">Generate</button>
         <div id="gen_file"></div>
@@ -3102,10 +3316,33 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- Overwrite warning modal -->
+  <div id="ow_backdrop" class="ow-backdrop" onclick="owCancel()"></div>
+  <div id="ow_modal" class="ow-modal" role="dialog" aria-modal="true" aria-labelledby="ow_title">
+    <h3 id="ow_title" style="margin:0 0 10px 0;">Overwrite warning</h3>
+
+    <div class="small" style="margin-bottom:10px;">
+      The target file already exists. Continuing with the same path will overwrite it.
+    </div>
+
+    <label style="margin-top:0;">Existing path</label>
+    <div id="ow_path" class="ow-path"></div>
+
+    <label>Auto-rename suggestion</label>
+    <div id="ow_suggested_path" class="ow-path"></div>
+
+    <div class="ow-actions">
+      <button onclick="owCancel()">Cancel</button>
+      <button onclick="owChooseAutorename()">Auto-rename</button>
+      <button class="ow-btn-danger" onclick="owChooseOverwrite()">Overwrite</button>
+    </div>
+  </div>  
+
 <script>
 
 const DTMF_PRESETS = __DTMF_PRESETS_JSON__;
 const URL_PREFIX = __URL_PREFIX_JSON__;
+const WEBUI_TS_GEN_CFG = __GEN_OUT_TS_CFG_JSON__;
 
 function prefixedUrl(u) {
   const s = String(u || "");
@@ -3208,7 +3445,15 @@ let MB = {
   exts: [],
   cwd: "",
   title: "Browse",
-  allowNew: false
+  allowNew: false,
+  allowUpload: true,
+  scope: ""
+};
+
+let OW = {
+  open: false,
+  info: null,
+  onDecision: null
 };
 
 let RUNS_CTX = {
@@ -3762,7 +4007,17 @@ function closeImgViewer() {
 }
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") closeImgViewer();
+  if (e.key !== "Escape") return;
+
+  if (OW.open) {
+    owCancel();
+    return;
+  }
+
+  if (IV.open) {
+    closeImgViewer();
+    return;
+  }
 });
 
 function runsEditNotes() {
@@ -3967,6 +4222,10 @@ function openBrowser(targetId, opts) {
   MB.exts = (opts && opts.exts) ? opts.exts : [];
   MB.title = (opts && opts.title) ? opts.title : "Browse";
   MB.allowNew = !!(opts && opts.allowNew);
+  MB.allowUpload = !opts || !Object.prototype.hasOwnProperty.call(opts, "allowUpload")
+    ? true
+    : !!opts.allowUpload;
+  MB.scope = (opts && opts.scope) ? String(opts.scope) : "";
 
   MB.cwd = "";
 
@@ -4001,6 +4260,7 @@ async function mbRefresh() {
   params.set("mode", MB.mode);
   for (const e of MB.exts) params.append("ext", e);
   if (q) params.set("q", q);
+  if (MB.scope) params.set("scope", MB.scope);
 
   const st = await apiGetJson("/api/browse?" + params.toString());
   MB.cwd = st.cwd;
@@ -4029,7 +4289,8 @@ async function mbRefresh() {
     MB.mode === "file" &&
     (MB.exts.includes(".wav") || MB.exts.includes("wav"));
 
-  document.getElementById("mb_upload_row").style.display = canUploadWav ? "block" : "none";
+    document.getElementById("mb_upload_row").style.display =
+    (canUploadWav && MB.allowUpload) ? "block" : "none";
 
   const list = document.getElementById("mb_list");
   let html = "";
@@ -4086,6 +4347,7 @@ async function mbUp() {
     if (MB.cwd) params.set("dir", MB.cwd);
     params.set("mode", MB.mode);
     for (const e of MB.exts) params.append("ext", e);
+    if (MB.scope) params.set("scope", MB.scope);
 
     const st = await apiGetJson("/api/browse?" + params.toString());
 
@@ -4096,7 +4358,6 @@ async function mbUp() {
       return;
     }
 
-    // Already at allowed root, do not silently pretend anything happened
     MB.cwd = st.cwd || MB.cwd || ".";
     const rootLabel = st.root_dir || st.cwd || ".";
     mbSetStatus(`You can't go above the allowed root directory: ${rootLabel}`, "error");
@@ -4200,6 +4461,191 @@ async function mbUploadWav() {
   }
 }
 
+/* -------- auto-generate timestamped filenames -------- */
+
+function _pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function _fmtLocalTimestampForFilename(d) {
+  return (
+    String(d.getFullYear()) +
+    _pad2(d.getMonth() + 1) +
+    _pad2(d.getDate()) +
+    "-" +
+    _pad2(d.getHours()) +
+    _pad2(d.getMinutes()) +
+    _pad2(d.getSeconds())
+  );
+}
+
+function _buildSuggestedTimestampedGenOut(seed) {
+  const raw = String(seed || "data/test_audio.wav").trim() || "data/test_audio.wav";
+  const norm = raw.replace(/\\/g, "/");
+
+  const slash = norm.lastIndexOf("/");
+  const dir = slash >= 0 ? norm.slice(0, slash) : "";
+  const base = slash >= 0 ? norm.slice(slash + 1) : norm;
+
+  let ext = ".wav";
+  const dot = base.lastIndexOf(".");
+  if (dot > 0 && dot < base.length - 1) {
+    ext = base.slice(dot);
+  }
+
+  const ts = _fmtLocalTimestampForFilename(new Date());
+  const name = `cc-test_audio-${ts}${ext}`;
+
+  return (dir && dir !== ".") ? `${dir}/${name}` : name;
+}
+
+function initSuggestedGenOutDefault() {
+  const cfg = WEBUI_TS_GEN_CFG || {};
+  if (!cfg.enabled) return;
+
+  const el = document.getElementById("gen_out");
+  if (!el) return;
+
+  const seed = String(cfg.seed || "").trim();
+  const current = String(el.value || "").trim();
+
+  // Only auto-fill when the field is still empty or still at the plain seed value.
+  // If the user already changed it, leave it alone.
+  if (current && seed && current !== seed) return;
+
+  el.value = _buildSuggestedTimestampedGenOut(seed || current || "data/test_audio.wav");
+}
+
+/* -------- overwrite errors -------- */
+
+function apiErrorText(status, j, t) {
+  const msg = (j && j.error) ? String(j.error) : String(t || "request failed");
+  const log = (j && j.log) ? String(j.log) : "";
+  const extra = (j && j.path) ? ("\n\npath: " + String(j.path)) : "";
+  return log ? (msg + extra + "\n\n--- log ---\n" + log) : (msg + extra);
+}
+
+async function postJsonRaw(path, payload) {
+  const r = await fetch(prefixedUrl(path), {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(payload || {})
+  });
+
+  const t = await r.text();
+  let j = null;
+  try { j = JSON.parse(t); } catch (e) {}
+
+  return {
+    ok: r.ok,
+    status: r.status,
+    json: j,
+    text: t
+  };
+}
+
+function owOpen(info, onDecision) {
+  OW.open = true;
+  OW.info = info || null;
+  OW.onDecision = onDecision || null;
+
+  document.getElementById("ow_path").textContent =
+    (info && info.path) ? String(info.path) : "";
+
+  document.getElementById("ow_suggested_path").textContent =
+    (info && info.suggested_path) ? String(info.suggested_path) : "";
+
+  document.getElementById("ow_backdrop").style.display = "block";
+  document.getElementById("ow_modal").style.display = "block";
+}
+
+function owClose() {
+  OW.open = false;
+  OW.info = null;
+  OW.onDecision = null;
+
+  document.getElementById("ow_backdrop").style.display = "none";
+  document.getElementById("ow_modal").style.display = "none";
+}
+
+async function owCancel() {
+  const cb = OW.onDecision;
+  owClose();
+  if (cb) await cb("cancel");
+}
+
+async function owChooseOverwrite() {
+  const cb = OW.onDecision;
+  owClose();
+  if (cb) await cb("overwrite");
+}
+
+async function owChooseAutorename() {
+  const cb = OW.onDecision;
+  owClose();
+  if (cb) await cb("autorename");
+}
+
+function handleGenError(e) {
+  setLog("gen_log", "ERROR: " + e.message);
+  document.getElementById("gen_file").innerHTML = "";
+  document.getElementById("gen_summary").innerHTML = `
+    <div class="op-summary fail">
+      <h4>Generation summary</h4>
+      <div class="status-line status-fail">FAIL ❌ generation request failed</div>
+      <div>${esc(e.message || "Unknown error")}</div>
+    </div>
+  `;
+}
+
+function applyGenResult(r, requestedOut) {
+  const logTxt = r.log || JSON.stringify(r, null, 2);
+  setLog("gen_log", logTxt);
+
+  const info = parseGenLog(logTxt);
+  info.out_path = info.out_path || r.out || requestedOut;
+
+  document.getElementById("gen_summary").innerHTML = renderGenSummary(info);
+
+  if (r.out) {
+    document.getElementById("gen_out").value = r.out;
+    document.getElementById("gen_file").innerHTML = fileActionTag(r.out);
+  }
+}
+
+async function runGenRequest(overwriteMode) {
+  const out = (document.getElementById("gen_out").value || "").trim();
+
+  const resp = await postJsonRaw("/api/gen", {
+    out,
+    overwrite_mode: overwriteMode || ""
+  });
+
+  if (resp.status === 409 && resp.json && resp.json.needs_confirmation) {
+    setLog("gen_log", `Overwrite warning: ${resp.json.path} already exists.`);
+    owOpen(resp.json, async (decision) => {
+      if (decision === "cancel") {
+        setLog("gen_log", "Generation cancelled.");
+        return;
+      }
+
+      try {
+        setLog("gen_log", "running...");
+        await runGenRequest(decision);
+      } catch (e) {
+        handleGenError(e);
+      }
+    });
+    return;
+  }
+
+  if (!resp.ok) {
+    throw new Error(apiErrorText(resp.status, resp.json, resp.text));
+  }
+
+  applyGenResult(resp.json || {}, out);
+}
+
 /* -------- actions -------- */
 
 async function doGen() {
@@ -4208,31 +4654,9 @@ async function doGen() {
     document.getElementById("gen_file").innerHTML = "";
     document.getElementById("gen_summary").innerHTML = "";
 
-    const out = document.getElementById("gen_out").value;
-    const r = await api("/api/gen", { out });
-
-    const logTxt = r.log || JSON.stringify(r, null, 2);
-    setLog("gen_log", logTxt);
-
-    const info = parseGenLog(logTxt);
-    info.out_path = info.out_path || r.out || out;
-
-    document.getElementById("gen_summary").innerHTML =
-      renderGenSummary(info);
-
-    if (r.out) {
-      document.getElementById("gen_file").innerHTML = fileActionTag(r.out);
-    }
+    await runGenRequest("");
   } catch (e) {
-    setLog("gen_log", "ERROR: " + e.message);
-    document.getElementById("gen_file").innerHTML = "";
-    document.getElementById("gen_summary").innerHTML = `
-      <div class="op-summary fail">
-        <h4>Generation summary</h4>
-        <div class="status-line status-fail">FAIL ❌ generation request failed</div>
-        <div>${esc(e.message || "Unknown error")}</div>
-      </div>
-    `;
+    handleGenError(e);
   }
 }
 
@@ -4556,6 +4980,7 @@ async function initPage() {
 
 window.addEventListener("DOMContentLoaded", () => {
   initDtmfPresetSelect();
+  initSuggestedGenOutDefault();
   applyDtmfPreset(document.getElementById("dtmf_preset").value);
 
   const anLock = document.getElementById("an_lock_y_axis");
@@ -4609,7 +5034,10 @@ Object.assign(window, {
   cmpClear,
   cmpUp,
   cmpDown,
-  doCompare
+  doCompare,
+  owCancel,
+  owChooseOverwrite,
+  owChooseAutorename  
 });
 
 console.log("webui script loaded; handlers exported to window");
@@ -4712,6 +5140,7 @@ class Handler(BaseHTTPRequestHandler):
         if req_path == "/":
             logo_url = _prefix_url(prefix, "/assets/cassette_logo_garble_v2.svg")
             form_defaults = _build_form_defaults(getattr(self.server, "cfg", {}) or {})
+            ts_gen_cfg = _webui_timestamped_gen_out_cfg(getattr(self.server, "cfg", {}) or {})
 
             html = INDEX_HTML
             html = html.replace("__DTMF_PRESETS_JSON__", json.dumps(DTMF_PRESETS, ensure_ascii=False))
@@ -4722,6 +5151,7 @@ class Handler(BaseHTTPRequestHandler):
             html = html.replace("__GEN_OUT_DEFAULT__", pyhtml.escape(form_defaults["gen_out"], quote=True))
             html = html.replace("__AN_REF_DEFAULT__", pyhtml.escape(form_defaults["an_ref"], quote=True))
             html = html.replace("__AN_OUTDIR_DEFAULT__", pyhtml.escape(form_defaults["an_outdir"], quote=True))
+            html = html.replace("__GEN_OUT_TS_CFG_JSON__", json.dumps(ts_gen_cfg, ensure_ascii=False))
 
             # y-axis locking check
             html = html.replace(
@@ -4779,13 +5209,14 @@ class Handler(BaseHTTPRequestHandler):
             mode = (qs.get("mode", ["file"])[0] or "file").strip().lower()
             exts = [e for e in qs.get("ext", []) if e is not None]
             q = (qs.get("q", [""])[0] or "").strip()
+            scope = (qs.get("scope", [""])[0] or "").strip()
 
             if mode not in ("file", "dir"):
                 self._json(400, {"error": "invalid mode (use file|dir)"})
                 return
 
             try:
-                out = _browse_dir(rel_dir, mode=mode, exts=exts, q=q)
+                out = _browse_dir(rel_dir, mode=mode, exts=exts, q=q, scope=scope, cfg=cfg)
                 self._json(200, out)
             except Exception as e:
                 self._json(400, {"error": str(e)})
@@ -5214,8 +5645,30 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 form_defaults = _build_form_defaults(cfg)
                 out_raw = _payload_str_or_default(payload, "out", form_defaults["gen_out"])
-                out = _rel_to_root_checked(out_raw)
-                (ROOT / out).parent.mkdir(parents=True, exist_ok=True)
+                out = _ensure_gen_out_rel(out_raw, cfg)
+
+                overwrite_mode = str(payload.get("overwrite_mode", "") or "").strip().lower()
+                if overwrite_mode not in ("", "overwrite", "autorename"):
+                    raise ValueError("invalid overwrite_mode")
+
+                out_full = ROOT / out
+
+                if out_full.exists():
+                    if _webui_warn_on_overwrite(cfg) and overwrite_mode == "":
+                        self._json(409, {
+                            "ok": False,
+                            "needs_confirmation": True,
+                            "error": "output file already exists",
+                            "path": out,
+                            "suggested_path": _timestamped_nonconflicting_rel(out, cfg=cfg),
+                        })
+                        return
+
+                    if overwrite_mode == "autorename":
+                        out = _timestamped_nonconflicting_rel(out, cfg=cfg)
+                        out_full = ROOT / out
+
+                out_full.parent.mkdir(parents=True, exist_ok=True)
 
                 args = _make_args("gen", cfg, {"out": out})
 
@@ -5331,6 +5784,12 @@ def main() -> int:
     WEBUI_ALLOW_PROJECT_ROOT_ACCESS = bool(w.get("allow_project_root_access", True))
     WEBUI_ROOT, WEBUI_ROOT_REL = _resolve_webui_root_from_cfg(cfg)
 
+    # Hard startup validation for forced generated-audio root
+    gen_out_root = None
+    gen_out_root_rel = None
+    if bool(w.get("restrict_gen_out_to_dir", False)):
+        gen_out_root, gen_out_root_rel = _ensure_gen_out_root_ready(cfg)
+
     try:
         DTMF_PRESETS = _build_dtmf_presets_from_cfg(cfg)
     except Exception as e:
@@ -5403,6 +5862,9 @@ def main() -> int:
         print(f"::: WebUI file root restricted to: {WEBUI_ROOT_REL}/")
     else:
         print("::: WebUI file root: project root")
+
+    if bool(w.get("restrict_gen_out_to_dir", False)):
+        print(f"::: Generated test WAV root restricted to: {gen_out_root_rel}/")
 
     print(hr)
     print()

@@ -327,6 +327,15 @@ In `--outdir`:
 
 ## Changelog / History
 
+* 0.3.1 - Safer WebUI output naming and overwrite handling for generated test WAVs
+
+  * [webui] Added `propose_timestamped_test_audio_default` (default: `true`) so the generation form suggests a timestamped output filename by default instead of reusing a fixed `data/test_audio.wav` path.
+  * [webui] Timestamped test WAV suggestions are generated from the browser's local time to reduce accidental overwrite of older reference files.
+  * [webui] Kept CLI / TOML `[gen].out` behavior intact; the timestamped naming change is WebUI-only.
+  * [webui] Added overwrite warning handling for generated test WAV output paths when the selected target file already exists.
+  * [webui] Added an overwrite confirmation dialog with `Overwrite`, `Auto-rename`, and `Cancel` options before replacing an existing generated test WAV.
+  * [webui] Added `[webui].warn_on_overwrite` (default: `true`) to control whether the WebUI asks for overwrite confirmation before replacing an existing generated test WAV.
+
 * 0.3.0 - WebUI run regeneration, locked y-axis workflow, and stricter root/path handling
 
   * [webui] Added saved-run regeneration from `summary.json`, creating a new run from the original stored source WAV paths instead of forcing manual re-entry.
