@@ -446,11 +446,27 @@ def rms(x: np.ndarray, eps: float = 1e-12) -> float:
     x = np.asarray(x, dtype=np.float32)
     return float(np.sqrt(np.mean(x * x) + eps))
 
-def write_wav_int16(path: Path, sr: int, x: np.ndarray) -> None:
+def write_wav_int16(path: Path, sr: int, x: np.ndarray) -> dict:
     x = np.asarray(x, dtype=np.float32)
     x = np.clip(x, -1.0, 1.0)
+
     y = (x * 32767.0).astype(np.int16)
     wavfile.write(str(path), sr, y)
+
+    if y.size:
+        peak_i = int(np.max(np.abs(y)))
+        peak_amp = float(peak_i / 32767.0)
+        peak_dbfs = float(20.0 * np.log10(max(peak_amp, EPS)))
+    else:
+        peak_i = 0
+        peak_amp = 0.0
+        peak_dbfs = float("-inf")
+
+    return {
+        "peak_i16": peak_i,
+        "peak_amp": peak_amp,
+        "peak_dbfs": peak_dbfs,
+    }
 
 def to_mono(y: np.ndarray) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
@@ -1632,10 +1648,16 @@ def cmd_gen(args: argparse.Namespace) -> None:
     if peak > args.peak:
         x = x * (args.peak / peak)
 
-    write_wav_int16(out_path, sr, x)
+    wav_stats = write_wav_int16(out_path, sr, x)
 
     print(f"Wrote: {out_path}")
-    print(f"  sr={sr}, dur={len(x)/sr:.2f}s, peak={np.max(np.abs(x)):.3f}")
+    print(f"  sr={sr}, dur={len(x)/sr:.2f}s")
+    print(
+        f"  peak_sample_amplitude={wav_stats['peak_amp']:.6f} "
+        f"(normalized linear amplitude; 1.0 = full scale)"
+    )
+    print(f"  audio_peak_level_dbfs={wav_stats['peak_dbfs']:.2f} dBFS")
+
     print(f"  marker_start='{args.marker_start}', marker_end='{args.marker_end}'")
     print(f"  noisewin_s={args.noisewin_s}")
     print(f"  tone={args.tone_hz}Hz for {args.tone_s}s at {args.tone_dbfs} dBFS peak")

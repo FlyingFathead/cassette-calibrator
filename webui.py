@@ -2130,17 +2130,18 @@ INDEX_HTML = r"""<!doctype html>
     align-items: flex-start;
   }
 
-  .card {
+   .card {
     background: var(--card-bg);
     border: 1px solid var(--card-border);
     border-radius: 14px;
     padding: 14px;
-    min-width: 340px;
+    min-width: min(340px, 100%);
     max-width: 560px;
-    flex: 1;
+    flex: 1 1 340px;
+    min-width: 0;
     box-shadow: var(--card-shadow);
     backdrop-filter: blur(2px);
-  }
+    }
 
   label {
     display: block;
@@ -2693,6 +2694,8 @@ INDEX_HTML = r"""<!doctype html>
   padding: 12px;
   border: 1px solid var(--panel-border);
   background: var(--panel-bg);
+  box-sizing: border-box;
+  overflow-x: hidden;
 }
 
 .op-summary.ok,
@@ -2743,8 +2746,16 @@ INDEX_HTML = r"""<!doctype html>
 .detect-summary dl {
   margin: 0;
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-template-columns: max-content minmax(0, 1fr);
   gap: 6px 12px;
+  align-items: start;
+}
+
+.op-summary dt,
+.detect-summary dt,
+.op-summary dd,
+.detect-summary dd {
+  min-width: 0;
 }
 
 .op-summary dt,
@@ -2755,6 +2766,16 @@ INDEX_HTML = r"""<!doctype html>
 .op-summary dd,
 .detect-summary dd {
   margin: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.file-path {
+  display: block;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .op-summary code,
@@ -2762,6 +2783,61 @@ INDEX_HTML = r"""<!doctype html>
 .detect-summary code,
 .detect-summary .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.op-summary .muted,
+.detect-summary .muted {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.op-summary .sum-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.op-summary .sum-section:first-of-type {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.op-summary .sum-section h5 {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.op-summary .sum-help,
+.detect-summary .sum-help {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+@media (max-width: 560px) {
+  .op-summary dl,
+  .detect-summary dl {
+    grid-template-columns: 1fr;
+    gap: 2px 0;
+  }
+
+  .op-summary dt,
+  .detect-summary dt {
+    margin-top: 8px;
+  }
+
+  .op-summary dt:first-child,
+  .detect-summary dt:first-child {
+    margin-top: 0;
+  }
 }
 
 .mb-status {
@@ -3499,21 +3575,29 @@ function parseGenLog(log) {
     out_path: null,
     sr: null,
     dur_s: null,
-    peak: null,
+
+    peak_sample_amplitude: null,
+    peak_dbfs: null,
+
     marker_start: null,
     marker_end: null,
+
     noisewin_s: null,
+
     tone_hz: null,
     tone_s: null,
     tone_dbfs: null,
+
     sweep_f1: null,
     sweep_f2: null,
     sweep_s: null,
     sweep_dbfs: null,
+
     spoken_cues_mode: null,
     spoken_cues_status: null,
     spoken_cues_pad_s: null,
     spoken_cues_dbfs: null,
+
     raw: s
   };
 
@@ -3522,11 +3606,39 @@ function parseGenLog(log) {
   m = s.match(/^\s*Wrote:\s+(.+)$/m);
   if (m) out.out_path = m[1].trim();
 
-  m = s.match(/^\s*sr\s*=\s*([0-9]+)\s*,\s*dur\s*=\s*([0-9.]+)s\s*,\s*peak\s*=\s*([0-9.]+)\s*$/m);
+  // Old legacy line:
+  // sr=44100, dur=56.62s, peak=0.251
+  m = s.match(/^\s*sr\s*=\s*([0-9]+)\s*,\s*dur\s*=\s*([0-9.]+)s(?:\s*,\s*peak\s*=\s*([0-9.]+))?\s*$/m);
   if (m) {
     out.sr = Number(m[1]);
     out.dur_s = Number(m[2]);
-    out.peak = Number(m[3]);
+    if (m[3] !== undefined) out.peak_sample_amplitude = Number(m[3]);
+  }
+
+  // Newer explicit lines:
+  // peak_sample_amplitude=0.251167 (...)
+  // audio_peak_level_dbfs=-12.00 dBFS
+  m = s.match(/^\s*peak_sample_amplitude\s*=\s*([0-9.]+)\b.*$/mi);
+  if (m) out.peak_sample_amplitude = Number(m[1]);
+
+  m = s.match(/^\s*audio_peak_level_dbfs\s*=\s*(-?[0-9.]+)\s*dBFS\s*$/mi);
+  if (m) out.peak_dbfs = Number(m[1]);
+
+  // Human-readable variants:
+  // Peak sample amplitude  0.251167 (normalized linear amplitude; 1.0 = full scale)
+  m = s.match(/^\s*Peak sample amplitude\s+([0-9.]+)\b.*$/mi);
+  if (m) out.peak_sample_amplitude = Number(m[1]);
+
+  // Audio peak level (dBFS)  -12.00 dBFS
+  m = s.match(/^\s*Audio peak level(?:\s*\(dBFS\))?\s+(-?[0-9.]+)\s*dBFS\s*$/mi);
+  if (m) out.peak_dbfs = Number(m[1]);
+
+  // Legacy ambiguous format:
+  // [File] Sample peak       0.251 FS (-12.00 dBFS)
+  m = s.match(/^\s*(?:\[File\]\s*)?Sample peak\s+([0-9.]+)\s+FS\s*\(\s*(-?[0-9.]+)\s*dBFS\s*\)\s*$/mi);
+  if (m) {
+    out.peak_sample_amplitude = Number(m[1]);
+    out.peak_dbfs = Number(m[2]);
   }
 
   m = s.match(/^\s*marker_start='([^']*)'\s*,\s*marker_end='([^']*)'\s*$/m);
@@ -3582,21 +3694,41 @@ function renderGenSummary(info) {
   if (hasOut && hasCore) {
     statusClass = "ok";
     statusText = "OK ✅ test WAV was generated successfully";
-    detailText = "The reference WAV was written and looks ready to use.";
+    detailText = "The reference WAV was written and is ready for use.";
   } else if (hasOut) {
     statusClass = "warn";
     statusText = "WARNING ⚠️ file was written, but the summary could not be parsed fully";
     detailText = "The WAV may still be usable, but some output fields were not parsed from the terminal log.";
   }
 
+  const peakAmp = Number.isFinite(info.peak_sample_amplitude)
+    ? `${esc(info.peak_sample_amplitude.toFixed(6))}
+        <div class="muted sum-help">normalized linear sample amplitude; 1.0 = full scale</div>`
+    : "(not reported)";
+
+  const peakDbfs = Number.isFinite(info.peak_dbfs)
+    ? `${esc(info.peak_dbfs.toFixed(2))} dBFS`
+    : "(not reported)";
+
+  const toneText =
+    Number.isFinite(info.tone_hz) && Number.isFinite(info.tone_s) && Number.isFinite(info.tone_dbfs)
+      ? `${esc(String(info.tone_hz))} Hz for ${esc(String(info.tone_s))} s at ${esc(String(info.tone_dbfs))} dBFS`
+      : "(not reported)";
+
+  const sweepText =
+    Number.isFinite(info.sweep_f1) && Number.isFinite(info.sweep_f2) &&
+    Number.isFinite(info.sweep_s) && Number.isFinite(info.sweep_dbfs)
+      ? `${esc(String(info.sweep_f1))}-${esc(String(info.sweep_f2))} Hz for ${esc(String(info.sweep_s))} s at ${esc(String(info.sweep_dbfs))} dBFS`
+      : "(not reported)";
+
   const spokenMode = optStr(info.spoken_cues_mode) || "(not reported)";
   const spokenStatus = optStr(info.spoken_cues_status) || "(not reported)";
   const spokenPad = Number.isFinite(info.spoken_cues_pad_s)
     ? `${esc(String(info.spoken_cues_pad_s))} s`
-    : "(n/a)";
+    : "(not reported)";
   const spokenLevel = Number.isFinite(info.spoken_cues_dbfs)
     ? `${esc(String(info.spoken_cues_dbfs))} dBFS`
-    : "(n/a)";
+    : "(not reported)";
 
   return `
     <div class="op-summary ${statusClass}">
@@ -3604,55 +3736,67 @@ function renderGenSummary(info) {
       <div class="status-line status-${statusClass}">${esc(statusText)}</div>
       <div style="margin-bottom:10px;">${esc(detailText)}</div>
 
-      <dl>
-        <dt>Output file</dt>
-        <dd><span class="mono">${esc(optStr(info.out_path) || "(unknown)")}</span></dd>
+      <div class="sum-section">
+        <h5>File</h5>
+        <dl>
+          <dt>Output file</dt>
+          <dd><span class="mono">${esc(optStr(info.out_path) || "(unknown)")}</span></dd>
 
-        <dt>Sample rate</dt>
-        <dd>${info.sr !== null ? esc(String(info.sr)) + " Hz" : "(unknown)"}</dd>
+          <dt>Sample rate</dt>
+          <dd>${Number.isFinite(info.sr) ? esc(String(info.sr)) + " Hz" : "(unknown)"}</dd>
 
-        <dt>Duration</dt>
-        <dd>${Number.isFinite(info.dur_s) ? esc(info.dur_s.toFixed(2)) + " s" : "(unknown)"}</dd>
+          <dt>Duration</dt>
+          <dd>${Number.isFinite(info.dur_s) ? esc(info.dur_s.toFixed(2)) + " s" : "(unknown)"}</dd>
 
-        <dt>Peak</dt>
-        <dd>${Number.isFinite(info.peak) ? esc(info.peak.toFixed(3)) : "(unknown)"}</dd>
+          <dt>Peak sample amplitude</dt>
+          <dd>${peakAmp}</dd>
 
-        <dt>Start marker</dt>
-        <dd><code>${esc(optStr(info.marker_start) || "(unknown)")}</code></dd>
+          <dt>Audio peak level (dBFS)</dt>
+          <dd>${peakDbfs}</dd>
+        </dl>
+      </div>
 
-        <dt>End marker</dt>
-        <dd><code>${esc(optStr(info.marker_end) || "(unknown)")}</code></dd>
+      <div class="sum-section">
+        <h5>DTMF markers</h5>
+        <dl>
+          <dt>Start marker</dt>
+          <dd><code>${esc(optStr(info.marker_start) || "(unknown)")}</code></dd>
 
-        <dt>Noise window</dt>
-        <dd>${Number.isFinite(info.noisewin_s) ? esc(String(info.noisewin_s)) + " s" : "(unknown)"}</dd>
+          <dt>End marker</dt>
+          <dd><code>${esc(optStr(info.marker_end) || "(unknown)")}</code></dd>
+        </dl>
+      </div>
 
-        <dt>Tone</dt>
-        <dd>${
-          Number.isFinite(info.tone_hz) && Number.isFinite(info.tone_s) && Number.isFinite(info.tone_dbfs)
-            ? `${esc(String(info.tone_hz))} Hz for ${esc(String(info.tone_s))} s at ${esc(String(info.tone_dbfs))} dBFS`
-            : "(unknown)"
-        }</dd>
+      <div class="sum-section">
+        <h5>Signal program</h5>
+        <dl>
+          <dt>Noise window</dt>
+          <dd>${Number.isFinite(info.noisewin_s) ? esc(String(info.noisewin_s)) + " s" : "(not reported)"}</dd>
 
-        <dt>Sweep</dt>
-        <dd>${
-          Number.isFinite(info.sweep_f1) && Number.isFinite(info.sweep_f2) &&
-          Number.isFinite(info.sweep_s) && Number.isFinite(info.sweep_dbfs)
-            ? `${esc(String(info.sweep_f1))}-${esc(String(info.sweep_f2))} Hz for ${esc(String(info.sweep_s))} s at ${esc(String(info.sweep_dbfs))} dBFS`
-            : "(unknown)"
-        }</dd>
+          <dt>Reference tone</dt>
+          <dd>${toneText}</dd>
 
-        <dt>Spoken cues</dt>
-        <dd>${esc(spokenMode)}</dd>
+          <dt>Sweep</dt>
+          <dd>${sweepText}</dd>
+        </dl>
+      </div>
 
-        <dt>Spoken cue status</dt>
-        <dd>${esc(spokenStatus)}</dd>
+      <div class="sum-section">
+        <h5>Spoken cues</h5>
+        <dl>
+          <dt>Mode</dt>
+          <dd>${esc(spokenMode)}</dd>
 
-        <dt>Spoken cue pad</dt>
-        <dd>${spokenPad}</dd>
+          <dt>Status</dt>
+          <dd>${esc(spokenStatus)}</dd>
 
-        <dt>Spoken cue level</dt>
-        <dd>${spokenLevel}</dd>
-      </dl>
+          <dt>Pad</dt>
+          <dd>${spokenPad}</dd>
+
+          <dt>Level</dt>
+          <dd>${spokenLevel}</dd>
+        </dl>
+      </div>
     </div>
   `;
 }
@@ -3917,7 +4061,7 @@ function fileActionTag(path) {
   const dlUrl = downloadUrl(path);
   return `
     <div class="block">
-      <div class="small"><span class="mono">${esc(path)}</span></div>
+      <div class="small"><span class="mono file-path">${esc(path)}</span></div>
       <div class="imglinks" style="margin-top:8px;">
         <a class="imglink" href="${openUrl}" target="_blank" rel="noopener">Open ↗</a>
         <a class="imglink" href="${dlUrl}">Download ⬇</a>
