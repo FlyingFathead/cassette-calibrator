@@ -187,6 +187,20 @@ WEBUI_ALLOW_PROJECT_ROOT_ACCESS = True
 def _webui_is_restricted() -> bool:
     return bool(WEBUI_RESTRICT_TO_ROOT_DIR) and (not bool(WEBUI_ALLOW_PROJECT_ROOT_ACCESS))
 
+def _log_kv(action: str, **fields) -> None:
+    parts = []
+    for k, v in fields.items():
+        if v is None:
+            continue
+        s = str(v).replace("\n", "\\n")
+        if len(s) > 300:
+            s = s[:297] + "..."
+        parts.append(f"{k}={s}")
+    if parts:
+        LOG.info("%s -- %s", action, " ".join(parts))
+    else:
+        LOG.info("%s", action)
+
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     seen: set[str] = set()
@@ -303,6 +317,48 @@ _WINDOWS_RESERVED_NAMES = {
 # ----------------
 # helper functions
 # ----------------
+
+# get generated wav details if sidecar is available
+def _load_generated_wav_details(rel_wav: str) -> dict:
+    rel = _rel_to_root_checked(rel_wav)
+    wav_full = ROOT / rel
+
+    if not wav_full.exists() or not wav_full.is_file():
+        raise FileNotFoundError(f"generated WAV not found: {rel}")
+
+    sidecar_full = cc.sidecar_path_for_wav(wav_full)
+    sidecar_rel = str(sidecar_full.relative_to(ROOT))
+
+    meta = None
+    meta_error = None
+
+    if sidecar_full.exists() and sidecar_full.is_file():
+        try:
+            meta = json.loads(sidecar_full.read_text(encoding="utf-8"))
+        except Exception as e:
+            meta_error = f"could not read sidecar JSON: {e}"
+
+    if not isinstance(meta, dict):
+        try:
+            meta = cc.build_basic_wav_sidecar_dict(wav_full)
+            if isinstance(meta, dict):
+                meta.setdefault("file", {})
+                meta["file"]["path"] = rel
+                meta["file"]["sidecar_path"] = sidecar_rel
+        except Exception as e:
+            if meta_error:
+                meta_error += f" | fallback probe failed: {e}"
+            else:
+                meta_error = f"fallback probe failed: {e}"
+            meta = None
+
+    return {
+        "wav_path": rel,
+        "sidecar_path": sidecar_rel,
+        "sidecar_exists": bool(sidecar_full.exists()),
+        "meta": meta,
+        "meta_error": meta_error,
+    }
 
 def _browse_root_for_scope(scope: str | None, cfg: dict) -> tuple[Path, str]:
     s = (scope or "").strip().lower()
@@ -962,7 +1018,16 @@ def _api_analyze_from_payload(payload: dict, cfg: dict) -> dict:
         if v is not None:
             replay_dtmf[k] = v
 
-    LOG.info("analyze: ref=%s rec=%s loopback=%s outdir=%s", ref, rec, loopback, outdir)
+    _log_kv(
+        "webui.analyze.request",
+        ref=ref,
+        rec=rec,
+        loopback=loopback,
+        outdir=outdir,
+        run_name=_opt_str(payload.get("run_name")),
+        dtmf_preset=dtmf_preset,
+        dtmf_autotune=dtmf_autotune,
+    )
 
     attempts = []
     used_label = None
@@ -987,6 +1052,14 @@ def _api_analyze_from_payload(payload: dict, cfg: dict) -> dict:
         ov = dict(overrides)
         _apply_dtmf_cfg(ov, dfl, dtmf_cfg)
 
+        _log_kv(
+            "webui.analyze.dtmf_try",
+            label=label,
+            min_dbfs=dtmf_cfg.get("min_dbfs"),
+            thresh=dtmf_cfg.get("thresh"),
+            marker_channel=dtmf_cfg.get("marker_channel"),
+        )
+
         args = _make_args("analyze", cfg, ov)
         ok, log_txt, err = _run_cc_cmd(cc.cmd_analyze, args)
 
@@ -996,6 +1069,13 @@ def _api_analyze_from_payload(payload: dict, cfg: dict) -> dict:
             "ok": bool(ok),
             "error": err,
         })
+
+        if not ok:
+            _log_kv(
+                "webui.analyze.dtmf_fail",
+                label=label,
+                error=err,
+            )
 
         if ok:
             used_label = label
@@ -1010,6 +1090,16 @@ def _api_analyze_from_payload(payload: dict, cfg: dict) -> dict:
             break
 
     if not ok:
+        _log_kv(
+            "webui.analyze.fail",
+            ref=ref,
+            rec=rec,
+            loopback=loopback,
+            outdir=outdir,
+            dtmf_preset=dtmf_preset,
+            dtmf_autotune=dtmf_autotune,
+            last_error=err,
+        )
         raise ValueError(
             json.dumps({
                 "ok": False,
@@ -1050,6 +1140,14 @@ def _api_analyze_from_payload(payload: dict, cfg: dict) -> dict:
 
     summary["_webui_replay_payload"] = replay_payload
     _write_json_atomic_preserve_mtime(summary_path, summary)
+
+    _log_kv(
+        "webui.analyze.ok",
+        outdir=outdir,
+        summary_path=str(summary_path.relative_to(ROOT)),
+        used_dtmf_label=used_label,
+        channels=",".join(str(x) for x in summary.get("channels_analyzed", [])),
+    )
 
     return {
         "ok": True,
@@ -3569,6 +3667,84 @@ function fmtTimeSec(v) {
   return `${n.toFixed(3)} s`;
 }
 
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtBytes(n) {
+  const v = numOrNull(n);
+  if (!Number.isFinite(v)) return "(not reported)";
+  if (v < 1024) return `${Math.round(v)} bytes`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KiB`;
+  if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(2)} MiB`;
+  return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+function shortHash(s, keep = 16) {
+  const x = optStr(s);
+  if (!x) return "(not reported)";
+  if (x.length <= keep * 2) return x;
+  return `${x.slice(0, keep)}...${x.slice(-keep)}`;
+}
+
+function buildGenSummaryInfo(resp, requestedOut) {
+  const parsed = parseGenLog((resp && resp.log) || "");
+  parsed.out_path = parsed.out_path || (resp && resp.out) || requestedOut || "";
+
+  const genWrap = (resp && typeof resp.generated === "object" && resp.generated) ? resp.generated : null;
+  const meta = (genWrap && typeof genWrap.meta === "object" && genWrap.meta) ? genWrap.meta : null;
+
+  parsed.sidecar_path = optStr(genWrap && genWrap.sidecar_path);
+  parsed.meta = meta;
+  parsed.meta_error = optStr(genWrap && genWrap.meta_error);
+
+  if (!meta) return parsed;
+
+  const file = (meta.file && typeof meta.file === "object") ? meta.file : {};
+  const audio = (meta.audio && typeof meta.audio === "object") ? meta.audio : {};
+  const peaks = (meta.peaks && typeof meta.peaks === "object") ? meta.peaks : {};
+  const ff = (meta.ffmpeg_ebur128 && typeof meta.ffmpeg_ebur128 === "object") ? meta.ffmpeg_ebur128 : {};
+  const g = (meta.gen && typeof meta.gen === "object") ? meta.gen : {};
+
+  if (!parsed.out_path) parsed.out_path = optStr(file.path);
+  if (!parsed.sidecar_path) parsed.sidecar_path = optStr(file.sidecar_path);
+
+  if (!Number.isFinite(parsed.sr)) parsed.sr = numOrNull(audio.sample_rate);
+  if (!Number.isFinite(parsed.dur_s)) parsed.dur_s = numOrNull(audio.duration_s);
+
+  if (!Number.isFinite(parsed.peak_sample_amplitude)) {
+    parsed.peak_sample_amplitude = numOrNull(peaks.sample_peak_amplitude);
+  }
+  if (!Number.isFinite(parsed.peak_dbfs)) {
+    parsed.peak_dbfs =
+      numOrNull(peaks.sample_peak_dbfs) ??
+      numOrNull(ff.sample_peak_dbfs);
+  }
+
+  if (!parsed.marker_start) parsed.marker_start = optStr(g.marker_start);
+  if (!parsed.marker_end) parsed.marker_end = optStr(g.marker_end);
+  if (!Number.isFinite(parsed.noisewin_s)) parsed.noisewin_s = numOrNull(g.noisewin_s);
+
+  if (!Number.isFinite(parsed.tone_hz)) parsed.tone_hz = numOrNull(g.tone_hz);
+  if (!Number.isFinite(parsed.tone_s)) parsed.tone_s = numOrNull(g.tone_s);
+  if (!Number.isFinite(parsed.tone_dbfs)) parsed.tone_dbfs = numOrNull(g.tone_dbfs);
+
+  if (!Number.isFinite(parsed.sweep_f1)) parsed.sweep_f1 = numOrNull(g.f1);
+  if (!Number.isFinite(parsed.sweep_f2)) parsed.sweep_f2 = numOrNull(g.f2);
+  if (!Number.isFinite(parsed.sweep_s)) parsed.sweep_s = numOrNull(g.sweep_s);
+  if (!Number.isFinite(parsed.sweep_dbfs)) parsed.sweep_dbfs = numOrNull(g.sweep_dbfs);
+
+  if (!parsed.spoken_cues_mode) {
+    parsed.spoken_cues_mode = (g.spoken_cues === true) ? "on" : ((g.spoken_cues === false) ? "off" : null);
+  }
+  if (!parsed.spoken_cues_status) parsed.spoken_cues_status = optStr(g.spoken_cues_status);
+  if (!Number.isFinite(parsed.spoken_cues_pad_s)) parsed.spoken_cues_pad_s = numOrNull(g.spoken_cues_pad_s);
+  if (!Number.isFinite(parsed.spoken_cues_dbfs)) parsed.spoken_cues_dbfs = numOrNull(g.spoken_cues_dbfs);
+
+  return parsed;
+}
+
 function parseGenLog(log) {
   const s = String(log || "");
   const out = {
@@ -3684,6 +3860,12 @@ function renderGenSummary(info) {
     </div>`;
   }
 
+  const meta = (info.meta && typeof info.meta === "object") ? info.meta : null;
+  const file = meta && typeof meta.file === "object" ? meta.file : {};
+  const audio = meta && typeof meta.audio === "object" ? meta.audio : {};
+  const peaks = meta && typeof meta.peaks === "object" ? meta.peaks : {};
+  const ff = meta && typeof meta.ffmpeg_ebur128 === "object" ? meta.ffmpeg_ebur128 : {};
+
   const hasOut = !!optStr(info.out_path);
   const hasCore = Number.isFinite(info.sr) && Number.isFinite(info.dur_s);
 
@@ -3698,12 +3880,12 @@ function renderGenSummary(info) {
   } else if (hasOut) {
     statusClass = "warn";
     statusText = "WARNING ⚠️ file was written, but the summary could not be parsed fully";
-    detailText = "The WAV may still be usable, but some output fields were not parsed from the terminal log.";
+    detailText = "The WAV may still be usable, but some output fields were not parsed cleanly.";
   }
 
   const peakAmp = Number.isFinite(info.peak_sample_amplitude)
     ? `${esc(info.peak_sample_amplitude.toFixed(6))}
-        <div class="muted sum-help">normalized linear sample amplitude; 1.0 = full scale</div>`
+       <div class="muted sum-help">normalized linear sample amplitude; 1.0 = full scale</div>`
     : "(not reported)";
 
   const peakDbfs = Number.isFinite(info.peak_dbfs)
@@ -3730,6 +3912,22 @@ function renderGenSummary(info) {
     ? `${esc(String(info.spoken_cues_dbfs))} dBFS`
     : "(not reported)";
 
+  const channelText = Number.isFinite(numOrNull(audio.channels))
+    ? `${esc(String(audio.channels))}${optStr(audio.channel_mode) ? ` (${esc(audio.channel_mode)})` : ""}`
+    : "(not reported)";
+
+  const bitDepthText = Number.isFinite(numOrNull(audio.bit_depth))
+    ? `${esc(String(audio.bit_depth))}-bit${optStr(audio.subtype) ? ` (${esc(audio.subtype)})` : ""}`
+    : "(not reported)";
+
+  const ffStatus = ff.ok
+    ? "ok"
+    : ((ff.available === false) ? "ffmpeg unavailable" : (optStr(ff.error) || "not reported"));
+
+  const metaNote = optStr(info.meta_error)
+    ? `<div class="muted" style="margin-top:10px;">Metadata note: ${esc(info.meta_error)}</div>`
+    : "";
+
   return `
     <div class="op-summary ${statusClass}">
       <h4>Generation summary</h4>
@@ -3742,17 +3940,66 @@ function renderGenSummary(info) {
           <dt>Output file</dt>
           <dd><span class="mono">${esc(optStr(info.out_path) || "(unknown)")}</span></dd>
 
+          <dt>Sidecar JSON</dt>
+          <dd><span class="mono">${esc(optStr(info.sidecar_path) || "(not found)")}</span></dd>
+
+          <dt>Size</dt>
+          <dd>${fmtBytes(file.size_bytes)}</dd>
+
+          <dt>SHA-256</dt>
+          <dd><span class="mono">${esc(shortHash(file.sha256))}</span></dd>
+
+          <dt>Modified</dt>
+          <dd>${esc(optStr(file.modified_at_local) || optStr(file.modified_at_utc) || "(not reported)")}</dd>
+
+          <dt>Created</dt>
+          <dd>${esc(optStr(file.created_at_local) || optStr(file.created_at_utc) || "(not reported)")}</dd>
+        </dl>
+      </div>
+
+      <div class="sum-section">
+        <h5>Audio container</h5>
+        <dl>
           <dt>Sample rate</dt>
           <dd>${Number.isFinite(info.sr) ? esc(String(info.sr)) + " Hz" : "(unknown)"}</dd>
 
           <dt>Duration</dt>
           <dd>${Number.isFinite(info.dur_s) ? esc(info.dur_s.toFixed(2)) + " s" : "(unknown)"}</dd>
 
+          <dt>Channels</dt>
+          <dd>${channelText}</dd>
+
+          <dt>Bit depth / subtype</dt>
+          <dd>${bitDepthText}</dd>
+
+          <dt>Frames</dt>
+          <dd>${Number.isFinite(numOrNull(audio.frames)) ? esc(String(audio.frames)) : "(not reported)"}</dd>
+        </dl>
+      </div>
+
+      <div class="sum-section">
+        <h5>Peaks and loudness</h5>
+        <dl>
           <dt>Peak sample amplitude</dt>
           <dd>${peakAmp}</dd>
 
           <dt>Audio peak level (dBFS)</dt>
           <dd>${peakDbfs}</dd>
+
+          <dt>FFmpeg EBU R128</dt>
+          <dd>${esc(ffStatus)}</dd>
+
+          <dt>Integrated loudness</dt>
+          <dd>${Number.isFinite(numOrNull(ff.integrated_lufs)) ? esc(Number(ff.integrated_lufs).toFixed(2)) + " LUFS" : "(not reported)"}</dd>
+
+          <dt>Loudness range</dt>
+          <dd>${Number.isFinite(numOrNull(ff.lra_lu)) ? esc(Number(ff.lra_lu).toFixed(2)) + " LU" : "(not reported)"}</dd>
+
+          <dt>Sample peak (ffmpeg)</dt>
+          <dd>${Number.isFinite(numOrNull(ff.sample_peak_dbfs)) ? esc(Number(ff.sample_peak_dbfs).toFixed(2)) + " dBFS" : "(not reported)"}</dd>
+
+          <dt>True peak (ffmpeg)</dt>
+          <dd>${Number.isFinite(numOrNull(ff.true_peak_dbfs)) ? esc(Number(ff.true_peak_dbfs).toFixed(2)) + " dBTP/dBFS" : "(not reported)"}</dd>
         </dl>
       </div>
 
@@ -3797,6 +4044,8 @@ function renderGenSummary(info) {
           <dd>${spokenLevel}</dd>
         </dl>
       </div>
+
+      ${metaNote}
     </div>
   `;
 }
@@ -4746,15 +4995,18 @@ function applyGenResult(r, requestedOut) {
   const logTxt = r.log || JSON.stringify(r, null, 2);
   setLog("gen_log", logTxt);
 
-  const info = parseGenLog(logTxt);
-  info.out_path = info.out_path || r.out || requestedOut;
-
+  const info = buildGenSummaryInfo(r, requestedOut);
   document.getElementById("gen_summary").innerHTML = renderGenSummary(info);
 
+  const blocks = [];
   if (r.out) {
     document.getElementById("gen_out").value = r.out;
-    document.getElementById("gen_file").innerHTML = fileActionTag(r.out);
+    blocks.push(fileActionTag(r.out));
   }
+  if (optStr(info.sidecar_path)) {
+    blocks.push(fileActionTag(info.sidecar_path));
+  }
+  document.getElementById("gen_file").innerHTML = blocks.join("");
 }
 
 async function runGenRequest(overwriteMode) {
@@ -5195,6 +5447,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"cassette-calibrator-webui/{APP_VERSION}"
 
     def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None) -> None:
+        self._last_status_code = int(code)
+        self._last_content_type = str(ctype)
+        self._last_response_bytes = len(body)
+
         self.send_response(code)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Pragma", "no-cache")
@@ -5219,7 +5475,6 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     # --- GET and POST with logging ---
-
     def do_GET(self) -> None:
         t0 = time.monotonic()
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
@@ -5238,7 +5493,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
-            LOG.info("GET %s -- %.1f ms", self.path, (time.monotonic() - t0) * 1000.0)
+            status = getattr(self, "_last_status_code", "?")
+            size = getattr(self, "_last_response_bytes", "?")
+            LOG.info(
+                "GET %s -- status=%s bytes=%s %.1f ms",
+                self.path,
+                status,
+                size,
+                (time.monotonic() - t0) * 1000.0,
+            )
 
     def do_POST(self) -> None:
         t0 = time.monotonic()
@@ -5259,7 +5522,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
-            LOG.info("POST %s -- %.1f ms", self.path, (time.monotonic() - t0) * 1000.0)
+            status = getattr(self, "_last_status_code", "?")
+            size = getattr(self, "_last_response_bytes", "?")
+            LOG.info(
+                "POST %s -- status=%s bytes=%s %.1f ms",
+                self.path,
+                status,
+                size,
+                (time.monotonic() - t0) * 1000.0,
+            )
 
     # --- original GET and POST ---
 
@@ -5276,6 +5547,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # If the configured prefix is hit without trailing slash, redirect to slash form.
         if prefix and u.path == prefix:
+            self._last_status_code = 302
+            self._last_response_bytes = 0
             self.send_response(302)
             self.send_header("Location", prefix + "/")
             self.end_headers()
@@ -5478,6 +5751,8 @@ class Handler(BaseHTTPRequestHandler):
                 rel_dir = _ensure_outdir_rel(dir_in)
                 target_dir = ROOT / rel_dir
 
+                _log_kv("webui.upload_wav.request", dir=rel_dir)
+
                 content_type = self.headers.get("Content-Type", "")
                 raw = self._read_body_bytes()
                 form = _parse_multipart_form(content_type, raw)
@@ -5488,6 +5763,13 @@ class Handler(BaseHTTPRequestHandler):
 
                 orig_name = str(file_obj.get("filename", "") or "").strip()
                 safe_name = _safe_upload_filename(orig_name, allowed_exts=UPLOAD_EXTS)
+
+                _log_kv(
+                    "webui.upload_wav.file",
+                    orig_name=orig_name,
+                    safe_name=safe_name,
+                    bytes=len(file_obj.get("data", b"")),
+                )
 
                 tmp_path = target_dir / f".upload-{time.time_ns()}.tmp"
                 tmp_path.write_bytes(file_obj.get("data", b""))
@@ -5502,6 +5784,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise
 
                 rel_final = str(final_path.relative_to(ROOT))
+
+                _log_kv(
+                    "webui.upload_wav.ok",
+                    path=rel_final,
+                    sample_rate=wav_info.get("sample_rate"),
+                    channels=wav_info.get("channels"),
+                    duration_s=f"{wav_info.get('duration_s', 0):.3f}",
+                )
+
                 self._json(200, {
                     "ok": True,
                     "path": rel_final,
@@ -5521,12 +5812,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not run_dir:
                     raise ValueError("dir is required")
 
+                _log_kv(
+                    "webui.run_regen.request",
+                    dir=run_dir,
+                    lock_y_axis=payload.get("lock_y_axis"),
+                    plot_y_min=payload.get("plot_y_min"),
+                    plot_y_max=payload.get("plot_y_max"),
+                )
+
                 summary = _load_summary_for_run_dir(run_dir, cfg)
                 run_meta = summary.get("run", {}) if isinstance(summary.get("run"), dict) else {}
                 plot_cfg = _summary_plot_cfg(summary, cfg)
 
                 ref = _require_existing_rel_wav(summary.get("ref"), label="Reference WAV")
                 rec = _require_existing_rel_wav(summary.get("rec"), label="Recorded WAV")
+
+                _log_kv(
+                    "webui.run_regen.sources",
+                    dir=run_dir,
+                    ref=ref,
+                    rec=rec,
+                    loopback=_opt_str(summary.get("loopback")),
+                )
 
                 loopback = None
                 loopback_raw = _opt_str(summary.get("loopback"))
@@ -5629,6 +5936,12 @@ class Handler(BaseHTTPRequestHandler):
                         if new_summary_path.exists() and new_summary_path.is_file():
                             _write_json_atomic_preserve_mtime(new_summary_path, result["summary"])
 
+                _log_kv(
+                    "webui.run_regen.ok",
+                    dir=run_dir,
+                    new_outdir=_opt_str(((result.get("summary") or {}).get("run") or {}).get("outdir")),
+                )
+
                 self._json(200, result)
 
             except Exception as e:
@@ -5645,7 +5958,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": msg})
             return
         
-        LOG.info("POST %s -- parsed payload keys=%s", req_path, sorted(payload.keys()))
+        LOG.debug("POST %s -- parsed payload keys=%s", req_path, sorted(payload.keys()))
 
         if req_path == "/api/mkdir":
             try:
@@ -5659,6 +5972,8 @@ class Handler(BaseHTTPRequestHandler):
 
                 full = ROOT / rel
                 full.mkdir(parents=True, exist_ok=True)
+
+                _log_kv("webui.mkdir.ok", path=rel)
 
                 self._json(200, {"ok": True, "path": rel})
             except Exception as e:
@@ -5696,6 +6011,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     run["notes"] = notes
 
+                _log_kv(
+                    "webui.run_notes.update",
+                    dir=rel_dir,
+                    notes_len=len(notes),
+                    notes_empty=(notes.strip() == ""),
+                )
+
                 _write_json_atomic_preserve_mtime(summary_path, obj)
 
                 self._json(200, {"ok": True, "summary": obj})
@@ -5708,6 +6030,19 @@ class Handler(BaseHTTPRequestHandler):
                 runs_in = payload.get("runs", None)
                 if not isinstance(runs_in, list) or not runs_in:
                     raise ValueError("runs must be a non-empty list of run dirs")
+
+                _log_kv(
+                    "webui.compare.request",
+                    runs=len(runs_in),
+                    metric=payload.get("metric", "response"),
+                    channels=payload.get("channels"),
+                    tile_w=payload.get("tile_w"),
+                    tile_h=payload.get("tile_h"),
+                    dpi=payload.get("dpi"),
+                    lock_y_axis=payload.get("lock_y_axis"),
+                    plot_y_min=payload.get("plot_y_min"),
+                    plot_y_max=payload.get("plot_y_max"),
+                )
 
                 lock_y_axis = bool(payload.get("lock_y_axis", True))
                 plot_y_min = _coerce_float(payload.get("plot_y_min"), default=None)
@@ -5767,6 +6102,14 @@ class Handler(BaseHTTPRequestHandler):
                     plot_y_max=plot_y_max,
                 )
 
+                _log_kv(
+                    "webui.compare.ok",
+                    out_png=out_png_rel,
+                    metric=metric,
+                    channels=",".join(channels),
+                    runs=len(runs),
+                )
+
                 self._json(200, {
                     "ok": True,
                     "out_png": out_png_rel,
@@ -5791,6 +6134,12 @@ class Handler(BaseHTTPRequestHandler):
                 out_raw = _payload_str_or_default(payload, "out", form_defaults["gen_out"])
                 out = _ensure_gen_out_rel(out_raw, cfg)
 
+                _log_kv(
+                    "webui.gen.request",
+                    out=out,
+                    overwrite_mode=payload.get("overwrite_mode", ""),
+                )
+
                 overwrite_mode = str(payload.get("overwrite_mode", "") or "").strip().lower()
                 if overwrite_mode not in ("", "overwrite", "autorename"):
                     raise ValueError("invalid overwrite_mode")
@@ -5799,18 +6148,26 @@ class Handler(BaseHTTPRequestHandler):
 
                 if out_full.exists():
                     if _webui_warn_on_overwrite(cfg) and overwrite_mode == "":
+                        suggested_path = _timestamped_nonconflicting_rel(out, cfg=cfg)
+                        _log_kv(
+                            "webui.gen.confirm_needed",
+                            path=out,
+                            suggested_path=suggested_path,
+                        )
                         self._json(409, {
                             "ok": False,
                             "needs_confirmation": True,
                             "error": "output file already exists",
                             "path": out,
-                            "suggested_path": _timestamped_nonconflicting_rel(out, cfg=cfg),
+                            "suggested_path": suggested_path,
                         })
                         return
 
                     if overwrite_mode == "autorename":
+                        old_out = out
                         out = _timestamped_nonconflicting_rel(out, cfg=cfg)
                         out_full = ROOT / out
+                        _log_kv("webui.gen.autorename", from_path=old_out, to_path=out)
 
                 out_full.parent.mkdir(parents=True, exist_ok=True)
 
@@ -5818,10 +6175,35 @@ class Handler(BaseHTTPRequestHandler):
 
                 ok, log_txt, err = _run_cc_cmd(cc.cmd_gen, args)
                 if not ok:
+                    _log_kv("webui.gen.fail", out=out, error=err)
                     self._json(400, {"ok": False, "error": err, "log": log_txt})
                     return
 
-                self._json(200, {"ok": True, "out": out, "log": log_txt})
+                gen_details = None
+                try:
+                    gen_details = _load_generated_wav_details(out)
+                except Exception as e:
+                    gen_details = {
+                        "wav_path": out,
+                        "sidecar_path": "",
+                        "sidecar_exists": False,
+                        "meta": None,
+                        "meta_error": str(e),
+                    }
+
+                _log_kv(
+                    "webui.gen.ok",
+                    out=out,
+                    sidecar=(gen_details or {}).get("sidecar_path"),
+                )
+
+                self._json(200, {
+                    "ok": True,
+                    "out": out,
+                    "log": log_txt,
+                    "generated": gen_details,
+                })
+
             except Exception as e:
                 self._json(400, {"ok": False, "error": str(e)})
             return
@@ -5829,10 +6211,12 @@ class Handler(BaseHTTPRequestHandler):
         if req_path == "/api/detect":
             try:
                 wav = _rel_to_root_checked(str(payload.get("wav", "")))
+                _log_kv("webui.detect.request", wav=wav)
                 args = _make_args("detect", cfg, {"wav": wav, "json": True})
 
                 ok, log_txt, err = _run_cc_cmd(cc.cmd_detect, args)
                 if not ok:
+                    _log_kv("webui.detect.fail", wav=wav, error=err)
                     self._json(400, {"ok": False, "error": err, "log": log_txt})
                     return
 
@@ -5847,6 +6231,15 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
 
+                _log_kv(
+                    "webui.detect.ok",
+                    wav=wav,
+                    channel=result.get("channel"),
+                    events=result.get("events"),
+                    t_marker_start=result.get("t_marker_start"),
+                    t_marker_end=result.get("t_marker_end"),
+                )
+
                 self._json(200, {"ok": True, "result": result, "log": log_txt})
             except Exception as e:
                 self._json(400, {"ok": False, "error": str(e)})
@@ -5855,6 +6248,10 @@ class Handler(BaseHTTPRequestHandler):
         if req_path == "/api/analyze":
             try:
                 result = _api_analyze_from_payload(payload, cfg)
+                _log_kv(
+                    "webui.analyze.route_ok",
+                    outdir=_opt_str(((result.get("summary") or {}).get("run") or {}).get("outdir")),
+                )
                 self._json(200, result)
             except Exception as e:
                 msg = str(e)
@@ -5862,11 +6259,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     obj = json.loads(msg)
                     if isinstance(obj, dict) and "ok" in obj and obj.get("ok") is False:
+                        _log_kv("webui.analyze.route_fail", error=msg)                        
                         self._json(400, obj)
                         return
                 except Exception:
                     pass
 
+                _log_kv("webui.analyze.route_fail", error=msg)
                 self._json(400, {"ok": False, "error": msg})
             return
 

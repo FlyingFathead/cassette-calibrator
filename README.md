@@ -4,11 +4,11 @@
 
 A CLI-first cassette measurement/calibration tool with an optional local WebUI. It is designed for testing a compact cassette recording/playback chain with generated reference audio, automated marker detection, drift compensation, and response analysis.
 
-The same workflow also works for plenty of other signal-chain measurements outside cassette use, but cassettes are the main target.
+A stdlib-only WebUI is included as `webui.py`. It supports generation, marker detection, analysis, saved-run browsing, note editing, regeneration, compare-grid rendering, WAV upload, optional restricted-root filesystem access, and clearer structured logging around analysis failures. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
 
-It generates a cassette-friendly test WAV with configurable DTMF markers, then analyzes a recorded playback capture to estimate magnitude response, optional loopback-subtracted difference response, and SNR.
+The program generates a cassette-friendly test WAV with configurable DTMF markers, then analyzes a recorded playback capture to estimate magnitude response, optional loopback-subtracted difference response, and SNR. The same workflow also works for plenty of other signal-chain measurements outside cassette use, but cassettes and other analog media are the main target(s).
 
-The WebUI now also supports saved-run browsing, run regeneration from stored source WAV paths, configurable locked y-axis plotting for analysis/regen/compare, compare-grid rendering, editable run notes, and optional filesystem restriction to a configured WebUI root.
+The WebUI also supports saved-run browsing, run regeneration from stored source WAV paths, configurable locked y-axis plotting for analysis/regen/compare, compare-grid rendering, editable run notes, and optional filesystem restriction to a configured WebUI root.
 
 ## What this does
 
@@ -90,7 +90,6 @@ TOML default for generated WAV sidecars:
 write_sidecar_json = true
 ```
 
-
 ### WebUI features
 
 * Run `gen`, `detect`, and `analyze` with the same defaults you use from CLI / TOML
@@ -105,6 +104,7 @@ write_sidecar_json = true
 * **Lock response plot y-axis** in analysis, regeneration, and compare rendering
 * Render compare grids across multiple saved runs
 * Optionally restrict WebUI browsing / file serving / writes to a configured subdirectory instead of the whole project root
+* Improved WebUI analysis failure logging for easier troubleshooting of marker-detection / auto-tune failures
 
 ### Editing run notes (WebUI)
 
@@ -384,6 +384,13 @@ my_recording.json
 * Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
 
 ## Changelog / History
+
+* 0.3.4 - WebUI analysis failure logging / observability cleanup
+
+  * [webui] Added explicit final analysis failure logging inside `_api_analyze_from_payload()` via `webui.analyze.fail`.
+  * [webui] Added route-level failure logging for `/api/analyze` structured error responses via `webui.analyze.route_fail`.
+  * [webui] Improved analyze-path observability so failed WebUI analysis requests are now logged more coherently across request start, DTMF auto-tune attempts, per-attempt failures, final analysis failure, and route-level API failure handling.
+  * [webui] This release is mainly a logging / diagnostics cleanup release; no core CLI analysis behavior changes were intended.
 
 * 0.3.3 - WAV sidecar JSON controls and richer sidecar metadata
 

@@ -675,6 +675,14 @@ def json_sanitize(obj):
 # (sidecar helpers)
 # ------------------------------------------------
 
+def _iso_now_local_utc_pair() -> Tuple[str, str]:
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    now_local = now_utc.astimezone()
+    return (
+        now_local.isoformat(),
+        now_utc.isoformat().replace("+00:00", "Z"),
+    )
+
 def _iso_from_ts_utc(ts: float) -> str:
     return (
         datetime.fromtimestamp(float(ts), tz=timezone.utc)
@@ -690,48 +698,6 @@ def _iso_from_ts_local(ts: float) -> str:
         .replace(microsecond=0)
         .isoformat()
     )
-
-def file_timestamp_info(path: Path) -> dict:
-    st = path.stat()
-
-    out = {
-        "modified_at_utc": _iso_from_ts_utc(st.st_mtime),
-        "modified_at_local": _iso_from_ts_local(st.st_mtime),
-    }
-
-    # Best-effort real creation/birth time.
-    # Do NOT treat st_ctime as creation on Linux/Unix.
-    birth_ts = None
-
-    # macOS / some BSDs
-    if hasattr(st, "st_birthtime"):
-        try:
-            birth_ts = float(st.st_birthtime)
-        except Exception:
-            birth_ts = None
-
-    # Python on some platforms may expose birth time ns
-    if birth_ts is None and hasattr(st, "st_birthtime_ns"):
-        try:
-            ns = int(st.st_birthtime_ns)
-            if ns > 0:
-                birth_ts = ns / 1_000_000_000.0
-        except Exception:
-            birth_ts = None
-
-    # Windows fallback: st_ctime is often creation-ish there,
-    # but keep it clearly marked as best-effort only.
-    if birth_ts is None and os.name == "nt":
-        try:
-            birth_ts = float(st.st_ctime)
-        except Exception:
-            birth_ts = None
-
-    if birth_ts is not None and math.isfinite(birth_ts) and birth_ts > 0:
-        out["created_at_utc"] = _iso_from_ts_utc(birth_ts)
-        out["created_at_local"] = _iso_from_ts_local(birth_ts)
-
-    return out
 
 def _iso_utc_now_z() -> str:
     return (
@@ -1041,8 +1007,15 @@ def build_gen_sidecar_dict(
     args: argparse.Namespace,
     wav_stats: dict,
     spoken_status: str,
+    generated_at_local: str,
+    generated_at_utc: str,
 ) -> dict:
     base = build_basic_wav_sidecar_dict(out_path)
+
+    base.setdefault("file", {})
+    base["file"]["created_at_local"] = generated_at_local
+    base["file"]["created_at_utc"] = generated_at_utc
+    base["file"]["created_time_source"] = "generator"
 
     base["origin"] = "generated"
     base["peaks"] = {
@@ -1051,6 +1024,9 @@ def build_gen_sidecar_dict(
         "sample_peak_dbfs": wav_stats.get("peak_dbfs"),
     }
     base["gen"] = {
+        "generated_at_local": generated_at_local,
+        "generated_at_utc": generated_at_utc,
+
         "out": str(out_path),
         "sr": int(args.sr),
         "pre_s": float(args.pre_s),
@@ -1100,11 +1076,16 @@ def write_gen_sidecar_json(
     spoken_status: str,
 ) -> Tuple[Path, dict]:
     sidecar_path = sidecar_path_for_wav(out_path)
+
+    generated_at_local, generated_at_utc = _iso_now_local_utc_pair()
+
     obj = build_gen_sidecar_dict(
         out_path=out_path,
         args=args,
         wav_stats=wav_stats,
         spoken_status=spoken_status,
+        generated_at_local=generated_at_local,
+        generated_at_utc=generated_at_utc,
     )
     safe = json_sanitize(obj)
     sidecar_path.write_text(
