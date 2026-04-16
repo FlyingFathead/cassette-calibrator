@@ -50,7 +50,7 @@ Notes:
 
 ## Local WebUI (optional)
 
-A stdlib-only WebUI is included as `webui.py`. It supports generation, marker detection, analysis, saved-run browsing, note editing, regeneration, compare-grid rendering, WAV upload, and optional restricted-root filesystem access. It calls into the same `cassette_calibrator.py` command handlers and uses your `cassette_calibrator.toml` defaults.
+A stdlib-only WebUI is included as `webui.py`. It uses the same `cassette_calibrator.py` command handlers and your `cassette_calibrator.toml` defaults, so generation, marker detection, and analysis stay aligned with the CLI instead of becoming a separate half-broken parallel universe. The WebUI supports safe relative-path browsing, WAV upload, output-directory creation, saved-run browsing, plot/image viewing from `summary.json`, run-note editing, regeneration from stored source WAV paths, reuse of saved effective analysis settings (including replay payloads when present), locked y-axis plotting for analysis/regeneration/compare rendering, compare-grid output across multiple saved runs, optional restricted-root filesystem access, and clearer analysis-failure logging for marker-detection / auto-tune troubleshooting.
 
 Launch:
 
@@ -81,30 +81,10 @@ legacy_run_plot_fallback_from_config = true
 restrict_to_root_dir = false
 allow_project_root_access = true
 root_dir = "data"
-```
 
-TOML default for generated WAV sidecars:
-
-```toml
 [gen]
 write_sidecar_json = true
 ```
-
-### WebUI features
-
-* Run `gen`, `detect`, and `analyze` with the same defaults you use from CLI / TOML
-* Browse files safely using relative paths only
-* Upload WAV files into the allowed project area from the browser
-* Create output directories from the browser
-* Browse prior runs by scanning for `summary.json`
-* View plots/images referenced in `summary.json`
-* **Edit run notes for an existing run** without re-running analysis
-* **Regenerate a saved run** from the original stored source WAV paths
-* **Reuse saved effective analysis settings for regeneration**, including stored replay payloads
-* **Lock response plot y-axis** in analysis, regeneration, and compare rendering
-* Render compare grids across multiple saved runs
-* Optionally restrict WebUI browsing / file serving / writes to a configured subdirectory instead of the whole project root
-* Improved WebUI analysis failure logging for easier troubleshooting of marker-detection / auto-tune failures
 
 ### Editing run notes (WebUI)
 
@@ -384,6 +364,15 @@ my_recording.json
 * Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
 
 ## Changelog / History
+
+* 0.3.5 - Structured JSON metadata/versioning for detect/summary outputs; backwards-compat polish
+
+  * Added explicit JSON metadata fields `schema_version` and `kind` to `detect --json` output.
+  * Added explicit JSON metadata fields `schema_version` and `kind` to analysis `summary.json`.
+  * Kept the new JSON type/version markers additive rather than breaking, so older runs/files that do not contain these fields still remain readable.
+  * [webui] Kept saved-run loading, note editing, regeneration, and compare workflows tolerant of legacy `summary.json` files that predate the new metadata markers.
+  * [webui] Continued using best-effort/legacy fallback handling for older runs instead of hard-requiring the newer structured metadata fields.
+  * This release is mainly a structured-metadata / backwards-compatibility cleanup release; no intentional breaking CLI workflow changes were introduced.
 
 * 0.3.4 - WebUI analysis failure logging / observability cleanup
 

@@ -166,6 +166,14 @@ def _get_version() -> str:
 __version__ = _get_version()
 
 # -------------------------
+# App details
+# -------------------------
+
+APP_NAME = "cassette-calibrator"
+APP_AUTHOR = "FlyingFathead"
+REPO_URL = "https://github.com/FlyingFathead/cassette-calibrator"
+
+# -------------------------
 # Help w/ descriptions
 # -------------------------
 
@@ -1103,8 +1111,10 @@ def build_basic_wav_sidecar_dict(path: Path) -> dict:
         "schema_version": 1,
         "kind": "cassette_calibrator_audio_sidecar",
         "generated_by": {
-            "app": "cassette-calibrator",
+            "app": APP_NAME,
+            "author": APP_AUTHOR,
             "version": __version__,
+            "repository_url": REPO_URL,
             "created_at_utc": _iso_utc_now_z(),
         },
         "file": {
@@ -2311,6 +2321,16 @@ def cmd_detect(args: argparse.Namespace) -> None:
     t_end_c = find_sequence(events, args.marker_end, which="t")
 
     result = {
+        "schema_version": 1,
+        "kind": "cassette_calibrator_detect_result",
+        "generated_by": {
+            "app": APP_NAME,
+            "author": APP_AUTHOR,
+            "version": __version__,
+            "repository_url": REPO_URL,
+            "created_at_utc": _iso_utc_now_z(),
+        },
+
         "wav": str(args.wav),
         "sr": sr,
         "channel": args.channel,
@@ -2329,7 +2349,8 @@ def cmd_detect(args: argparse.Namespace) -> None:
     }
 
     if args.json:
-        print(json.dumps(result, indent=2))
+        safe_result = json_sanitize(result)
+        print(json.dumps(safe_result, indent=2, allow_nan=False))
         return
 
     print(f"Detected {len(events)} DTMF events (channel={args.channel})")
@@ -2968,6 +2989,16 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         stereo_outputs["lr_diff_png"] = str(outdir / "lr_diff.png")
 
     summary = {
+        "schema_version": 1,
+        "kind": "cassette_calibrator_analysis_summary",
+        "generated_by": {
+            "app": APP_NAME,
+            "author": APP_AUTHOR,
+            "version": __version__,
+            "repository_url": REPO_URL,
+            "created_at_utc": _iso_utc_now_z(),
+        },
+
         "version": __version__,
         "run": run_meta,
 

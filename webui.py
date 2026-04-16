@@ -862,6 +862,19 @@ def _channels_mode_from_summary(summary: dict) -> str:
     if "L" in norm and "R" in norm:
         return "stereo"
 
+    # legacy fallback: infer from per_channel keys
+    per = summary.get("per_channel", {})
+    if isinstance(per, dict):
+        keys = [_norm_ch_name(str(k)) for k in per.keys()]
+        if "mono" in keys:
+            return "mono"
+        if keys == ["L"]:
+            return "l"
+        if keys == ["R"]:
+            return "r"
+        if "L" in keys and "R" in keys:
+            return "stereo"
+
     return "stereo"
 
 def _summary_has_impulse(summary: dict) -> bool:
