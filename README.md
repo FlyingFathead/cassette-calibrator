@@ -31,6 +31,10 @@ The WebUI now also supports saved-run browsing, run regeneration from stored sou
   - Exporting plots + CSV + summary JSON
   - Estimating SNR from the dedicated silence window vs the mid-tone RMS
 
+- Creates / updates WAV sidecar JSON metadata:
+  - Writes sidecar JSONs for generated WAVs by default
+  - Can bulk-scan existing WAVs and backfill sidecar metadata
+
 ## Install
 
 Python 3.9+ recommended. Tested on Python 3.12.x.
@@ -78,6 +82,14 @@ restrict_to_root_dir = false
 allow_project_root_access = true
 root_dir = "data"
 ```
+
+TOML default for generated WAV sidecars:
+
+```toml
+[gen]
+write_sidecar_json = true
+```
+
 
 ### WebUI features
 
@@ -300,6 +312,52 @@ In `--outdir`:
   * `difference_l.png`, `difference_r.png` -- only if `--loopback` is provided
   * `impulse_l.png`, `impulse_r.png` -- only if `--save-ir` is used
 
+Generated test WAVs may also produce a sibling sidecar JSON file (i.e. `<your wav file>.json`) when sidecar writing is enabled.
+
+## WAV sidecar JSONs
+
+The tool can write per-WAV sidecar JSON files for generated test audio and can also scan existing WAV files to backfill sidecars in bulk.
+
+Sidecar JSONs are useful when you want lightweight file-level metadata alongside the WAV itself, for example:
+
+* technical WAV info (sample rate, channels, bit depth, duration, subtype)
+* file hash / size
+* filesystem timestamps when available
+* ffmpeg `ebur128` loudness / peak summary when ffmpeg is available
+* generation metadata for WAVs created by `gen`
+
+Generated test WAVs write a sidecar JSON by default:
+
+```bash
+python3 cassette_calibrator.py gen --out sweepcass.wav
+```
+
+Disable sidecar JSON creation for generated WAVs if needed:
+
+```bash
+python3 cassette_calibrator.py gen --out sweepcass.wav --no-write-sidecar-json
+```
+
+Create or backfill sidecar JSONs for existing WAV files:
+
+```bash
+python3 cassette_calibrator.py sidecar data
+```
+
+Rewrite existing sidecars in bulk:
+
+```bash
+python3 cassette_calibrator.py sidecar --force data
+```
+
+Each sidecar is written next to the WAV using the same basename, for example:
+
+```text
+my_recording.wav
+my_recording.json
+```
+
+
 ## Notes and gotchas
 
 * HF loss is often mechanical (azimuth, head wear, dirty path, wrong tape-type EQ) before it's "EQ fixing".
@@ -326,6 +384,25 @@ In `--outdir`:
 * Phase correlation check (correlation meter / phase relationship), ideally also available per-channel.
 
 ## Changelog / History
+
+* 0.3.3 - WAV sidecar JSON controls and richer sidecar metadata
+
+  * Added configurable generated-WAV sidecar JSON writing via `--write-sidecar-json` / `--no-write-sidecar-json`.
+  * Added TOML support for generated-WAV sidecar control via `[gen].write_sidecar_json` (default: `true`).
+  * Generated test WAVs now write sidecar JSON metadata by default unless explicitly disabled.
+  * Expanded WAV sidecar metadata with richer file information for the original WAV, including filesystem timestamp fields when available.
+  * Improved sidecar JSON usefulness for archival / cataloguing workflows by recording more file-level provenance and technical metadata in one place.
+  * The `sidecar` command remains available for scanning existing WAV files and creating or rewriting sidecar JSONs in bulk.
+
+* 0.3.2 - WebUI long-path wrapping/layout fixes for generation output summaries
+
+  * [webui] Fixed long generated test WAV paths overflowing the Step 1 generation summary panel.
+  * [webui] Fixed long output paths in the generated-file action block (`Open` / `Download`) so they wrap inside the card instead of spilling horizontally out of bounds.
+  * [webui] Hardened summary-panel layout CSS for long values by adding safer wrapping/overflow handling for summary blocks, definition-list values, monospace path text, and muted helper text.
+  * [webui] Improved summary definition-list layout with `minmax(0, 1fr)` sizing so long filenames/paths no longer bully the grid into overflow.
+  * [webui] Added a responsive single-column fallback for summary definition lists on narrower layouts.
+  * [webui] Split the peak-amplitude helper text into a dedicated small helper line for cleaner wrapping and readability.
+  * [webui] No CLI behavior changes in this release; this is a WebUI layout/rendering fix release.
 
 * 0.3.1 - Safer WebUI output naming and overwrite handling for generated test WAVs
 

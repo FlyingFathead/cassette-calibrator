@@ -24,6 +24,11 @@ spoken_cues_pad_s = 1.0
 spoken_cues_dbfs = -14.0
 spoken_cues_autogen = true
 spoken_cues_regen = false
+write_sidecar_json = true
+
+[sidecar]
+recursive = true
+force = false
 
 [voicecues]
 outdir = "data/voice_cues"

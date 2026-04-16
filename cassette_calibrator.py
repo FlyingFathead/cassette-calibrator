@@ -37,12 +37,18 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import glob
 import textwrap
 import csv
 import json
 import math
 import re
+import hashlib
+import shutil
+import subprocess
+import wave
 import unicodedata
+
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from fractions import Fraction
@@ -181,9 +187,6 @@ Commands:
       [pre] [start marker] [noise window] [pad] [countdown] [pad]
       [1 kHz tone] [pad] [ESS sweep (+optional ticks)] [pad] [end marker] [post]
 
-  detect
-    Scan a recording and locate start/end markers (timestamps).
-
   analyze
     Auto-align using markers, drift-correct (linear + optional tick warp),
     deconvolve sweep -> impulse -> magnitude response, export plots + CSV + summary.json
@@ -191,6 +194,12 @@ Commands:
   compare
     Compare multiple analyze run directories (shared axes by default).
     Reads each run's summary.json + response*.csv and plots on the same dB scale.
+
+  detect
+    Scan a recording and locate start/end markers (timestamps).    
+
+  sidecar
+    Create or backfill WAV sidecar JSON files for WAVs in files/directories/globs.    
     
 Run: cassette_calibrator.py <command> --help  for full options.
 """
@@ -660,6 +669,573 @@ def json_sanitize(obj):
         return [json_sanitize(v) for v in obj]
 
     return obj
+
+# ------------------------------------------------
+# Helpers for audio file summaries into i.e. .json
+# (sidecar helpers)
+# ------------------------------------------------
+
+def _iso_from_ts_utc(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+def _iso_from_ts_local(ts: float) -> str:
+    return (
+        datetime.fromtimestamp(float(ts))
+        .astimezone()
+        .replace(microsecond=0)
+        .isoformat()
+    )
+
+def file_timestamp_info(path: Path) -> dict:
+    st = path.stat()
+
+    out = {
+        "modified_at_utc": _iso_from_ts_utc(st.st_mtime),
+        "modified_at_local": _iso_from_ts_local(st.st_mtime),
+    }
+
+    # Best-effort real creation/birth time.
+    # Do NOT treat st_ctime as creation on Linux/Unix.
+    birth_ts = None
+
+    # macOS / some BSDs
+    if hasattr(st, "st_birthtime"):
+        try:
+            birth_ts = float(st.st_birthtime)
+        except Exception:
+            birth_ts = None
+
+    # Python on some platforms may expose birth time ns
+    if birth_ts is None and hasattr(st, "st_birthtime_ns"):
+        try:
+            ns = int(st.st_birthtime_ns)
+            if ns > 0:
+                birth_ts = ns / 1_000_000_000.0
+        except Exception:
+            birth_ts = None
+
+    # Windows fallback: st_ctime is often creation-ish there,
+    # but keep it clearly marked as best-effort only.
+    if birth_ts is None and os.name == "nt":
+        try:
+            birth_ts = float(st.st_ctime)
+        except Exception:
+            birth_ts = None
+
+    if birth_ts is not None and math.isfinite(birth_ts) and birth_ts > 0:
+        out["created_at_utc"] = _iso_from_ts_utc(birth_ts)
+        out["created_at_local"] = _iso_from_ts_local(birth_ts)
+
+    return out
+
+def _iso_utc_now_z() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sidecar_path_for_wav(path: Path) -> Path:
+    return path.with_suffix(".json")
+
+def _iso_from_epoch_local(ts: float | None) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+def _iso_from_epoch_utc(ts: float | None) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+def probe_file_times(path: Path) -> dict:
+    st = path.stat()
+
+    mtime = getattr(st, "st_mtime", None)
+    atime = getattr(st, "st_atime", None)
+
+    # birth/creation time is platform-dependent:
+    # - macOS / some BSDs: st_birthtime
+    # - Windows: st_ctime is creation-ish
+    # - Linux: usually no reliable creation time from plain stat
+    birth = getattr(st, "st_birthtime", None)
+
+    created_epoch = None
+    created_source = None
+
+    if birth is not None:
+        created_epoch = float(birth)
+        created_source = "birthtime"
+    elif os.name == "nt":
+        ctime = getattr(st, "st_ctime", None)
+        if ctime is not None:
+            created_epoch = float(ctime)
+            created_source = "ctime_windows"
+
+    return {
+        "accessed_at_local": _iso_from_epoch_local(atime),
+        "accessed_at_utc": _iso_from_epoch_utc(atime),
+        "modified_at_local": _iso_from_epoch_local(mtime),
+        "modified_at_utc": _iso_from_epoch_utc(mtime),
+        "created_at_local": _iso_from_epoch_local(created_epoch),
+        "created_at_utc": _iso_from_epoch_utc(created_epoch),
+        "created_time_source": created_source,
+    }
+
+
+def probe_wav_file_basic(path: Path) -> dict:
+    st = path.stat()
+
+    try:
+        with wave.open(str(path), "rb") as wf:
+            channels = int(wf.getnchannels())
+            sample_rate = int(wf.getframerate())
+            frames = int(wf.getnframes())
+            sampwidth = int(wf.getsampwidth())  # bytes
+            comptype = str(wf.getcomptype())
+            compname = str(wf.getcompname())
+
+        bit_depth = sampwidth * 8
+
+        if channels == 1:
+            channel_mode = "mono"
+        elif channels == 2:
+            channel_mode = "stereo"
+        else:
+            channel_mode = f"{channels}-channel"
+
+        if comptype == "NONE":
+            subtype = f"PCM_{bit_depth}"
+        else:
+            subtype = compname or comptype
+
+        return {
+            "container": "wav",
+            "sample_rate": sample_rate,
+            "frames": frames,
+            "duration_s": (frames / float(sample_rate)) if sample_rate > 0 else None,
+            "channels": channels,
+            "channel_mode": channel_mode,
+            "bit_depth": bit_depth,
+            "sample_width_bytes": sampwidth,
+            "comptype": comptype,
+            "compname": compname,
+            "subtype": subtype,
+            "size_bytes": int(st.st_size),
+        }
+
+    except wave.Error:
+        # Fallback for IEEE float WAV etc.
+        sr, y = wavfile.read(str(path), mmap=True)
+        y = np.asarray(y)
+
+        if y.ndim == 1:
+            channels = 1
+            frames = int(y.shape[0])
+            channel_mode = "mono"
+        else:
+            frames = int(y.shape[0])
+            channels = int(y.shape[1])
+            channel_mode = "stereo" if channels == 2 else f"{channels}-channel"
+
+        dtype = y.dtype
+        sample_width_bytes = int(dtype.itemsize)
+
+        if np.issubdtype(dtype, np.floating):
+            subtype = f"FLOAT_{sample_width_bytes * 8}"
+            comptype = "IEEE_FLOAT"
+            compname = "IEEE float"
+            bit_depth = sample_width_bytes * 8
+        elif dtype == np.uint8:
+            subtype = "PCM_8"
+            comptype = "NONE"
+            compname = "not compressed"
+            bit_depth = 8
+        elif dtype == np.int16:
+            subtype = "PCM_16"
+            comptype = "NONE"
+            compname = "not compressed"
+            bit_depth = 16
+        elif dtype == np.int32:
+            maxabs = int(np.max(np.abs(y))) if y.size else 0
+            if maxabs <= (2**23):
+                subtype = "PCM_24"
+                bit_depth = 24
+            else:
+                subtype = "PCM_32"
+                bit_depth = 32
+            comptype = "NONE"
+            compname = "not compressed"
+        else:
+            subtype = str(dtype)
+            comptype = "UNKNOWN"
+            compname = "unknown"
+            bit_depth = sample_width_bytes * 8
+
+        return {
+            "container": "wav",
+            "sample_rate": int(sr),
+            "frames": frames,
+            "duration_s": (frames / float(sr)) if sr > 0 else None,
+            "channels": channels,
+            "channel_mode": channel_mode,
+            "bit_depth": bit_depth,
+            "sample_width_bytes": sample_width_bytes,
+            "comptype": comptype,
+            "compname": compname,
+            "subtype": subtype,
+            "size_bytes": int(st.st_size),
+        }
+
+def _re_search_float(pattern: str, text: str) -> Optional[float]:
+    m = re.search(pattern, text, flags=re.MULTILINE | re.DOTALL)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def run_ffmpeg_ebur128_summary(path: Path) -> dict:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return {
+            "available": False,
+            "ok": False,
+            "error": "ffmpeg not found in PATH",
+        }
+
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-nostats",
+        "-i", str(path),
+        "-filter_complex", "ebur128=peak=sample+true:framelog=quiet",
+        "-f", "null",
+        "-",
+    ]
+
+    try:
+        cp = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as e:
+        return {
+            "available": True,
+            "ok": False,
+            "error": f"ffmpeg execution failed: {e}",
+            "command": cmd,
+        }
+
+    txt = "\n".join([cp.stdout or "", cp.stderr or ""]).strip()
+
+    if cp.returncode != 0:
+        return {
+            "available": True,
+            "ok": False,
+            "error": f"ffmpeg exited with status {cp.returncode}",
+            "command": cmd,
+            "stderr_tail": txt[-4000:] if txt else "",
+        }
+
+    out = {
+        "available": True,
+        "ok": True,
+        "command": cmd,
+        "integrated_lufs": None,
+        "threshold_lufs": None,
+        "lra_lu": None,
+        "lra_threshold_lufs": None,
+        "lra_low_lufs": None,
+        "lra_high_lufs": None,
+        "sample_peak_dbfs": None,
+        "true_peak_dbfs": None,
+    }
+
+    m_int = re.search(
+        r"Integrated loudness:\s*[\r\n]+"
+        r"\s*I:\s*(-?\d+(?:\.\d+)?)\s+LUFS\s*[\r\n]+"
+        r"\s*Threshold:\s*(-?\d+(?:\.\d+)?)\s+LUFS",
+        txt,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if m_int:
+        out["integrated_lufs"] = float(m_int.group(1))
+        out["threshold_lufs"] = float(m_int.group(2))
+
+    m_lra = re.search(
+        r"Loudness range:\s*[\r\n]+"
+        r"\s*LRA:\s*(-?\d+(?:\.\d+)?)\s+LU\s*[\r\n]+"
+        r"\s*Threshold:\s*(-?\d+(?:\.\d+)?)\s+LUFS\s*[\r\n]+"
+        r"\s*LRA low:\s*(-?\d+(?:\.\d+)?)\s+LUFS\s*[\r\n]+"
+        r"\s*LRA high:\s*(-?\d+(?:\.\d+)?)\s+LUFS",
+        txt,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if m_lra:
+        out["lra_lu"] = float(m_lra.group(1))
+        out["lra_threshold_lufs"] = float(m_lra.group(2))
+        out["lra_low_lufs"] = float(m_lra.group(3))
+        out["lra_high_lufs"] = float(m_lra.group(4))
+
+    out["sample_peak_dbfs"] = _re_search_float(
+        r"Sample peak:\s*[\r\n]+\s*Peak:\s*(-?\d+(?:\.\d+)?)\s+dBFS",
+        txt,
+    )
+
+    out["true_peak_dbfs"] = _re_search_float(
+        r"True peak:\s*[\r\n]+\s*Peak:\s*(-?\d+(?:\.\d+)?)\s+dB(?:FS|TP)",
+        txt,
+    )
+
+    found_any = any(
+        out[k] is not None
+        for k in (
+            "integrated_lufs",
+            "threshold_lufs",
+            "lra_lu",
+            "sample_peak_dbfs",
+            "true_peak_dbfs",
+        )
+    )
+
+    if not found_any:
+        out["ok"] = False
+        out["error"] = "ffmpeg ran but ebur128 summary could not be parsed"
+        out["stderr_tail"] = txt[-4000:] if txt else ""
+
+    return out
+
+def build_gen_sidecar_dict(
+    *,
+    out_path: Path,
+    args: argparse.Namespace,
+    wav_stats: dict,
+    spoken_status: str,
+) -> dict:
+    base = build_basic_wav_sidecar_dict(out_path)
+
+    base["origin"] = "generated"
+    base["peaks"] = {
+        "sample_peak_i16": wav_stats.get("peak_i16"),
+        "sample_peak_amplitude": wav_stats.get("peak_amp"),
+        "sample_peak_dbfs": wav_stats.get("peak_dbfs"),
+    }
+    base["gen"] = {
+        "out": str(out_path),
+        "sr": int(args.sr),
+        "pre_s": float(args.pre_s),
+        "post_s": float(args.post_s),
+        "pad_s": float(args.pad_s),
+        "noisewin_s": float(args.noisewin_s),
+        "marker_start": str(args.marker_start),
+        "marker_end": str(args.marker_end),
+        "marker_tone_s": float(args.marker_tone_s),
+        "marker_gap_s": float(args.marker_gap_s),
+        "marker_dbfs": float(args.marker_dbfs),
+        "countdown": bool(args.countdown),
+        "countdown_from": int(args.countdown_from),
+        "tone_hz": float(args.tone_hz),
+        "tone_s": float(args.tone_s),
+        "tone_dbfs": float(args.tone_dbfs),
+        "f1": float(args.f1),
+        "f2": float(args.f2),
+        "sweep_s": float(args.sweep_s),
+        "sweep_dbfs": float(args.sweep_dbfs),
+        "peak_limit": float(args.peak),
+        "dtmf_ramp_ms": float(args.dtmf_ramp_ms),
+
+        "ticks": bool(args.ticks),
+        "tick_sym": str(args.tick_sym),
+        "tick_interval_s": float(args.tick_interval_s),
+        "tick_tone_s": float(args.tick_tone_s),
+        "tick_dbfs": float(args.tick_dbfs),
+        "tick_offset_s": float(args.tick_offset_s),
+
+        "spoken_cues": bool(getattr(args, "spoken_cues", False)),
+        "spoken_cues_dir": str(getattr(args, "spoken_cues_dir", "")),
+        "spoken_cues_pad_s": float(getattr(args, "spoken_cues_pad_s", 0.0)),
+        "spoken_cues_dbfs": float(getattr(args, "spoken_cues_dbfs", 0.0)),
+        "spoken_cues_autogen": bool(getattr(args, "spoken_cues_autogen", False)),
+        "spoken_cues_regen": bool(getattr(args, "spoken_cues_regen", False)),
+        "spoken_cues_status": str(spoken_status),
+    }
+
+    return base
+
+def write_gen_sidecar_json(
+    *,
+    out_path: Path,
+    args: argparse.Namespace,
+    wav_stats: dict,
+    spoken_status: str,
+) -> Tuple[Path, dict]:
+    sidecar_path = sidecar_path_for_wav(out_path)
+    obj = build_gen_sidecar_dict(
+        out_path=out_path,
+        args=args,
+        wav_stats=wav_stats,
+        spoken_status=spoken_status,
+    )
+    safe = json_sanitize(obj)
+    sidecar_path.write_text(
+        json.dumps(safe, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return sidecar_path, safe
+
+def build_basic_wav_sidecar_dict(path: Path) -> dict:
+    audio_info = probe_wav_file_basic(path)
+    ffmpeg_info = run_ffmpeg_ebur128_summary(path)
+    file_times = probe_file_times(path)
+
+    return {
+        "schema_version": 1,
+        "kind": "cassette_calibrator_audio_sidecar",
+        "generated_by": {
+            "app": "cassette-calibrator",
+            "version": __version__,
+            "created_at_utc": _iso_utc_now_z(),
+        },
+        "file": {
+            "path": str(path),
+            "sidecar_path": str(sidecar_path_for_wav(path)),
+            "sha256": sha256_file(path),
+            "size_bytes": audio_info["size_bytes"],
+            **file_times,
+        },
+        "audio": {
+            "container": audio_info["container"],
+            "sample_rate": audio_info["sample_rate"],
+            "frames": audio_info["frames"],
+            "duration_s": audio_info["duration_s"],
+            "channels": audio_info["channels"],
+            "channel_mode": audio_info["channel_mode"],
+            "bit_depth": audio_info["bit_depth"],
+            "sample_width_bytes": audio_info["sample_width_bytes"],
+            "subtype": audio_info["subtype"],
+            "comptype": audio_info["comptype"],
+            "compname": audio_info["compname"],
+        },
+        "ffmpeg_ebur128": ffmpeg_info,
+    }
+
+def write_basic_wav_sidecar_json(
+    path: Path,
+    *,
+    extra: Optional[dict] = None,
+) -> Tuple[Path, dict]:
+    sidecar_path = sidecar_path_for_wav(path)
+    obj = build_basic_wav_sidecar_dict(path)
+
+    if extra:
+        obj = deep_merge_dict(obj, extra)
+
+    safe = json_sanitize(obj)
+    sidecar_path.write_text(
+        json.dumps(safe, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return sidecar_path, safe
+
+def collect_wav_inputs(inputs: Sequence[str], recursive: bool = True) -> List[Path]:
+    found: Dict[str, Path] = {}
+
+    for raw in inputs:
+        raw = os.path.expanduser(str(raw))
+        matches = glob.glob(raw, recursive=recursive)
+
+        candidates = [Path(m).expanduser() for m in matches] if matches else [Path(raw).expanduser()]
+
+        for p in candidates:
+            if p.is_dir():
+                it = p.rglob("*") if recursive else p.glob("*")
+                for item in it:
+                    if item.is_file() and item.suffix.lower() == ".wav":
+                        rp = item.resolve()
+                        found[str(rp)] = rp
+            elif p.is_file() and p.suffix.lower() == ".wav":
+                rp = p.resolve()
+                found[str(rp)] = rp
+
+    return [found[k] for k in sorted(found.keys())]
+
+
+def cmd_sidecar(args: argparse.Namespace) -> None:
+    wavs = collect_wav_inputs(args.inputs, recursive=bool(args.recursive))
+
+    if not wavs:
+        raise SystemExit("No WAV files found.")
+
+    created = 0
+    skipped = 0
+    failed = 0
+
+    for wav_path in wavs:
+        sidecar_path = sidecar_path_for_wav(wav_path)
+
+        if sidecar_path.exists() and not bool(args.force):
+            print(f"Skipping {wav_path} (sidecar exists: {sidecar_path.name})")
+            skipped += 1
+            continue
+
+        if sidecar_path.exists():
+            print(f"Regenerating {sidecar_path} for {wav_path}")
+        else:
+            print(f"Found {wav_path} without JSON, generating {sidecar_path}")
+
+        try:
+            write_basic_wav_sidecar_json(
+                wav_path,
+                extra={
+                    "origin": "scanned",
+                    "scan": {
+                        "mode": "sidecar",
+                        "created_from_existing_wav": True,
+                    },
+                },
+            )
+            created += 1
+        except Exception as e:
+            warn(f"failed to write sidecar for {wav_path}: {e}")
+            failed += 1
+
+    print(
+        f"Done. wavs={len(wavs)} created_or_updated={created} skipped={skipped} failed={failed}"
+    )
+
+# -----------------
+# Other audio tools
+# -----------------
 
 def extract(x: np.ndarray, start_s: float, dur_s: float, sr: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
@@ -1650,6 +2226,20 @@ def cmd_gen(args: argparse.Namespace) -> None:
 
     wav_stats = write_wav_int16(out_path, sr, x)
 
+    sidecar_path = None
+    sidecar = None
+
+    if bool(getattr(args, "write_sidecar_json", True)):
+        try:
+            sidecar_path, sidecar = write_gen_sidecar_json(
+                out_path=out_path,
+                args=args,
+                wav_stats=wav_stats,
+                spoken_status=spoken_status,
+            )
+        except Exception as e:
+            warn(f"could not write sidecar JSON for generated WAV: {e}")
+
     print(f"Wrote: {out_path}")
     print(f"  sr={sr}, dur={len(x)/sr:.2f}s")
     print(
@@ -1681,6 +2271,39 @@ def cmd_gen(args: argparse.Namespace) -> None:
             f"  spoken_cues=off, status=disabled, "
             f"pad_s={args.spoken_cues_pad_s}, level={args.spoken_cues_dbfs} dBFS peak"
         )
+
+    if sidecar_path is not None and isinstance(sidecar, dict):
+        print(f"  sidecar_json={sidecar_path}")
+
+        file_info = sidecar.get("file", {})
+        audio_info = sidecar.get("audio", {})
+        ff = sidecar.get("ffmpeg_ebur128", {})
+
+        if isinstance(file_info, dict):
+            print(f"  sha256={file_info.get('sha256')}")
+            print(f"  size_bytes={file_info.get('size_bytes')}")
+
+        if isinstance(audio_info, dict):
+            print(
+                f"  wav_channels={audio_info.get('channels')} "
+                f"({audio_info.get('channel_mode')}), "
+                f"bit_depth={audio_info.get('bit_depth')}, "
+                f"frames={audio_info.get('frames')}"
+            )
+
+        if isinstance(ff, dict):
+            if ff.get("ok"):
+                if ff.get("integrated_lufs") is not None:
+                    print(f"  ffmpeg_integrated_lufs={ff['integrated_lufs']:.2f}")
+                if ff.get("lra_lu") is not None:
+                    print(f"  ffmpeg_lra_lu={ff['lra_lu']:.2f}")
+                if ff.get("sample_peak_dbfs") is not None:
+                    print(f"  ffmpeg_sample_peak_dbfs={ff['sample_peak_dbfs']:.2f}")
+                if ff.get("true_peak_dbfs") is not None:
+                    print(f"  ffmpeg_true_peak_dbfs={ff['true_peak_dbfs']:.2f}")
+            else:
+                state = "unavailable" if not ff.get("available", True) else "failed"
+                print(f"  ffmpeg_ebur128={state}: {ff.get('error')}")
 
 def cmd_detect(args: argparse.Namespace) -> None:
     sr, y = read_wav(Path(args.wav))
@@ -2757,7 +3380,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         dest="cmd",
         required=True,
         title="commands",
-        metavar="{gen,voicecues,detect,analyze,compare}",
+        metavar="{gen,voicecues,detect,analyze,compare,sidecar}",
     )
 
     # common = argparse.ArgumentParser(add_help=False)
@@ -2774,6 +3397,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     a = sub.add_parser("analyze", help="Analyze recorded sweep and export response plots/data")
     c = sub.add_parser("compare", help="Compare multiple analyze run directories (shared axes by default)")
     v = sub.add_parser("voicecues", help="Generate optional spoken cue WAVs for human reference")
+    s = sub.add_parser("sidecar", help="Create/update WAV sidecar JSONs")
 
     # -------- compare --------
     c.add_argument("runs", nargs="+", help="Analyze run directories (each containing summary.json + response*.csv)")
@@ -2837,6 +3461,15 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     g.add_argument("--sweep-s", type=float, default=30.0)
     g.add_argument("--sweep-dbfs", type=float, default=-24.0, help="sweep level (peak dBFS)")
     g.add_argument("--peak", type=float, default=0.90, help="hard peak limiter for whole file")
+
+    # sidecar writer
+    g.add_argument(
+        "--write-sidecar-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write <output>.json sidecar metadata for generated WAVs (default: on)",
+    )
+
     g.set_defaults(func=cmd_gen)
 
     # // ticks
@@ -3059,7 +3692,27 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
         help="matplotlib color for Right channel in overlay plot",
     )
 
-    # -------- voicecues --------
+    # Sidecar arguments
+    s.add_argument(
+        "inputs",
+        nargs="+",
+        help="WAV files, directories, and/or glob patterns",
+    )
+    s.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="recurse into directories when scanning for WAVs (default: on)",
+    )
+    s.add_argument(
+        "--force",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="rewrite sidecar JSONs even if they already exist",
+    )
+    s.set_defaults(func=cmd_sidecar)
+
+    # -------- voice cues --------
     v.add_argument("--outdir", default="data/voice_cues")
     v.add_argument(
         "--force",
@@ -3069,7 +3722,7 @@ def build_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Argument
     )
     v.set_defaults(func=cmd_voicecues)
 
-    return ap, {"gen": g, "voicecues": v, "detect": d, "analyze": a, "compare": c}
+    return ap, {"gen": g, "voicecues": v, "detect": d, "analyze": a, "compare": c, "sidecar": s}
 
 # ----------------------
 # MAIN
@@ -3092,7 +3745,7 @@ def main() -> None:
 
     if "--help-all" in argv:
         print(ap.format_help())
-        for name in ("gen", "voicecues", "detect", "analyze", "compare"):
+        for name in ("gen", "voicecues", "detect", "analyze", "compare", "sidecar"):
             print("\n" + "=" * 80 + "\n")
             print(cmd_parsers[name].format_help())
         raise SystemExit(0)
@@ -3116,7 +3769,7 @@ def main() -> None:
 
     args = ap.parse_args(remaining)
 
-    if getattr(args, "cmd", None) in {"gen", "voicecues", "detect", "analyze", "compare"}:
+    if getattr(args, "cmd", None) in {"gen", "voicecues", "detect", "analyze", "compare", "sidecar"}:
         print(f"cassette-calibrator {__version__}")
 
     if not logging.getLogger().handlers:
